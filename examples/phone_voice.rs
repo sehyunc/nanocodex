@@ -640,3 +640,5 @@ mod tests {
         ));
     }
 }
+
+// CI source-only dependency-cache measurement.

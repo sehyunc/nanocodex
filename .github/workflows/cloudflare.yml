@@ -200,10 +200,24 @@ jobs:
         id: builder
       # Keep CI_TESTS_ENABLED unset so the sandbox retains its default tests.
       - name: Build preview image without publication
+        shell: bash
         env:
           IMAGE: ${{ matrix.image }}
           BUILDX_BUILDER: ${{ steps.builder.outputs.name }}
-        run: node scripts/cloudflare/managed-images.mjs preview "$IMAGE"
+          BUILDKIT_PROGRESS: plain
+        run: |
+          set -o pipefail
+          node scripts/cloudflare/managed-images.mjs preview "$IMAGE" 2>&1 | tee "$RUNNER_TEMP/image-build.log"
+      - name: Report Rust image layer measurements
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/image-build.log" ]; then
+            awk '
+              /^#[0-9]+ \[[^]]+\] RUN .*cargo (install cargo-chef|chef cook|build)/ { phase[$1] = $0 }
+              /^#[0-9]+ (CACHED|DONE)/ { if ($1 in phase) print "::notice title=Rust image layer::" phase[$1] " => " $0 }
+            ' "$RUNNER_TEMP/image-build.log"
+          fi
 
   preview:
     needs: worker-build

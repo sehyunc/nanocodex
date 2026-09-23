@@ -1461,3 +1461,5 @@ mod tests {
         assert!(system_with_agent.validate().is_err());
     }
 }
+
+// CI source-only dependency-cache measurement.
