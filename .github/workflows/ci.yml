@@ -106,6 +106,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           # Concurrent jobs must not race to save incompatible target subsets.
           shared-key: native-ci-${{ github.job }}
+          cache-targets: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST ImageOS
           workspaces: |
             . -> target
@@ -146,6 +147,19 @@ jobs:
           NANOCODEX_DEVICE_TEST_BINARY="$(node -p 'require("node:path").resolve("target/debug/nanocodex2" + (process.platform === "win32" ? ".exe" : ""))')"
           export NANOCODEX_DEVICE_TEST_BINARY
           node --test js/desktop-runtime/test/device-hand.integration.test.mjs js/desktop-runtime/test/device-hand-shutdown.test.mjs
+
+
+      - name: Report native compiler cache measurements
+        if: always()
+        shell: bash
+        run: |
+          sccache --show-stats | while IFS= read -r line; do
+            case "$line" in
+              "Compile requests"*|"Cache hits"*|"Cache misses"*|"Cache write errors"*)
+                printf '::notice title=Native compiler cache::%s\n' "$line"
+                ;;
+            esac
+          done
 
   voice-native:
     needs: changes
@@ -235,6 +249,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           # Concurrent jobs must not race to save incompatible target subsets.
           shared-key: native-ci-${{ github.job }}
+          cache-targets: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST ImageOS
           workspaces: |
             . -> target
@@ -295,6 +310,19 @@ jobs:
           -Nanocodex2 ./target/debug/nanocodex2.exe
           -Version 0.0.0-ci
           -NumericVersion 0.0.0.0
+
+
+      - name: Report native compiler cache measurements
+        if: always()
+        shell: bash
+        run: |
+          sccache --show-stats | while IFS= read -r line; do
+            case "$line" in
+              "Compile requests"*|"Cache hits"*|"Cache misses"*|"Cache write errors"*)
+                printf '::notice title=Native compiler cache::%s\n' "$line"
+                ;;
+            esac
+          done
 
   quality:
     needs: changes
