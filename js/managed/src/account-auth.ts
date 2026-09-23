@@ -1,4 +1,8 @@
-import type { AgentPresentation } from "./agent-presentation";
+import { consumeRpcData } from "nanocodex/cloudflare/rpc";
+import { API_KEY, apiKeyDigest, apiKeyPrincipal, isOrganizationCapabilities, isApiKeyBase, isStoredApiKey, forwardPrincipalAssertions } from "nanocodex/cloudflare/managed-auth";
+export { isOrganizationCapabilities, forwardPrincipalAssertions };
+import { durablePlacementOptions, placementHeaders, TRUSTED_INGRESS_HEADER, type IngressPlacement } from "nanocodex/cloudflare/durable-placement";
+import { LAST_USER_PROMPT_LIMIT, type AgentPresentation } from "./agent-presentation";
 import { retireAccountProjects } from "./retired-projects";
 import { recordHandTiming } from "./hand-timing";
 import { configurationCatalog } from "./agent-configuration";
@@ -33,7 +37,7 @@ const ACCOUNT_PROVISION_TIMEOUT_MS = 10_000;
 const MAX_WALLET_MUTATION_BODY_BYTES = 16 * 1024;
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const API_KEY = /^ncx_live_([A-Za-z0-9_-]{12})_([A-Za-z0-9_-]{43})$/;
+
 const ANONYMOUS_SESSION_TOKEN = /^a_[A-Za-z0-9_-]{43}$/;
 const SMS_SESSION_TOKEN = /^s_[A-Za-z0-9_-]{43}$/;
 const LEGACY_PASSKEY_SESSION_TOKEN = /^[0-9a-f]{64}$/;
@@ -68,7 +72,7 @@ export function isUserId(value: unknown): value is string {
 
 export const NonceStorage = Kv.NonceStorage;
 
-export interface AccountAuthEnv {
+export interface AccountAuthEnv extends IngressPlacement {
   NANOCODEX_PERFORMANCE_TRACE?: string;
   NANOCODEX_ACCESS_SECRET?: string;
   ENVIRONMENT?: string;
@@ -139,40 +143,6 @@ export type Principal = Readonly<{
   capabilities: readonly OrganizationCapability[];
   connectGrant?: ConnectGrantSlice;
 }>;
-
-export function forwardPrincipalAssertions(headers: Headers, principal: Principal): void {
-  headers.set("x-nanocodex-request-principal", JSON.stringify({ kind: principal.kind, user_id: principal.userId }));
-  headers.set(SESSION_OWNER_ASSERTION, principal.userId);
-  headers.set(SESSION_ORGANIZATION_ASSERTION, principal.organizationId);
-  headers.set(SESSION_TEAM_ASSERTION, principal.teamId);
-  headers.set(SESSION_AUTHORIZATION_EPOCH_ASSERTION, String(principal.authorizationEpoch));
-  headers.set(SESSION_CAPABILITIES_ASSERTION, JSON.stringify(principal.capabilities));
-  for (const name of [
-    CONNECT_USER_HEADER,
-    CONNECT_GRANT_ID_HEADER,
-    CONNECT_CAPABILITIES_HEADER,
-    CONNECT_CONNECTORS_HEADER,
-    CONNECT_CONNECTOR_CONNECTIONS_HEADER,
-    CONNECT_MCP_IDS_HEADER,
-    CONNECT_APP_TOOL_CATALOG_DIGEST_HEADER,
-  ]) {
-    headers.delete(name);
-  }
-  if (principal.connectGrant) {
-    headers.set(CONNECT_GRANT_ID_HEADER, principal.connectGrant.grantId);
-    headers.set(CONNECT_CONNECTORS_HEADER, JSON.stringify(principal.connectGrant.connectors));
-    if (principal.connectGrant.connectorConnections !== undefined) {
-      headers.set(
-        CONNECT_CONNECTOR_CONNECTIONS_HEADER,
-        JSON.stringify(principal.connectGrant.connectorConnections),
-      );
-    }
-    headers.set(CONNECT_MCP_IDS_HEADER, JSON.stringify(principal.connectGrant.mcpIds));
-    if (principal.connectGrant.appToolCatalogDigest !== undefined) {
-      headers.set(CONNECT_APP_TOOL_CATALOG_DIGEST_HEADER, principal.connectGrant.appToolCatalogDigest);
-    }
-  }
-}
 
 type UserRecord = Readonly<{
   id: string;
@@ -436,7 +406,7 @@ export async function routeAccountRequest(
     if (principal.kind !== "account_session") {
       return json({ error: "forbidden" }, { status: 403 });
     }
-    const organization = env.NANOCODEX_ORGANIZATIONS.getByName(principal.organizationId);
+    const organization = env.NANOCODEX_ORGANIZATIONS.getByName(principal.organizationId, durablePlacementOptions(env.trustedClientIngressColo));
     if (request.method === "GET") {
       if (!principal.capabilities.includes("organization:read")) {
         return json({ error: "forbidden" }, { status: 403 });
@@ -720,10 +690,11 @@ export async function authenticate(
   url = new URL(request.url),
 ): Promise<Principal | undefined> {
   const started = performance.now();
+  const startedAt = Date.now();
   const reuse = managedAccessRequest(request) && request.headers.has(MANAGED_ACCESS_HEADER);
   const principal = reuse ? await readManagedAccess(request, env) : await authenticateLive(request, env, url);
   recordHandTiming(request, "auth", performance.now() - started);
-  await observeManagedAccess(request, env, principal, reuse ? "access" : "live", performance.now() - started);
+  await observeManagedAccess(request, env, principal, reuse ? "access" : "live", performance.now() - started, startedAt);
   return principal;
 }
 
@@ -768,17 +739,15 @@ async function authenticateLive(request: Request, env: AccountAuthEnv, url: URL)
       return resolveUserPrincipal(env, passkeyUserId, credentialId);
     }
   }
-  const authorization = request.headers.get("authorization");
-  if (!authorization?.startsWith("Bearer ")) return undefined;
-  const token = authorization.slice("Bearer ".length);
-  if (!API_KEY.test(token)) return undefined;
-  const digest = await sha256(token);
-  const stub = env.NANOCODEX_API_KEYS.getByName(digest);
+  const digest = await apiKeyDigest(request);
+  if (!digest) return undefined;
+  const stub = env.NANOCODEX_API_KEYS.getByName(digest, durablePlacementOptions(env.trustedClientIngressColo));
   // RPC returns the small record in one reply. A fetch Response transports its
   // headers and JSON stream separately across Durable Object locations.
   let record: StoredApiKey | undefined;
-  if (typeof stub.resolveAuthorizedKey === "function") {
-    record = await stub.resolveAuthorizedKey();
+  const rpc = stub.resolveAuthorizedKey;
+  if (typeof rpc === "function") {
+    record = consumeRpcData(await Reflect.apply(rpc, stub, []));
   } else {
     const response = await stub.fetch("https://api-key.internal/resolve?authorize=1");
     if (!response.ok) {
@@ -790,18 +759,7 @@ async function authenticateLive(request: Request, env: AccountAuthEnv, url: URL)
     if (response.headers.get("x-nanocodex-api-key-authorized") !== "1"
       && !await apiKeyAuthorized(env, record)) return undefined;
   }
-  if (!isStoredApiKey(record) || record.digest !== digest) return undefined;
-  return {
-    kind: "api_key",
-    userId: record.userId,
-    organizationId: record.organizationId,
-    teamId: record.teamId,
-    role: record.role,
-    subjectId: `api_key:${record.id}`,
-    credentialId: record.id,
-    authorizationEpoch: record.authorizationEpoch,
-    capabilities: record.capabilities,
-  };
+  return apiKeyPrincipal(record, digest);
 }
 
 async function apiKeyAuthorized(env: AccountAuthEnv, record: StoredApiKey): Promise<boolean> {
@@ -827,7 +785,7 @@ async function resolveUserPrincipal(
 ): Promise<Principal | undefined> {
   // Resolve live membership beside the account record, avoiding a second
   // edge-to-Durable-Object round trip for browser/passkey sessions.
-  const response = await env.NANOCODEX_USERS.getByName(userId).fetch("https://user.internal/authorization");
+  const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/authorization");
   if (!response.ok) {
     await response.body?.cancel();
     return undefined;
@@ -937,7 +895,7 @@ export function requireSameOriginMutation(
 }
 
 export async function listAgents(env: AccountAuthEnv, userId: string): Promise<AgentSummary[]> {
-  const response = await env.NANOCODEX_USERS.getByName(userId).fetch("https://user.internal/agents");
+  const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/agents");
   if (!response.ok) throw new Error("agent listing failed");
   return response.json<AgentSummary[]>();
 }
@@ -950,7 +908,7 @@ export async function attachAgent(
   hasCronTriggers?: boolean,
 ): Promise<void> {
   await fetchResponseWithDeadline(
-    env.NANOCODEX_USERS.getByName(userId),
+    env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)),
     "https://user.internal/agents",
     {
       method: "POST",
@@ -973,7 +931,7 @@ export async function recordAgentCronPresence(
   present: boolean,
 ): Promise<void> {
   await fetchResponseWithDeadline(
-    env.NANOCODEX_USERS.getByName(userId),
+    env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)),
     `https://user.internal/agents/${agentId}/cron-presence`,
     { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ present }) },
     DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
@@ -993,7 +951,7 @@ export async function recordAgentActivity(
   let failure: unknown;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
-      const response = await env.NANOCODEX_USERS.getByName(userId).fetch(
+      const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch(
         `https://user.internal/agents/${agentId}/activity`,
         {
           method: "POST",
@@ -1019,7 +977,7 @@ export async function detachAgent(
   timeoutMs = DEFAULT_OWNERSHIP_IO_TIMEOUT_MS,
 ): Promise<void> {
   await fetchResponseWithDeadline(
-    env.NANOCODEX_USERS.getByName(userId),
+    env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)),
     `https://user.internal/agents/${agentId}`,
     { method: "DELETE" },
     timeoutMs,
@@ -1360,13 +1318,13 @@ export async function ensureAccount(
   if (!isUserId(userId)) {
     throw new Error("invalid account identity");
   }
-  const accountStub = env.NANOCODEX_USERS.getByName(userId);
+  const accountStub = env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
   const status = await fetchResponseWithDeadline(
     accountStub,
     "https://user.internal/account",
     {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: placementHeaders({ "content-type": "application/json" }, env.trustedClientIngressColo),
       body: JSON.stringify({ id: userId, persistent }),
     },
     timeoutMs,
@@ -1459,12 +1417,19 @@ async function proxyAccountWalletRequest(
 }
 
 async function readAccount(env: AccountAuthEnv, userId: string): Promise<UserRecord | undefined> {
-  const response = await env.NANOCODEX_USERS.getByName(userId).fetch("https://user.internal/account");
-  if (!response.ok) {
-    await response.body?.cancel();
-    return undefined;
+  const stub = env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
+  let record: UserRecord | undefined;
+  const rpc = stub.readAccount;
+  if (typeof rpc === "function") {
+    record = consumeRpcData(await Reflect.apply(rpc, stub, []));
+  } else {
+    const response = await stub.fetch("https://user.internal/account");
+    if (!response.ok) {
+      await response.body?.cancel();
+      return undefined;
+    }
+    record = await response.json<UserRecord>();
   }
-  const record = await response.json<UserRecord>();
   return isUserRecord(record) && record.id === userId ? record : undefined;
 }
 
@@ -1476,14 +1441,21 @@ async function resolveOrganizationGrant(
   env: AccountAuthEnv,
   account: Pick<UserRecord, "id" | "organizationId">,
 ): Promise<OrganizationGrant | undefined> {
-  const response = await env.NANOCODEX_ORGANIZATIONS.getByName(account.organizationId).fetch(
-    `https://organization.internal/resolve?userId=${encodeURIComponent(account.id)}`,
-  );
-  if (!response.ok) {
-    await response.body?.cancel();
-    return undefined;
+  const stub = env.NANOCODEX_ORGANIZATIONS.getByName(account.organizationId, durablePlacementOptions(env.trustedClientIngressColo));
+  let grant: OrganizationGrant | undefined;
+  const rpc = stub.resolveOrganizationGrant;
+  if (typeof rpc === "function") {
+    grant = consumeRpcData(await Reflect.apply(rpc, stub, [account.id]));
+  } else {
+    const response = await stub.fetch(
+      `https://organization.internal/resolve?userId=${encodeURIComponent(account.id)}`,
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      return undefined;
+    }
+    grant = await response.json<OrganizationGrant>();
   }
-  const grant = await response.json<OrganizationGrant>();
   if (!isOrganizationGrant(grant)
     || grant.organizationId !== account.organizationId) {
     return undefined;
@@ -1635,7 +1607,7 @@ function requireBrowserOrigin(request: Request, url: URL): Response | undefined 
 }
 
 async function listApiKeys(env: AccountAuthEnv, userId: string): Promise<ApiKeyMetadata[]> {
-  const response = await env.NANOCODEX_USERS.getByName(userId).fetch("https://user.internal/api-keys");
+  const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/api-keys");
   if (!response.ok) throw new Error("API key listing failed");
   return response.json<ApiKeyMetadata[]>();
 }
@@ -1662,7 +1634,7 @@ export async function createApiKey(
     prefix: `ncx_live_${id}`,
     createdAt,
   };
-  const key = env.NANOCODEX_API_KEYS.getByName(digest);
+  const key = env.NANOCODEX_API_KEYS.getByName(digest, durablePlacementOptions(env.trustedClientIngressColo));
   const record = {
     ...metadata,
     digest,
@@ -1691,7 +1663,7 @@ export async function createApiKey(
   } else {
     await initialized.body?.cancel();
   }
-  const attached = await env.NANOCODEX_USERS.getByName(principal.userId).fetch(
+  const attached = await env.NANOCODEX_USERS.getByName(principal.userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch(
     "https://user.internal/api-keys",
     {
       method: "POST",
@@ -1713,7 +1685,7 @@ export async function revokeApiKey(
   id: string,
   token?: string,
 ): Promise<boolean> {
-  const account = env.NANOCODEX_USERS.getByName(userId);
+  const account = env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
   let digest: string;
   if (token !== undefined) {
     if (token.match(API_KEY)?.[1] !== id) throw new Error("invalid API key material");
@@ -1726,7 +1698,7 @@ export async function revokeApiKey(
     }
     digest = (await found.json<ApiKeyMetadata & { digest: string }>()).digest;
   }
-  const deleted = await env.NANOCODEX_API_KEYS.getByName(digest).fetch(
+  const deleted = await env.NANOCODEX_API_KEYS.getByName(digest, durablePlacementOptions(env.trustedClientIngressColo)).fetch(
     "https://api-key.internal/record",
     { method: "DELETE" },
   );
@@ -1771,6 +1743,11 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     }
   }
 
+  // Live storage read in a single RPC reply, without a streamed HTTP body.
+  async readAccount(): Promise<UserRecord | undefined> {
+    return this.ctx.storage.get<UserRecord>("account");
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (/^\/(agent-definitions|environment-templates)(?:\/|$)/.test(url.pathname)) {
@@ -1809,7 +1786,7 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         };
         await this.ctx.storage.put("account", record);
         const rootTeamId = crypto.randomUUID();
-        const initialized = await this.env.NANOCODEX_ORGANIZATIONS.getByName(record.organizationId).fetch(
+        const initialized = await this.env.NANOCODEX_ORGANIZATIONS.getByName(record.organizationId, durablePlacementOptions(request.headers.get(TRUSTED_INGRESS_HEADER))).fetch(
           "https://organization.internal/initialize",
           {
             method: "PUT",
@@ -1829,7 +1806,7 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         return json(record);
       }
       if (request.method === "GET") {
-        const record = await this.ctx.storage.get<UserRecord>("account");
+        const record = await this.readAccount();
         return record ? json(record) : json({ error: "not_found" }, { status: 404 });
       }
     }
@@ -1925,16 +1902,18 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         || !Array.isArray(value.activeTurnIds) || !value.activeTurnIds.every(id => typeof id === "string")
         || !Number.isFinite(value.updatedAt)
         || (value.lastUserMessageAt !== undefined && (!Number.isFinite(value.lastUserMessageAt) || value.lastUserMessageAt < 0))
+        || (value.lastUserPrompt !== undefined && (typeof value.lastUserPrompt !== "string" || value.lastUserPrompt.length > LAST_USER_PROMPT_LIMIT))
         || (value.title !== undefined && (typeof value.title !== "string" || value.title.length > 56))
         || (value.activity !== undefined && (typeof value.activity !== "string" || value.activity.length > 90))) {
         return json({ error: "invalid_presentation" }, { status: 400 });
       }
       this.ctx.storage.sql.exec(`UPDATE agent_registry SET presentation = json_set(?, '$.lastUserMessageAt',
-        COALESCE(?, json_extract(presentation, '$.lastUserMessageAt'), CASE WHEN turn_count > 0 THEN updated_at ELSE 0 END)),
+        COALESCE(?, json_extract(presentation, '$.lastUserMessageAt'), CASE WHEN turn_count > 0 THEN updated_at ELSE 0 END),
+        '$.lastUserPrompt', COALESCE(?, json_extract(presentation, '$.lastUserPrompt'), '')),
         title = COALESCE(?, title)
         WHERE id = ? AND deleted_at IS NULL
           AND COALESCE(json_extract(presentation, '$.revision'), 0) < ?`,
-        JSON.stringify(value), value.lastUserMessageAt ?? null, value.title ?? null, presentationMatch[1]!, value.revision);
+        JSON.stringify(value), value.lastUserMessageAt ?? null, value.lastUserPrompt ?? null, value.title ?? null, presentationMatch[1]!, value.revision);
       return new Response(null, { status: 204 });
     }
     const activityMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/activity$/);
@@ -1994,6 +1973,34 @@ function agentSummary(row: AgentRegistryRow): AgentSummary {
 }
 
 export class Organization extends DurableObject<AccountAuthEnv> {
+  async resolveOrganizationGrant(userId: string): Promise<OrganizationGrant | undefined> {
+    if (!isUserId(userId)) return undefined;
+    // Read all authority from storage on every RPC, just as the HTTP route does.
+    const [metadata, membership] = await Promise.all([
+      this.ctx.storage.get<OrganizationMetadata>("metadata"),
+      this.ctx.storage.get<OrganizationMembership>(userMembershipStorageKey(userId)),
+    ]);
+    if (!isOrganizationMetadata(metadata)
+      || !isOrganizationMembership(membership)
+      || membership.userId !== userId
+      || membership.organizationId !== metadata.id) {
+      return undefined;
+    }
+    const team = await this.ctx.storage.get<TeamRecord>(teamStorageKey(membership.teamId));
+    if (!isTeamRecord(team)
+      || team.id !== membership.teamId
+      || team.organizationId !== metadata.id) {
+      return undefined;
+    }
+    return {
+      organizationId: metadata.id,
+      teamId: membership.teamId,
+      role: membership.role,
+      authorizationEpoch: metadata.authorizationEpoch,
+      capabilities: membership.role === "owner" ? OWNER_CAPABILITIES : membership.capabilities,
+    };
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/initialize" && request.method === "PUT") {
@@ -2063,29 +2070,8 @@ export class Organization extends DurableObject<AccountAuthEnv> {
         userId = body.userId;
       }
       if (!isUserId(userId)) return json({ error: "invalid_subject" }, { status: 400 });
-      const [metadata, membership] = await Promise.all([
-        this.ctx.storage.get<OrganizationMetadata>("metadata"),
-        this.ctx.storage.get<OrganizationMembership>(userMembershipStorageKey(userId)),
-      ]);
-      if (!isOrganizationMetadata(metadata)
-        || !isOrganizationMembership(membership)
-        || membership.userId !== userId
-        || membership.organizationId !== metadata.id) {
-        return json({ error: "not_found" }, { status: 404 });
-      }
-      const team = await this.ctx.storage.get<TeamRecord>(teamStorageKey(membership.teamId));
-      if (!isTeamRecord(team)
-        || team.id !== membership.teamId
-        || team.organizationId !== metadata.id) {
-        return json({ error: "not_found" }, { status: 404 });
-      }
-      return json({
-        organizationId: metadata.id,
-        teamId: membership.teamId,
-        role: membership.role,
-        authorizationEpoch: metadata.authorizationEpoch,
-        capabilities: membership.role === "owner" ? OWNER_CAPABILITIES : membership.capabilities,
-      } satisfies OrganizationGrant);
+      const grant = await this.resolveOrganizationGrant(userId);
+      return grant ? json(grant) : json({ error: "not_found" }, { status: 404 });
     }
     if (url.pathname === "/metadata") {
       const metadata = await this.ctx.storage.get<OrganizationMetadata>("metadata");
@@ -2280,23 +2266,6 @@ function organizationRoleRank(role: OrganizationRole): number {
   return role === "owner" ? 2 : role === "writer" ? 1 : 0;
 }
 
-export function isOrganizationCapabilities(value: unknown): value is readonly OrganizationCapability[] {
-  if (!Array.isArray(value) || new Set(value).size !== value.length) return false;
-  return value.every((capability) =>
-    capability === "agents:read"
-    || capability === "agents:portability"
-    || capability === "agents:write"
-    || capability === "api_keys:read"
-    || capability === "api_keys:write"
-    || capability === "history:read"
-    || capability === "memory:read"
-    || capability === "memory:write"
-    || capability === "tools:use"
-    || capability === "organization:read"
-    || capability === "organization:write"
-  );
-}
-
 const CONNECT_CAPABILITIES = new Set<OrganizationCapability>([
   "agents:read",
   "agents:portability",
@@ -2391,31 +2360,6 @@ function isOrganizationGrant(value: unknown): value is OrganizationGrant {
     && Number.isSafeInteger(grant.authorizationEpoch)
     && Number(grant.authorizationEpoch) >= 1
     && isOrganizationCapabilities(grant.capabilities);
-}
-
-function isApiKeyBase(value: unknown): value is ApiKeyBase {
-  if (typeof value !== "object" || value === null) return false;
-  const record = value as Partial<ApiKeyBase>;
-  return typeof record.id === "string"
-    && /^[A-Za-z0-9_-]{12}$/.test(record.id)
-    && typeof record.label === "string"
-    && record.label.length <= 120
-    && record.prefix === `ncx_live_${record.id}`
-    && Number.isFinite(record.createdAt)
-    && typeof record.digest === "string"
-    && /^[A-Za-z0-9_-]{43}$/.test(record.digest)
-    && isUserId(record.userId);
-}
-
-function isStoredApiKey(value: unknown): value is StoredApiKey {
-  if (!isApiKeyBase(value)) return false;
-  const record = value as Partial<StoredApiKey>;
-  return isUuid(record.organizationId)
-    && isUuid(record.teamId)
-    && isOrganizationRole(record.role)
-    && isOrganizationCapabilities(record.capabilities)
-    && Number.isSafeInteger(record.authorizationEpoch)
-    && Number(record.authorizationEpoch) >= 1;
 }
 
 function sameStoredApiKey(value: unknown, expected: StoredApiKey): boolean {

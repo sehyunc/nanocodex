@@ -162,7 +162,7 @@ test("OpenRouter single-call mode does not require a parallel-call endpoint", as
   assert.equal(result.at(-1).response.output.length, 1);
 });
 
-test("OpenRouter fails closed when single-call mode receives multiple calls", async () => {
+test("OpenRouter preserves multiple validated calls despite a false parallel preference", async () => {
   const outcomes = [];
   const transport = createGatewayResponses({ ...options, onRequest: () => ({
     headers() {}, finish(outcome) { outcomes.push(outcome); },
@@ -171,9 +171,10 @@ test("OpenRouter fails closed when single-call mode receives multiple calls", as
     return completion({ tool_calls: ["one", "two"].map(id => ({ id,
       function: { name: body.tools[0].function.name, arguments: "{}" } })) }, "tool_calls");
   } });
-  await assert.rejects(invoke(transport, { parallel_tool_calls: false,
-    tools: [{ type: "function", name: "read", parameters: { type: "object" } }], input: "read" }), /Gateway Responses/);
-  assert.deepEqual(outcomes, ["protocol_error"]);
+  const result = await events(await invoke(transport, { parallel_tool_calls: false,
+    tools: [{ type: "function", name: "read", parameters: { type: "object" } }], input: "read" }));
+  assert.deepEqual(result.at(-1).response.output.map(item => item.call_id), ["one", "two"]);
+  assert.deepEqual(outcomes, ["success"]);
 });
 
 test("explicit parallel mode still requires provider support", async () => {
@@ -305,7 +306,7 @@ test("Cloudflare fails closed and sanitizes binding errors without retries or fa
       { error: { message: secret } }, { choices: [] }, nativeResponse([], { status: "failed", error: { message: secret } }),
       nativeResponse([{ type: "web_search_call", status: "completed" }]),
       nativeResponse([{ ...tool, name: secret }]), nativeResponse([{ ...tool, arguments: secret }]),
-      nativeResponse([{ ...tool, call_id: undefined }]), nativeResponse([tool, { ...tool, call_id: "two" }]),
+      nativeResponse([{ ...tool, call_id: undefined }]), nativeResponse([tool, { ...tool }]),
       nativeResponse([tool], { status: "incomplete", incomplete_details: { reason: "max_output_tokens" } }),
       nativeResponse([{ ...nativeText("x"), content: [{ type: "refusal", refusal: secret }] }]),
       nativeResponse([nativeText("x")], { usage: { input_tokens: secret } }),
@@ -604,3 +605,79 @@ test("Chat tool guard includes tools declared in retained history", async () => 
   ] }), /incompatible/);
   assert.equal(calls, 0);
 });
+
+// Exercise both wire modes through the public gateway with MiMo routing. Custom
+// grammar validation/execution still belongs to the existing native tool path.
+for (const provider of ["openrouter", "vercel"]) for (const stream of [false, true]) {
+  const label = `${provider}/${stream ? "streaming" : "buffered"} raw custom input`;
+  const custom = { type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] };
+  const tools = [{ type: "function", name: "other" }, custom];
+  const forced = { type: "custom", namespace: "functions", name: "exec" };
+  const raw = " \n// exact freeform input\r\ntext('π 🐈 \"quoted\"');\t\n";
+  const call = (name = "tool_1", args = raw, id = "raw-call") => ({ id, type: "function", function: { name, arguments: args } });
+  const upstream = (message, finish_reason = "tool_calls") => {
+    if (!stream) return completion(message, finish_reason);
+    const data = [{ choices: [{ index: 0, delta: message, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason }] }, "[DONE]"];
+    return new Response(data.map(value => `data: ${typeof value === "string" ? value : JSON.stringify(value)}\n\n`).join(""),
+      { headers: { "content-type": "text/event-stream" } });
+  };
+  const streamedCalls = calls => calls.map((value, index) => stream ? { ...value, index } : value);
+  test(`${label} preserves registered aliases, forced choice and full-history replay`, async () => {
+    for (const alias of ["tool_1", "functions.exec", "exec"]) {
+      const requests = [];
+      const transport = createGatewayResponses({ ...options, provider, model: "mimo-v2.6-pro", fetch: async (_url, init) => {
+        const body = JSON.parse(init.body); requests.push(body);
+        assert.equal(body.model, "xiaomi/mimo-v2.6-pro");
+        if (requests.length === 1) {
+          assert.equal(body.tools.find(tool => tool.function.name === "tool_1").function.parameters.properties.input.type, "string");
+          return upstream({ tool_calls: streamedCalls([call(alias)]) });
+        }
+        assert.deepEqual(body.messages[1].tool_calls, [call("tool_1", JSON.stringify({ input: raw }))]);
+        assert.deepEqual(body.messages[2], { role: "tool", tool_call_id: "raw-call", content: "ok" });
+        return upstream({ content: "done" }, "stop");
+      }});
+      const first = await events(await invoke(transport, { stream, tools, tool_choice: forced, input: "run" }));
+      const result = first.at(-1).response, item = result.output[0];
+      assert.equal(result.output.length, 1);
+      assert.deepEqual({ type: item.type, call_id: item.call_id, namespace: item.namespace, name: item.name, input: item.input },
+        { type: "custom_tool_call", call_id: "raw-call", namespace: "functions", name: "exec", input: raw });
+      assert.equal(first.find(event => event.type === "response.custom_tool_call_input.delta").delta, raw);
+      assert.equal(first.find(event => event.type === "response.custom_tool_call_input.done").input, raw);
+      const second = await events(await invoke(transport, { stream, tools, input: [{ role: "user", content: "run" }, ...result.output,
+        { type: "custom_tool_call_output", call_id: "raw-call", output: "ok" }] }));
+      assert.equal(second.at(-1).response.end_turn, true);
+    }
+  });
+  test(`${label} retains strict JSON, identity and terminal guards without reflecting data`, async () => {
+    const privateRaw = "text('synthetic-secret')";
+    const scenarios = [
+      ...['{"input":"synthetic-secret', '["synthetic-secret"', '"synthetic-secret', ' ', '',
+        '{"input":"synthetic-secret"}{"input":"synthetic-secret"}', '"synthetic-secret"', '{"input":42}',
+        'null', 'true', '42', '[]'].map(args => ({ calls: [call("tool_1", args)] })),
+      { calls: [call("tool_0", privateRaw)] },
+      { calls: [call("tool_2", privateRaw)], tools: [...tools, { type: "tool_search", execution: "client" }] },
+      { calls: [call("synthetic-secret", privateRaw)] },
+      { calls: [call("exec", privateRaw)], tools: [...tools, { ...custom, name: "other" }] },
+      { calls: [call("tool_1", privateRaw)], tool_choice: { type: "function", name: "other" } },
+      { calls: [call("tool_1", privateRaw)], tool_choice: "none" },
+      { calls: [call("tool_1", privateRaw, "")] },
+      { calls: [call("tool_1", privateRaw, 42)] },
+      { calls: [call("tool_1", privateRaw), call("tool_1", privateRaw)] },
+      { calls: [call("tool_1", privateRaw)], finish: "length" },
+      { calls: [call("tool_1", privateRaw)], finish: "content_filter" },
+    ];
+    for (const { calls, finish, ...request } of scenarios) {
+      const outcomes = [];
+      const transport = createGatewayResponses({ ...options, provider, model: "mimo-v2.6-pro",
+        fetch: async () => upstream({ tool_calls: streamedCalls(calls) }, finish),
+        onRequest: () => ({ finish(outcome) { outcomes.push(outcome); } }) });
+      await assert.rejects(async () => events(await invoke(transport, { stream, tools, input: "run", ...request })), error => {
+        assert.match(error.message, /Gateway Responses|invalid provider stream/);
+        assert.equal(error.message.includes("synthetic-secret"), false);
+        return true;
+      });
+      assert.deepEqual(outcomes, ["protocol_error"]);
+    }
+  });
+}

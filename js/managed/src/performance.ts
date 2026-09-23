@@ -37,6 +37,16 @@ export async function performanceStage<T>(stage: string, run: () => Promise<T>):
     stage, started_at: Date.now() - (performance.now() - began), duration_ms: performance.now() - began, success }); }
 }
 
+/** One bounded discovery record; no owner, authority key or metadata payload. */
+export function performanceCache(stage: string, cacheState: "hit" | "miss", ageMs: number, remainingMs: number): void {
+  const context = contexts.getStore();
+  if (!context) return;
+  try {
+    console.info({ type: "managed.performance", trace_id: context.trace_id, stage,
+      cache_state: cacheState, cache_age_ms: Math.max(0, ageMs), remaining_ttl_ms: Math.max(0, remainingMs) });
+  } catch { /* Passive cache observations cannot fail admission. */ }
+}
+
 export function performanceRead<T>(table: string, run: () => T): T {
   const context = contexts.getStore();
   if (!context) return run();
@@ -136,4 +146,81 @@ export function performanceState<Props>(state: DurableObjectState<Props>): Durab
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+/** Observe the existing output-gate commit without delaying the response path.
+ * sync waits for pending writes; it does not weaken durability or start an RPC.
+ * CF handler clocks cannot show time spent behind the output gate after return.
+ */
+export function performanceCommit(state: Pick<DurableObjectState, "id" | "storage" | "waitUntil">,
+  stage: "session.create.commit"): void {
+  const began = performance.now();
+  const traceId = state.id.toString();
+  const record = (success: boolean) => {
+    try { console.info({ type: "managed.performance", trace_id: traceId, stage,
+      duration_ms: performance.now() - began, success }); }
+    catch { /* Observation cannot alter a durable response. */ }
+  };
+  try { state.waitUntil(state.storage.sync().then(() => record(true), () => record(false))); }
+  catch { /* Native output gates remain authoritative if observation fails. */ }
+}
+
+/** One owned-connection summary. Only fixed numeric fields and correlation IDs. */
+export function performanceSocketTiming(sessionId: string, observation: unknown): void {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return;
+  const input = observation as Record<string, unknown>;
+  const metrics: Record<string, number> = {};
+  for (const key of ["message_count", "delivered_message_count", "buffered_message_count", "discarded_message_count",
+    "queue_residence_total_ms", "queue_residence_max_ms"]) {
+    const value = input[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return;
+    metrics[key] = value;
+  }
+  try {
+    console.info({ type: "managed.performance", stage: "transport.socket_queue", session_id: sessionId, ...metrics });
+    if (!Array.isArray(input.provider_timings)) return;
+    for (const provider of input.provider_timings.slice(0, 32)) {
+      if (!provider || typeof provider !== "object" || Array.isArray(provider)
+        || (provider.response_id !== undefined && (typeof provider.response_id !== "string"
+          || !/^resp_[A-Za-z0-9_-]{1,128}$/.test(provider.response_id)))) continue;
+      const timing: Record<string, number> = {};
+      for (const key of ["pre_inference_ms", "engine_queue_max_ms", "engine_service_ttft_total_ms"]) {
+        const value = provider[key];
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 86_400_000) timing[key] = value;
+      }
+      if (Object.keys(timing).length) console.info({ type: "managed.performance", stage: "transport.provider_timing",
+        session_id: sessionId, ...(provider.response_id === undefined ? {} : { response_id: provider.response_id }), ...timing });
+    }
+  } catch { /* Passive observations cannot fail transport cleanup. */ }
+}
+
+/** Post-policy WebSocket request controls; no input, tool schema, IDs or metadata. */
+export function performanceRequestShape(sessionId: string, observation: unknown): void {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return;
+  const input = observation as Record<string, unknown>;
+  const safe: Record<string, string | number | boolean> = {};
+  const enums: Record<string, readonly string[]> = {
+    model: ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"],
+    reasoning_effort: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+    reasoning_context: ["all_turns", "last_turn"],
+    service_tier: ["default", "auto", "priority", "flex", "fast"],
+    text_verbosity: ["low", "medium", "high"],
+    tool_choice: ["auto", "none", "required"],
+  };
+  for (const [key, allowed] of Object.entries(enums)) {
+    const value = input[key];
+    if (typeof value !== "string" || (!allowed.includes(value) && value !== "other_or_absent")) return;
+    safe[key] = value;
+  }
+  for (const key of ["encoded_characters", "input_items", "tools_count"]) {
+    const value = input[key];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return;
+    safe[key] = value;
+  }
+  for (const key of ["cache_key_present", "previous_response_present", "encrypted_reasoning_included",
+    "parallel_tool_calls", "store", "stream", "generate"]) {
+    if (typeof input[key] === "boolean") safe[key] = input[key];
+  }
+  try { console.info({ type: "managed.performance", stage: "transport.request_controls", session_id: sessionId, ...safe }); }
+  catch { /* Diagnostics cannot change a sent request. */ }
 }

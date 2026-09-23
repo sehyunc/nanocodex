@@ -79,7 +79,7 @@ describe("Session-only model egress", () => {
     const env = { USER_CREDENTIALS: { getByName }, MANAGED_AGENT_OWNERSHIP: { fetch: callback } } as unknown as EgressEnv;
     const entrypoint = new SessionModelEgress(createExecutionContext(), env);
     for (let i = 0; i < 2; i++) expect((await entrypoint.fetch(request())).status).toBe(200);
-    expect(getByName).toHaveBeenCalledWith(owner);
+    expect(getByName).toHaveBeenCalledWith(owner, undefined);
     expect(lookup).toHaveBeenCalledTimes(2);
     expect(callback).not.toHaveBeenCalled();
     expect(upstream).toHaveBeenCalledTimes(2);
@@ -218,5 +218,37 @@ describe("Session-only model egress", () => {
       const input = request(); input.headers.set(header!, value!);
       expect((await entrypoint.fetch(input)).status).toBe(403);
     }
+  });
+});
+
+describe("model credential RPC ownership", () => {
+  it.each([
+    [200, "fixture-provider-secret", 200],
+    [404, "fixture-provider-secret", 409],
+    [429, "fixture-provider-secret", 429],
+    [200, "", 503],
+  ])("disposes credential status %s before use or rejection (secret=%s)", async (status, secret, expected) => {
+    const dispose = vi.fn();
+    const raw = { status, credential: { kind: "openai", revision: 1, secret },
+      [Symbol.dispose]() { raw.credential.secret = "disposed"; dispose(); } };
+    const lookup = vi.fn(async () => raw);
+    const upstream = vi.fn(async (input: Request) => {
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(input.headers.get("authorization")).toBe("Bearer fixture-provider-secret");
+      expect(input.headers.has(ownerHeader)).toBe(false);
+      return new Response(null, { status: 200 });
+    });
+    vi.stubGlobal("fetch", upstream);
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const entry = new SessionModelEgress(createExecutionContext(), {
+      USER_CREDENTIALS: { getByName: () => ({ resolveModelCredential: lookup }) },
+    } as unknown as EgressEnv);
+    const response = await entry.fetch(request());
+    expect(response.status).toBe(expected);
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(upstream).toHaveBeenCalledTimes(expected === 200 ? 1 : 0);
+    expect(await response.text()).not.toContain("fixture-provider-secret");
+    expect(JSON.stringify(log.mock.calls)).not.toContain("fixture-provider-secret");
   });
 });

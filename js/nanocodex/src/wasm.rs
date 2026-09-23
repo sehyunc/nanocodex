@@ -242,9 +242,13 @@ struct JavaScriptSpawnRouter {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct JavaScriptSpawnRoute {
-    model: String,
-    thinking: Thinking,
+    model: Option<String>,
+    thinking: Option<Thinking>,
+    #[serde(default)]
+    native: bool,
     route_id: String,
+    #[serde(default)]
+    stateless_http: bool,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -257,6 +261,25 @@ impl nanocodex_subagents::SpawnRouter for JavaScriptSpawnRouter {
         options: SpawnOptions,
         host_context: Option<&str>,
     ) -> std::io::Result<nanocodex_subagents::SpawnRoute> {
+        match self
+            .resolve_spawn(parent_session_id, role, task, options, host_context)
+            .await?
+        {
+            nanocodex_subagents::SpawnDecision::Routed(route) => Ok(route),
+            nanocodex_subagents::SpawnDecision::Native { .. } => Err(std::io::Error::other(
+                "native spawn requires a spawn decision",
+            )),
+        }
+    }
+
+    async fn resolve_spawn(
+        &self,
+        parent_session_id: &str,
+        role: &str,
+        task: &str,
+        options: SpawnOptions,
+        host_context: Option<&str>,
+    ) -> std::io::Result<nanocodex_subagents::SpawnDecision> {
         let mut request = serde_json::json!({ "parentSessionId": parent_session_id,
             "role": role, "task": task });
         if let Some(model) = options.selected_model() {
@@ -278,8 +301,22 @@ impl nanocodex_subagents::SpawnRouter for JavaScriptSpawnRouter {
                 .as_string()
                 .ok_or_else(|| std::io::Error::other("invalid subagent route response"))?,
         )?;
+        if route.native {
+            if route.model.is_some() || route.thinking.is_some() || route.stateless_http {
+                return Err(std::io::Error::other(
+                    "native spawn cannot override requested settings",
+                ));
+            }
+            return Ok(nanocodex_subagents::SpawnDecision::Native {
+                reference: route.route_id,
+            });
+        }
+        let thinking = route
+            .thinking
+            .ok_or_else(|| std::io::Error::other("missing routed thinking"))?;
         let model = route
             .model
+            .ok_or_else(|| std::io::Error::other("missing routed model"))?
             .parse::<Model>()
             .map_err(std::io::Error::other)?;
         if options
@@ -287,7 +324,7 @@ impl nanocodex_subagents::SpawnRouter for JavaScriptSpawnRouter {
             .is_some_and(|requested| requested != model)
             || options
                 .selected_thinking()
-                .is_some_and(|thinking| thinking != route.thinking)
+                .is_some_and(|requested| requested != thinking)
         {
             return Err(std::io::Error::other(
                 "subagent route conflicts with explicit override",
@@ -296,10 +333,16 @@ impl nanocodex_subagents::SpawnRouter for JavaScriptSpawnRouter {
         if route.route_id.trim().is_empty() {
             return Err(std::io::Error::other("empty subagent route reference"));
         }
-        Ok(nanocodex_subagents::SpawnRoute {
-            options: SpawnOptions::new().model(model).thinking(route.thinking),
-            reference: route.route_id,
-        })
+        let mut options = SpawnOptions::new().model(model).thinking(thinking);
+        if route.stateless_http {
+            options = options.stateless_http();
+        }
+        Ok(nanocodex_subagents::SpawnDecision::Routed(
+            nanocodex_subagents::SpawnRoute {
+                options,
+                reference: route.route_id,
+            },
+        ))
     }
 
     fn bind(
@@ -2533,19 +2576,36 @@ impl WasmManagedBrowserVoice {
         })
     }
 
+    /// Binds the known managed call before admission or microphone setup begins.
+    ///
+    /// # Errors
+    /// Rejects invalid session IDs or rebinding an active call.
+    #[wasm_bindgen(js_name = bindSession)]
+    pub fn bind_session(&self, managed_session_id: &str) -> Result<(), JsValue> {
+        if self.started.get() || self.call_prepared.get() {
+            return Err(js_error("voice session binding requires a new call"));
+        }
+        let session_id = managed_voice_session_id(managed_session_id)?;
+        self.protocol.borrow_mut().bind_session(&session_id);
+        Ok(())
+    }
+
     /// Starts the protocol from the managed Agent's authoritative serialized context.
     ///
     /// # Errors
     ///
     /// Rejects malformed `AgentSessionContext` JSON.
-    pub fn start(&self, context_json: &str) -> Result<(), JsValue> {
+    pub fn start(&self, context_json: &str) -> Result<String, JsValue> {
         if self.started.get() {
-            return Ok(());
+            return encode_voice_effects(&BrowserVoiceEffects::default());
         }
-        let _context = serde_json::from_str::<WasmOwnedAgentSessionContext>(context_json)
+        let context: serde_json::Value = serde_json::from_str(context_json)
             .map_err(|error| js_error(format!("invalid AgentSessionContext: {error}")))?;
+        serde_json::from_value::<WasmOwnedAgentSessionContext>(context.clone())
+            .map_err(|error| js_error(format!("invalid AgentSessionContext: {error}")))?;
+        let effects = self.protocol.borrow_mut().personalization(&context);
         self.started.set(true);
-        Ok(())
+        encode_voice_effects(&effects)
     }
 
     /// Encodes the managed same-origin call request after the browser creates its SDP offer.
@@ -2725,12 +2785,6 @@ fn managed_voice_session_id(value: &str) -> Result<String, JsValue> {
         .parse::<SessionId>()
         .map(|session_id| session_id.to_string())
         .map_err(|error| js_error(format!("invalid managed session ID: {error}")))
-}
-
-/// Returns the shared bounded first-prompt retrieval plan for a managed host.
-#[wasm_bindgen(js_name = managedBootstrapPlan)]
-pub fn managed_bootstrap_plan(input: &str) -> String {
-    nanocodex_voice_protocol::bootstrap_plan(input).to_string()
 }
 
 fn encode_managed_voice_update(

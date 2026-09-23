@@ -84,10 +84,44 @@ export class ChatGptEgress extends Container {
   }
 
   override async fetch(request: Request): Promise<Response> {
-    if (new URL(request.url).pathname === "/internal/claude-auth") return new Response(null, { status: 404 });
+    const pathname = new URL(request.url).pathname;
+    if (pathname === "/internal/claude-auth") return new Response(null, { status: 404 });
     const claude = request.headers.get("x-nanocodex-cliproxy-provider") === "claude";
     if (claude) await this.#restoreClaudeAuth();
-    if (new URL(request.url).pathname !== "/backend-api/codex/realtime/calls") {
+    if (pathname === "/backend-api/codex/responses"
+      && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const began = performance.now();
+      const wasRunning = this.ctx.container?.running;
+      // Generated here, never copied from a caller's identifier or credential.
+      // The Node relay does not forward this private correlation header upstream.
+      const relayId = crypto.randomUUID();
+      // Parent ID is generated/overwritten by egress at the private DO boundary.
+      // UUID validation bounds the log value; it does not authenticate its origin.
+      const egressRequestId = request.headers.get("x-nanocodex-egress-request-id");
+      const headers = new Headers(request.headers);
+      headers.set("x-nanocodex-relay-id", relayId);
+      headers.delete("x-nanocodex-egress-request-id");
+      let status: number | undefined;
+      try {
+        const response = await super.fetch(new Request(request, { headers }));
+        status = response.status;
+        if (claude) await this.#captureClaudeAuth();
+        // Preserve the exact upgrade Response and its webSocket; do not wrap it.
+        return response;
+      } finally {
+        try {
+          console.info({
+            type: "responses.relay", transport: "websocket", relay_id: relayId,
+            ...(egressRequestId
+              && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(egressRequestId)
+              ? { egress_request_id: egressRequestId } : {}),
+            was_running: wasRunning, duration_ms: performance.now() - began,
+            ...(status === undefined ? { outcome: "error" } : { status, outcome: "response" }),
+          });
+        } catch { /* Observability must not change the upgrade result. */ }
+      }
+    }
+    if (pathname !== "/backend-api/codex/realtime/calls") {
       const response = await super.fetch(request);
       if (claude) await this.#captureClaudeAuth();
       return response;
@@ -114,3 +148,13 @@ export class ChatGptEgress extends Container {
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
   }
 }
+
+// Separate classes create independent container applications with regional
+// constraints. They share the relay image/behavior; no credential state moves.
+export class ChatGptEgressWnam extends ChatGptEgress {}
+export class ChatGptEgressEnam extends ChatGptEgress {}
+export class ChatGptEgressWeur extends ChatGptEgress {}
+export class ChatGptEgressEeur extends ChatGptEgress {}
+export class ChatGptEgressApac extends ChatGptEgress {}
+export class ChatGptEgressSam extends ChatGptEgress {}
+export class ChatGptEgressOc extends ChatGptEgress {}

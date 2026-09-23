@@ -24,6 +24,7 @@ mod shell;
 mod spinner;
 mod terminal;
 mod theme;
+mod tmux;
 mod transcript;
 mod vault;
 mod voice_clone;
@@ -1851,6 +1852,7 @@ async fn run_inner(
     client: &ManagedClient,
     attach: Option<Option<String>>,
 ) -> Result<(), ManagedError> {
+    let first_frame = crate::startup_timing::Stage::new("tui_first_frame");
     let workspace = HostConfig::load()
         .map_err(|error| ManagedError::Configuration(error.to_string()))?
         .workspace()
@@ -1868,25 +1870,15 @@ async fn run_inner(
     root.set_fast_mode(initial_settings.fast_mode);
     root.set_model(initial_settings.model);
 
-    let mut theme = Theme::default();
-    if let Some(scheme) = detect_system_scheme() {
-        theme.set_system_scheme(scheme);
-    }
-    let mut app = AppNode::new(theme, workspace.clone(), root);
-    let mut reload = match crate::reload::register() {
-        Ok(registration) => Some(registration),
-        Err(error) => {
-            tracing::warn!(%error, "local reload unavailable");
-            None
-        }
-    };
+    let mut app = AppNode::new(Theme::default(), workspace.clone(), root);
+    let mut reload: Option<crate::reload::Registration> = None;
     let mut reload_requested = false;
-    let mut terminal = TerminalSession::enter().map_err(terminal_error)?;
+    let mut terminal = TerminalSession::enter().await.map_err(terminal_error)?;
     let mut input = EventStream::new();
     let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
     let mut runtime = DriverRuntime {
         control_bridge: None,
-        screen: screen::Controller::new(components::video_picker()),
+        screen: screen::Controller::new(None),
         client: client.clone(),
         pending_voice: None,
         voice_selection: Default::default(),
@@ -1969,6 +1961,20 @@ async fn run_inner(
         .draw(|frame| app.render(frame))
         .map_err(terminal_error)?;
     scheduler.presented(Instant::now());
+    drop(first_frame);
+    // An updater can hold reload's coordination lock. Keep registration owned,
+    // but wait off the input loop so it becomes available after contention clears.
+    // Dropping the JoinSet also drops any uncollected registration and its lease.
+    let mut reload_setup = JoinSet::new();
+    reload_setup.spawn_blocking(crate::reload::register);
+    // Theme and tmux discovery must not delay the first editable frame. These
+    // tasks never read stdin; the terminal event stream remains its sole owner.
+    let mut presentation_setup = JoinSet::new();
+    presentation_setup.spawn(async {
+        components::initialize_image_renderer().await;
+        None
+    });
+    presentation_setup.spawn_blocking(detect_system_scheme);
     match attach {
         Some(None) => {
             let update = app.open_resume_selector();
@@ -1997,6 +2003,9 @@ async fn run_inner(
     }
     let mut clone_tick = tokio::time::interval(std::time::Duration::from_millis(200));
     clone_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tmux = tmux::Publisher::new();
+    let mut tmux_tick = tokio::time::interval(Duration::from_secs(2));
+    tmux_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut stopping = false;
     #[cfg(unix)]
     let mut control_server = if nanocodex_tui_control::Server::enabled() {
@@ -2175,6 +2184,36 @@ async fn run_inner(
                 (Some(&mut voice.status), Some(&mut voice.transcripts))
             });
         tokio::select! {
+            _ = tmux_tick.tick(), if tmux.is_some() => {
+                if let Some(publisher) = &mut tmux {
+                    let status = if runtime.recovery.is_some() { "reconnecting" }
+                        else if runtime.agent.is_none() { "connecting" }
+                        else if !runtime.managed_events_open { "disconnected" }
+                        else if !runtime.controls.is_empty() || !runtime.admitting.is_empty()
+                            || !runtime.managed_active_turns.ids.is_empty() { "running" }
+                        else { "idle" };
+                    let prompt = runtime.recent_prompts.iter()
+                        .find(|prompt| prompt.session_id == runtime.agent_id);
+                    publisher.publish(&runtime.agent_id, status,
+                        prompt.map_or("", |prompt| prompt.text.as_str()),
+                        prompt.map_or(0, |prompt| prompt.recorded_at_unix_ms)).await;
+                }
+            }
+            result = reload_setup.join_next(), if !reload_setup.is_empty() => {
+                match result {
+                    Some(Ok(Ok(registration))) => reload = Some(registration),
+                    Some(Ok(Err(error))) => tracing::warn!(%error, "local reload unavailable"),
+                    Some(Err(error)) => tracing::warn!(%error, "local reload setup failed"),
+                    None => {}
+                }
+            }
+            result = presentation_setup.join_next(), if !presentation_setup.is_empty() => {
+                if let Some(Ok(Some(scheme))) = result {
+                    request_render(app.update(AppEvent::SystemThemeChanged(scheme)), &mut scheduler);
+                } else {
+                    scheduler.request_immediate(Instant::now());
+                }
+            }
             command = async {
                 #[cfg(unix)]
                 if let Some(server) = &mut control_server {
@@ -2781,7 +2820,12 @@ async fn run_inner(
                             {
                                 runtime.start_submission(pane, id, prompt);
                             }
-                            runtime.refresh_routing();
+                            // Live creation accepts fixed model settings only;
+                            // routing starts disabled. Existing threads still
+                            // hydrate their durable routing configuration.
+                            if !created {
+                                runtime.refresh_routing();
+                            }
                             runtime.start_history_prefetch(pane);
                         }
                         ConnectionResult::Agent { purpose, result: Err(failure) } => {
@@ -3354,12 +3398,7 @@ fn fresh_thread_settings(was_routed: bool, settings: AgentSettings) -> AgentSett
 }
 
 fn new_agent_settings() -> AgentSettings {
-    AgentSettings {
-        model: Model::Astra,
-        thinking: Thinking::Low,
-        reasoning_mode: ManagedReasoningMode::Standard,
-        fast_mode: false,
-    }
+    super::control::InitialSettings::default().resolve()
 }
 
 async fn apply_update(
@@ -4481,14 +4520,14 @@ mod tests {
     }
 
     #[test]
-    fn new_agents_select_astra_without_an_entitlement_probe() {
+    fn new_agents_select_sol_xhigh_fast_without_an_entitlement_probe() {
         assert_eq!(
             new_agent_settings(),
             AgentSettings {
-                model: Model::Astra,
-                thinking: Thinking::Low,
+                model: Model::Sol,
+                thinking: Thinking::Xhigh,
                 reasoning_mode: ManagedReasoningMode::Standard,
-                fast_mode: false,
+                fast_mode: true,
             }
         );
     }
@@ -4737,7 +4776,9 @@ mod tests {
                 .unwrap();
         DriverRuntime {
             control_bridge: None,
-            screen: crate::tui::screen::Controller::new(ratatui_image::picker::Picker::halfblocks()),
+            screen: crate::tui::screen::Controller::new(Some(
+                ratatui_image::picker::Picker::halfblocks(),
+            )),
             pending_voice: None,
             voice_selection: Default::default(),
             voice_tasks: JoinSet::new(),
@@ -6056,6 +6097,7 @@ mod tests {
                 "agent-1".to_owned(),
                 AgentSummary {
                     title: "A durable task".to_owned(),
+                    presentation: None,
                     created_at: 1_750_000_000.0,
                     updated_at: 1_750_000_100.0,
                     turn_count: 2,

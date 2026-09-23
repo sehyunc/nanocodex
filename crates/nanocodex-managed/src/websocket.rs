@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,8 @@ use crate::{
     client::{agent_path, validate_id, validate_idempotency_key},
 };
 
+const PREPARE_HEADER: &str = "x-nanocodex-prepare";
+const PREPARE_ACTIVE_CONVERSATION: &str = "active-conversation";
 const EVENT_CAPACITY: usize = 256;
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
@@ -27,6 +32,7 @@ type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct ConnectedSocket {
     socket: Socket,
     replay_through: String,
+    preparation_accepted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -224,6 +230,7 @@ async fn run(
 ) {
     let mut pending: Option<PendingSubmit> = None;
     let mut backoff = RECONNECT_MIN;
+    let mut preparation_fallback_started = false;
     loop {
         if connected.is_none() {
             let attempt = tokio::select! {
@@ -243,6 +250,12 @@ async fn run(
             }
         }
         let mut live = connected.take().expect("socket was connected above");
+        if !live.preparation_accepted && !preparation_fallback_started {
+            // Older Workers ignore the upgrade opt-in. Keep their best-effort
+            // HTTP preparation, once per driver, without delaying submission.
+            client.prepare_active_conversation(&agent_id);
+            preparation_fallback_started = true;
+        }
         if let Some(pending) = pending.as_mut() {
             pending.sent_at = None;
         }
@@ -515,6 +528,10 @@ async fn connect_endpoint(
         tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
         authorization,
     );
+    request.headers_mut().insert(
+        PREPARE_HEADER,
+        tokio_tungstenite::tungstenite::http::HeaderValue::from_static(PREPARE_ACTIVE_CONVERSATION),
+    );
     if let Some(origin) = &client.request_origin {
         request
             .headers_mut()
@@ -526,7 +543,8 @@ async fn connect_endpoint(
     let config = WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None);
-    let (mut socket, _) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    let (mut socket, response) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let tls_timing = ConnectionTiming::new("managed_native_tls");
         let connector = if request.uri().scheme_str() == Some("wss") {
             Some(tokio_tungstenite::Connector::Rustls(
                 nanocodex_oai_api::tls::native_client_config().await?,
@@ -534,11 +552,14 @@ async fn connect_endpoint(
         } else {
             None
         };
+        drop(tls_timing);
+        let _upgrade_timing = ConnectionTiming::new("managed_ws_upgrade");
         connect_async_tls_with_config(request, Some(config), true, connector).await
     })
     .await
     .map_err(|_| live_error("managed WebSocket handshake timed out"))?
     .map_err(|error| live_error(format!("managed WebSocket handshake failed: {error}")))?;
+    let _ready_timing = ConnectionTiming::new("managed_ws_ready");
     match tokio::time::timeout(CONNECT_TIMEOUT, socket.next())
         .await
         .map_err(|_| live_error("managed WebSocket ready timed out"))?
@@ -569,11 +590,50 @@ async fn connect_endpoint(
                 ConnectedSocket {
                     socket,
                     replay_through: ready.latest_event_cursor.clone(),
+                    preparation_accepted: response
+                        .headers()
+                        .get(PREPARE_HEADER)
+                        .is_some_and(|value| value == PREPARE_ACTIVE_CONVERSATION),
                 },
                 ready,
             ))
         }
         _ => Err(live_error("managed WebSocket closed before ready")),
+    }
+}
+
+// Opt-in, content-free connection phases share the CLI startup diagnostic.
+// Only static stage names and monotonic durations enter stderr; requests,
+// responses, origins, identifiers and credentials are never formatted here.
+struct ConnectionTiming {
+    stage: &'static str,
+    started: Option<Instant>,
+}
+
+impl ConnectionTiming {
+    fn new(stage: &'static str) -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            std::env::var_os("NANOCODEX_STARTUP_TIMING").is_some_and(|value| value == "1")
+        });
+        Self {
+            stage,
+            started: enabled.then(Instant::now),
+        }
+    }
+}
+
+impl Drop for ConnectionTiming {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "type": "client.startup", "stage": self.stage,
+                    "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                })
+            );
+        }
     }
 }
 

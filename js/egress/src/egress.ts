@@ -1,3 +1,7 @@
+import { cachedAccountMetadata, validDiscoveryOptions } from "./metadata-cache";
+import { consumeRpcData } from "nanocodex/cloudflare/rpc";
+import type { CloudflareAccountCatalogResult, CloudflareAccountVaultResult, CloudflareAccountDiscoveryResult } from "nanocodex/cloudflare/egress";
+import { durablePlacementOptions, ingressColo, TRUSTED_INGRESS_HEADER, type IngressPlacement } from "nanocodex/cloudflare/durable-placement";
 import { LINK_PATH } from "./connectors/link";
 import { chatGptFailoverSocket, chatGptLimitReset } from "./chatgpt-failover";
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -211,13 +215,22 @@ const CONNECTOR_OPERATIONS: readonly ConnectorOperation[] = [
   },
 ];
 
-export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv {
+export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv, IngressPlacement {
+  trustedPlacementRegion?: DurableObjectLocationHint;
   USER_CREDENTIALS: DurableObjectNamespace<UserCredentialBroker>;
   USER_CONNECTORS: DurableObjectNamespace<UserConnectorBroker>;
   AGENT_SUBJECTS: DurableObjectNamespace<AgentSubjectDirectory>;
   MANAGED_AGENT_OWNERSHIP?: Fetcher;
   MCP_CONNECTIONS: DurableObjectNamespace<McpConnectionDirectory>;
   CHATGPT_EGRESS?: DurableObjectNamespace;
+  // Optional during phased account/egress rollout; absent bindings use legacy.
+  CHATGPT_EGRESS_WNAM?: DurableObjectNamespace;
+  CHATGPT_EGRESS_ENAM?: DurableObjectNamespace;
+  CHATGPT_EGRESS_WEUR?: DurableObjectNamespace;
+  CHATGPT_EGRESS_EEUR?: DurableObjectNamespace;
+  CHATGPT_EGRESS_APAC?: DurableObjectNamespace;
+  CHATGPT_EGRESS_SAM?: DurableObjectNamespace;
+  CHATGPT_EGRESS_OC?: DurableObjectNamespace;
   CHATGPT_VOICE_RELAY_RPC?: string;
   CODEX_RELAY_URL?: string;
   CLIPROXY_CANARY_AGENT_ID?: string;
@@ -230,7 +243,9 @@ export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv {
 /** Bound only to the managed ingress Worker, which has just verified ownership. */
 export class ManagedRealtimeEgress extends WorkerEntrypoint<EgressEnv> {
   fetch(request: Request): Promise<Response> {
-    return handleManagedRealtimeCall(request, this.env, this.ctx);
+    return new URL(request.url).pathname === "/v1/realtime/sideband"
+      ? handleManagedRealtimeSideband(request, this.env, this.ctx)
+      : handleManagedRealtimeCall(request, this.env, this.ctx);
   }
 
   /** SDP is a small, complete reply; transport it with its headers in one RPC. */
@@ -263,6 +278,31 @@ export function handleManagedRealtimeCall(
   // organization, team, epoch, and deletion/export state for either retained
   // subject strategy. Legacy calls need no directory rebind/readback. Only this
   // private entrypoint may carry the result past generic agent egress.
+  const region = validatedRelayRegion(request.headers.get("x-nanocodex-voice-region"));
+  const placed = region ? { ...env, trustedPlacementRegion: region } : env;
+  return handleEgressWithOwner(request, placed, ctx, fetch, undefined, undefined, { subject, userId });
+}
+
+/** The same live ownership admission as calls, without a second Session hop.
+ * This capability is private to managed ingress; generic egress ignores it. */
+export function handleManagedRealtimeSideband(
+  request: Request,
+  env: EgressEnv,
+  ctx?: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const subject = request.headers.get(SUBJECT_HEADER);
+  const userId = request.headers.get("x-nanocodex-realtime-owner");
+  if (request.method !== "GET" || url.origin !== "https://nanocodex.internal"
+    || url.pathname !== "/v1/realtime/sideband" || url.search
+    || request.headers.get("upgrade")?.toLowerCase() !== "websocket"
+    || !validRealtimeCallId(request.headers.get("x-nanocodex-realtime-call-id"))
+    || !subject || !(MANAGED_SESSION_SUBJECT.test(subject) || /^[0-9a-f]{64}$/.test(subject))
+    || !userId || !CHIEF_USER_ID.test(userId)) {
+    return Promise.resolve(Response.json({ error: "invalid_managed_realtime_sideband" }, { status: 403 }));
+  }
+  // Return the provider's exact upgrade Response. Credential resolution,
+  // account selection and refresh remain in the ordinary egress path.
   return handleEgressWithOwner(request, env, ctx, fetch, undefined, undefined, { subject, userId });
 }
 
@@ -284,6 +324,13 @@ export class ChiefOfStaffEgress extends WorkerEntrypoint<EgressEnv> {
 }
 
 const SESSION_MODEL_OWNER_HEADER = "x-nanocodex-session-model-owner";
+const SESSION_MODEL_REGION_HEADER = "x-nanocodex-model-region";
+type SessionModelAuthority = Readonly<{ subject: string; owner: string; region?: DurableObjectLocationHint }>;
+
+function validatedRelayRegion(value: string | null | undefined): DurableObjectLocationHint | undefined {
+  return value && ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc"].includes(value)
+    ? value as DurableObjectLocationHint : undefined;
+}
 
 /** Bound only to the managed Session's private model transport, never tools. */
 export class SessionModelEgress extends WorkerEntrypoint<EgressEnv> {
@@ -297,7 +344,11 @@ export class SessionModelEgress extends WorkerEntrypoint<EgressEnv> {
     }
     const forwarded = new Request(request);
     forwarded.headers.delete(SESSION_MODEL_OWNER_HEADER);
-    return handleEgress(forwarded, this.env, this.ctx, fetch, undefined, { subject, owner });
+    // Only the private Session wrapper may assert placement; generic egress
+    // never derives a region from this header. Nothing private goes upstream.
+    const region = validatedRelayRegion(forwarded.headers.get(SESSION_MODEL_REGION_HEADER));
+    forwarded.headers.delete(SESSION_MODEL_REGION_HEADER);
+    return handleEgress(forwarded, this.env, this.ctx, fetch, undefined, { subject, owner, ...(region ? { region } : {}) });
   }
 }
 
@@ -375,11 +426,44 @@ const OPERATIONS: readonly ModelOperation[] = [
   },
 ];
 
-export default {
-  fetch(request: Request, env: EgressEnv, ctx: ExecutionContext): Promise<Response> {
-    return handleEgress(request, env, ctx);
-  },
-} satisfies ExportedHandler<EgressEnv>;
+export default class Egress extends WorkerEntrypoint<EgressEnv> {
+  fetch(request: Request): Promise<Response> {
+    return handleEgress(request, this.env, this.ctx);
+  }
+
+  /** Explicit discovery opt-in; never used by the live HTTP metadata routes. */
+  async readAccountDiscovery(userId: unknown, component: unknown, options: unknown): Promise<CloudflareAccountDiscoveryResult> {
+    if (typeof userId !== "string" || !USER_ID.test(userId)
+      || (component !== "catalog" && component !== "vault") || !validDiscoveryOptions(options)) {
+      return { schema: 1, status: 400, data: null, expiresAt: 0 };
+    }
+    const namespace = component === "catalog" ? this.env.USER_CONNECTORS : this.env.USER_CREDENTIALS;
+    return cachedAccountMetadata(namespace.idFromName(userId).toString(), component, options, async () => {
+      if (component === "catalog") {
+        const result = await this.readAccountCatalog(userId);
+        return { status: result.status, data: result.catalog };
+      }
+      const result = await this.readAccountVault(userId);
+      return { status: result.status, data: result.vault };
+    }, this.ctx);
+  }
+
+  /** Service-binding control reads carry the same caller-selected owner as HTTP. */
+  async readAccountCatalog(userId: unknown): Promise<CloudflareAccountCatalogResult> {
+    if (typeof userId !== "string" || !USER_ID.test(userId)) {
+      return { status: 400, catalog: null };
+    }
+    // Never forward the DO result's runtime disposer into the next RPC hop.
+    return consumeRpcData(await connectorBroker(this.env, userId).readCatalog());
+  }
+
+  async readAccountVault(userId: unknown): Promise<CloudflareAccountVaultResult> {
+    if (typeof userId !== "string" || !USER_ID.test(userId)) {
+      return { status: 400, vault: null };
+    }
+    return consumeRpcData(await userBroker(this.env, userId).readVaultMetadata());
+  }
+}
 
 export function handleEgress(
   request: Request,
@@ -387,7 +471,7 @@ export function handleEgress(
   ctx?: Pick<ExecutionContext, "waitUntil">,
   upstreamFetch: typeof fetch = fetch,
   diagnostics?: Readonly<{ upstreamException(error: Readonly<{ name: string }>): void }>,
-  sessionModelAuthority?: Readonly<{ subject: string; owner: string }>,
+  sessionModelAuthority?: SessionModelAuthority,
 ): Promise<Response> {
   return handleEgressWithOwner(request, env, ctx, upstreamFetch, diagnostics, sessionModelAuthority);
 }
@@ -398,9 +482,10 @@ async function handleEgressWithOwner(
   ctx?: Pick<ExecutionContext, "waitUntil">,
   upstreamFetch: typeof fetch = fetch,
   diagnostics?: Readonly<{ upstreamException(error: Readonly<{ name: string }>): void }>,
-  sessionModelAuthority?: Readonly<{ subject: string; owner: string }>,
+  sessionModelAuthority?: SessionModelAuthority,
   verifiedVoiceOwner?: Readonly<{ subject: string; userId: string }>,
 ): Promise<Response> {
+  if (sessionModelAuthority?.region) env = { ...env, trustedPlacementRegion: sessionModelAuthority.region };
   const started = Date.now();
   // Headers on the general broker are never an ownership assertion. Only the
   // dedicated Worker entrypoint may supply already-validated Session authority.
@@ -500,11 +585,14 @@ async function handleEgressWithOwner(
   }
 
   let userId: string | undefined;
+  // Responses-only private correlation; preserve unrelated audit schemas.
+  // Never derived from caller input.
+  const egressRequestId = operation.id === "responses" ? crypto.randomUUID() : undefined;
   try {
     if (sessionModelAuthority && (operation.id !== "responses" || sessionModelAuthority.subject !== subject)) {
       return jsonError(403, "invalid_session_model_authority");
     }
-    userId = sessionModelAuthority?.owner ?? (operation.id === "realtime-call" && verifiedVoiceOwner?.subject === subject
+    userId = sessionModelAuthority?.owner ?? ((operation.id === "realtime-call" || operation.id === "realtime-sideband") && verifiedVoiceOwner?.subject === subject
       ? verifiedVoiceOwner.userId : await resolveSubject(env, subject));
     const subjectResolvedAt = Date.now();
     const accountId = request.headers.get("x-nanocodex-chatgpt-account-id") ?? undefined;
@@ -522,7 +610,7 @@ async function handleEgressWithOwner(
     if (operation.chatGptOnly && credential.kind !== "chatgpt") {
       return auditedError(409, "chatgpt_credential_required", request, url, operation.id, started, {
         user_id: userId,
-        deployment_sha: env.DEPLOYMENT_SHA,
+        deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
       });
     }
     // Sponsored admission is enforced per response.create frame, including
@@ -545,6 +633,8 @@ async function handleEgressWithOwner(
         buildUpstreamRequest(request, env, operation, credential, body),
         upstreamFetch,
         request.headers.get("x-nanocodex-voice-region"),
+        egressRequestId,
+        sessionModelAuthority?.region,
       );
       let recovered = false;
       if (upstream.status === 401 && credential.kind === "chatgpt") {
@@ -560,7 +650,7 @@ async function handleEgressWithOwner(
         if (operation.chatGptOnly && credential.kind !== "chatgpt") {
           return auditedError(409, "chatgpt_credential_required", request, url, operation.id, started, {
             user_id: userId,
-            deployment_sha: env.DEPLOYMENT_SHA,
+            deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
           });
         }
         upstream = await fetchUpstream(
@@ -571,6 +661,8 @@ async function handleEgressWithOwner(
           buildUpstreamRequest(request, env, operation, credential, body),
           upstreamFetch,
           request.headers.get("x-nanocodex-voice-region"),
+          egressRequestId,
+          sessionModelAuthority?.region,
         );
         recovered = true;
       }
@@ -588,7 +680,7 @@ async function handleEgressWithOwner(
         if (!resetAt) break;
         if (!await reportChatGptLimit(env, userId, credential, resetAt, !accountId)) {
           return auditedError(429, accountId ? "chatgpt_account_exhausted" : "chatgpt_accounts_exhausted", request, url, operation.id, started, {
-            user_id: userId, deployment_sha: env.DEPLOYMENT_SHA,
+            user_id: userId, deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
           });
         }
         credential = await resolveCredential(env, userId, false);
@@ -597,14 +689,14 @@ async function handleEgressWithOwner(
         rejectionBody = undefined;
         upstream = await fetchUpstream(env, userId, credential, operation,
           buildUpstreamRequest(request, env, operation, credential, body), upstreamFetch,
-          request.headers.get("x-nanocodex-voice-region"));
+          request.headers.get("x-nanocodex-voice-region"), egressRequestId, sessionModelAuthority?.region);
         recovered = true;
       }
       if (REDIRECT_STATUS.has(upstream.status)) {
         await cancelResponseBody(upstream);
         return auditedError(502, "upstream_redirect_blocked", request, url, operation.id, started, {
           user_id: userId,
-          deployment_sha: env.DEPLOYMENT_SHA,
+          deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
         });
       }
       if (upstream.status >= 400) {
@@ -638,7 +730,7 @@ async function handleEgressWithOwner(
           const { code } = diagnostic;
           audit(upstreamStatus >= 500 ? "error" : "deny", request, url, operation.id, started, {
             code, status: upstreamStatus, upstream_status: upstreamStatus,
-            deployment_sha: env.DEPLOYMENT_SHA,
+            deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
           });
           const response = json({
             error: { ...diagnostic, message: diagnostic.message ?? `Upstream model request rejected (HTTP ${upstreamStatus}; ${code}).` },
@@ -660,7 +752,7 @@ async function handleEgressWithOwner(
           {
             upstream_status: upstreamStatus,
             user_id: userId,
-            deployment_sha: env.DEPLOYMENT_SHA,
+            deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
           },
         );
       }
@@ -669,8 +761,11 @@ async function handleEgressWithOwner(
         recovered,
         model_source: credential.source,
         user_id: userId,
-        deployment_sha: env.DEPLOYMENT_SHA,
+        deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
         credential_kind: credential.kind,
+        ...(operation.id === "responses" && credential.kind === "chatgpt" && env.CHATGPT_EGRESS
+          && !env.CODEX_RELAY_URL && sessionModelAuthority?.region
+          ? { relay_region: sessionModelAuthority.region } : {}),
         subject_ms: subjectResolvedAt - started,
         credential_ms: credentialResolvedAt - subjectResolvedAt,
         credential_broker_ms: credentialBrokerMs,
@@ -720,7 +815,7 @@ async function handleEgressWithOwner(
     return auditedError(problem.status, problem.code, request, url, operation.id, started,
       {
         ...(userId === undefined ? {} : { user_id: userId }),
-        deployment_sha: env.DEPLOYMENT_SHA,
+        deployment_sha: env.DEPLOYMENT_SHA, egress_request_id: egressRequestId,
       });
   }
 }
@@ -1926,6 +2021,8 @@ function closeSponsoredSocket(socket: WebSocket, code: number, reason: string): 
 }
 
 async function handleControl(request: Request, url: URL, env: EgressEnv): Promise<Response> {
+  // This control API is service-binding only; public model egress never enters it.
+  env = { ...env, trustedClientIngressColo: ingressColo(request.headers.get(TRUSTED_INGRESS_HEADER)) };
   const subjectMatch = url.pathname.match(/^\/subjects\/([A-Za-z0-9_-]{43,128})$/);
   if (subjectMatch) {
     // Versioned subjects are owned and revoked by their Session DO. Never
@@ -2536,21 +2633,39 @@ async function fetchUpstream(
   request: Request,
   upstreamFetch: typeof fetch,
   voiceRegion: string | null,
+  egressRequestId: string | undefined,
+  textRegion: DurableObjectLocationHint | undefined,
 ): Promise<Response> {
   if (credential.kind !== "chatgpt" || env.CODEX_RELAY_URL || operation.directChatGpt) {
     return upstreamFetch(request);
   }
-  if (env.CHATGPT_EGRESS) {
+  const region = operation.id === "realtime-call" ? validatedRelayRegion(voiceRegion)
+    : operation.id === "responses" ? validatedRelayRegion(textRegion) : undefined;
+  // DO hints place the controller; the selected application's constraints place
+  // its container. Validated text and voice regions share regional pools while
+  // keeping separate identities and transport state.
+  const regionalRelays: Partial<Record<DurableObjectLocationHint, DurableObjectNamespace | undefined>> = {
+    wnam: env.CHATGPT_EGRESS_WNAM,
+    enam: env.CHATGPT_EGRESS_ENAM,
+    weur: env.CHATGPT_EGRESS_WEUR,
+    eeur: env.CHATGPT_EGRESS_EEUR,
+    apac: env.CHATGPT_EGRESS_APAC,
+    sam: env.CHATGPT_EGRESS_SAM,
+    oc: env.CHATGPT_EGRESS_OC,
+  };
+  const relayNamespace = (region ? regionalRelays[region] : undefined)
+    ?? env.CHATGPT_EGRESS;
+  if (relayNamespace) {
     const target = new URL(request.url);
     const internal = new URL(`${target.pathname}${target.search}`, "https://chatgpt-egress.internal");
-    // Voice media placement follows the call-creation relay. Keep a separate
-    // regional relay so a user's older text relay cannot anchor calls overseas.
-    const region = operation.id === "realtime-call" && voiceRegion
-      && ["wnam", "enam", "sam", "weur", "eeur", "apac", "oc"].includes(voiceRegion)
-      ? voiceRegion as DurableObjectLocationHint : undefined;
-    const id = env.CHATGPT_EGRESS.idFromName(region
-      ? `voice-v1:${region}:${userId}` : `user-v1:${userId}`);
-    const relay = env.CHATGPT_EGRESS.get(id, region ? { locationHint: region } : undefined);
+    // Hints apply only to initial allocation and are best effort. New text
+    // identities avoid legacy relay anchors; existing DOs never move. Keep
+    // voice separate because call-creation placement also affects media.
+    const relayName = region
+      ? `${operation.id === "realtime-call" ? "voice" : "text"}-v1:${region}:${userId}`
+      : `user-v1:${userId}`;
+    const id = relayNamespace.idFromName(relayName);
+    const relay = relayNamespace.get(id, region ? { locationHint: region } : undefined);
     if (operation.id === "realtime-call" && realtimeRelayRpc(env, request)) {
       const rpc = relay as typeof relay & {
         createRealtimeCall(body: string, headers: Record<string, string>, search: string): Promise<{
@@ -2561,9 +2676,15 @@ async function fetchUpstream(
       // Do not retry through fetch: an RPC failure can occur after call creation.
       return new Response(response.body, { status: response.status, headers: response.headers });
     }
+    // The private container hop receives this join key. Its upstream header
+    // allowlist excludes it; direct public provider requests are unchanged.
+    const relayHeaders = new Headers(request.headers);
+    if (operation.id === "responses" && operation.websocket && egressRequestId) {
+      relayHeaders.set("x-nanocodex-egress-request-id", egressRequestId);
+    }
     return relay.fetch(new Request(internal, {
       method: request.method,
-      headers: request.headers,
+      headers: relayHeaders,
       body: request.body,
       redirect: "manual",
       signal: request.signal,
@@ -2767,7 +2888,7 @@ async function resolveUserCredential(
   revision?: number,
   accountId?: string,
 ): Promise<UserCredentialSnapshot & Pick<ResolvedModelCredential, "broker_ms" | "broker_activation_ms" | "broker_age_ms" | "broker_resolve_id">> {
-  const result = await userBroker(env, userId).resolveModelCredential(recover, revision, accountId);
+  const result = consumeRpcData(await userBroker(env, userId).resolveModelCredential(recover, revision, accountId));
   if (result.status < 200 || result.status >= 300) {
     if (result.status === 429) throw new EgressFailure(429, accountId ? "chatgpt_account_exhausted" : "chatgpt_accounts_exhausted");
     throw new EgressFailure(result.status === 404 ? 409 : 503, accountId ? "chatgpt_account_unavailable" : "user_credential_unavailable");
@@ -2848,10 +2969,11 @@ function subjectDirectory(
   return env.AGENT_SUBJECTS.getByName(`${SUBJECT_DIRECTORY_PREFIX}${subject}`);
 }
 function userBroker(env: EgressEnv, userId: string): DurableObjectStub<UserCredentialBroker> {
-  return env.USER_CREDENTIALS.getByName(userId);
+  return env.USER_CREDENTIALS.getByName(userId, env.trustedPlacementRegion
+    ? { locationHint: env.trustedPlacementRegion } : durablePlacementOptions(env.trustedClientIngressColo));
 }
 function connectorBroker(env: EgressEnv, userId: string): DurableObjectStub<UserConnectorBroker> {
-  return env.USER_CONNECTORS.getByName(userId);
+  return env.USER_CONNECTORS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
 }
 async function cancelResponseBody(response: Response): Promise<void> {
   try { await response.body?.cancel(); } catch { /* Response disposal is best-effort. */ }
@@ -3016,6 +3138,11 @@ function audit(
     || rule === "slack" || rule === "x" || rule === "spotify" || rule === "soundcloud" || rule === "link" || rule === "mcp";
   const log = action === "error" ? console.error : action === "deny" ? console.warn : console.info;
   const safeDetail = {
+    ...(rule === "responses" && typeof detail.relay_region === "string" && validatedRelayRegion(detail.relay_region)
+      ? { relay_region: detail.relay_region } : {}),
+    ...(typeof detail.egress_request_id === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(detail.egress_request_id)
+      ? { egress_request_id: detail.egress_request_id } : {}),
     ...(typeof detail.voice_session_id === "string" && /^[0-9a-f-]{36}$/.test(detail.voice_session_id)
       ? { voice_session_id: detail.voice_session_id } : {}),
     ...(detail.relay_transport === "rpc" || detail.relay_transport === "fetch"

@@ -1,9 +1,11 @@
+import { durablePlacementOptions } from "nanocodex/cloudflare/durable-placement";
 import { extensionTools, fileMemoriesBackend, type ExtensionProvider } from 'nanocodex-tools/extensions';
 import type { NamedTool, ToolContext } from 'nanocodex';
 import { memoryTarget } from './memory-target';
 import { HistorySearchError } from './history-search';
 
 export type ManagedExtensionOptions = {
+  clientIngressColo?: string | null;
   organizationId: string; teamId: string; ownerId: string; sessionId: string;
   memories: DurableObjectNamespace<import("./memory-scope").MemoryScope>;
   personal(context: ToolContext): boolean;
@@ -18,7 +20,7 @@ export function managedExtensionTools(options: ManagedExtensionOptions): NamedTo
       const root = personal ? 'personal' : 'team';
       const call = async (scope: 'personal' | 'team', operation: string, value: unknown) => {
         const target = memoryTarget(options.organizationId, options.teamId, options.ownerId, scope);
-        const response = await options.memories.getByName(target.name).fetch('https://memory.internal/extension-memories/' + operation, {
+        const response = await options.memories.getByName(target.name, durablePlacementOptions(options.clientIngressColo)).fetch('https://memory.internal/extension-memories/' + operation, {
           method: 'POST', signal: context.signal,
           headers: {
             'content-type': 'application/json',
@@ -39,7 +41,9 @@ export function managedExtensionTools(options: ManagedExtensionOptions): NamedTo
       const backend = fileMemoriesBackend({
         listFiles: async () => {
           const own = await call(root, 'files', {}) as string[];
-          return personal ? [...own, ...(await call('team', 'files', {}) as string[]).map(path => `team/${path}`)] : own;
+          const files = personal ? [...own, ...(await call('team', 'files', {}) as string[]).map(path => `team/${path}`)] : own;
+          // Audit journals remain explicitly listable/readable, but are never recall evidence.
+          return method === 'search' ? files.filter(path => path !== 'DREAMS.md' && path !== 'team/DREAMS.md') : files;
         },
         readFile: async path => personal && path.startsWith('team/')
           ? await call('team', 'file', { path: path.slice(5) }) as string

@@ -3,7 +3,7 @@ import { fromBindingResponsesResult } from "./gateway-binding-responses.mjs";
 
 // Codes are local constants only. Never surface an upstream exception/message.
 class StreamProtocolError extends Error {
-  constructor(code) { super(`Responses: invalid provider stream [${code}]`); this.code = code; }
+  constructor(code) { super(`Responses: invalid provider stream\nProtocol invariant: ${code}`); this.code = code; }
 }
 const invalid = code => { throw new StreamProtocolError(code); };
 // The portable normalizer has static failures but can also throw arbitrary
@@ -20,8 +20,15 @@ const normalizationCodes = new Map([
   ["required tool call missing", "normalize_tool_required"],
   ["unsupported completion tool call", "normalize_tool_type"],
   ["model returned an unknown tool alias", "normalize_tool_alias"],
+  ["model returned ambiguous original tool alias", "normalize_tool_alias_ambiguous"],
+  ["model returned namespaced wire tool alias", "normalize_tool_alias_namespace_wire"],
+  ["model returned flattened namespace tool alias", "normalize_tool_alias_namespace_flat"],
+  ["model returned repeated tool alias", "normalize_tool_alias_repeated"],
+  ["model returned unregistered wire tool alias", "normalize_tool_alias_unregistered_wire"],
+  ["model returned parallel wrapper tool alias", "normalize_tool_alias_parallel_wrapper"],
   ["model returned a different forced tool", "normalize_forced_tool"],
   ["model returned invalid tool JSON", "normalize_tool_json"],
+  ["model returned unwrapped custom tool input", "normalize_custom_raw_input"],
   ["invalid tool call ID", "normalize_tool_id"],
   ["tool arguments must be a JSON object", "normalize_tool_arguments"],
   ["model returned duplicate tool call IDs", "normalize_tool_duplicate_id"],
@@ -83,7 +90,7 @@ async function* records(reader) {
   }
 }
 
-export function streamResponse(source, normalize, responseEvents, signal, parallelToolCalls) {
+export function streamResponse(source, normalize, responseEvents, signal) {
   if (!(source.body instanceof ReadableStream)) invalid("body_type");
   const checkedNormalize = (result, prologue) => {
     try { return normalize(result, prologue); }
@@ -145,9 +152,9 @@ export function streamResponse(source, normalize, responseEvents, signal, parall
       { output_index: entry.index, item_id: entry.item.id, content_index: 0, delta: text });
   };
   // Tool declarations/arguments stay private until the existing normalizer has
-  // checked aliases, JSON, IDs, completeness and the single-call contract.
+  // checked aliases, JSON, IDs and completeness. The parallel request bit is a
+  // generation preference; the host scheduler owns execution concurrency.
   const complete = async result => {
-    if (parallelToolCalls === false && result.choices?.[0]?.message?.tool_calls?.length > 1) invalid("parallel_tools");
     const response = checkedNormalize(result);
     response.id = id;
     const output = [];
@@ -281,7 +288,7 @@ export function streamResponse(source, normalize, responseEvents, signal, parall
           || item.call_id !== final.call_id || item.name !== final.name)) invalid("native_terminal_tool");
       }
       let result;
-      try { result = fromBindingResponsesResult(value.response, parallelToolCalls); }
+      try { result = fromBindingResponsesResult(value.response); }
       catch { invalid("native_normalization"); }
       await complete(result);
     } else if (!["response.created", "response.in_progress", "response.queued", "response.output_item.done",
@@ -333,7 +340,7 @@ export function streamResponse(source, normalize, responseEvents, signal, parall
         cancelReader();
         controller.error(new Error(error instanceof StreamReadError
           ? "Responses: provider stream read failed"
-          : `Responses: invalid provider stream [${error instanceof StreamProtocolError ? error.code : "unknown"}]`));
+          : `Responses: invalid provider stream\nProtocol invariant: ${error instanceof StreamProtocolError ? error.code : "unknown"}`));
         await finish(error instanceof StreamReadError ? "network_error" : "protocol_error");
       }
     },

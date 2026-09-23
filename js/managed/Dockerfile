@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 # Build against the same libc family as the Sandbox runtime. The publisher is
 # the shared Rust Hand implementation; Go remains only a developer toolchain.
-FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS hand
+FROM --platform=$TARGETPLATFORM ubuntu:22.04 AS hand-chef
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git cmake pkg-config libssl-dev clang libpulse-dev libxkbcommon-dev \
     libasound2-dev libudev-dev libwayland-dev libpipewire-0.3-dev libspa-0.2-dev uuid-dev \
@@ -9,21 +12,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:${PATH}
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --profile minimal --default-toolchain 1.97.0
+# Install once in the toolchain layer, independently of application sources.
+RUN cargo install cargo-chef --version 0.1.78 --locked --jobs 2
 WORKDIR /source
+
+FROM hand-chef AS hand-planner
 COPY .generated/remote-rust/ ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/usr/local/cargo/git --mount=type=cache,target=/source/target \
-    CARGO_BUILD_JOBS=2 cargo build --release --locked -p nanocodex2-bin --bin nanocodex2 \
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM hand-chef AS hand
+COPY --from=hand-planner /source/recipe.json recipe.json
+# Cook only the recipe in this otherwise empty directory. Keep target AND Cargo
+# sources in image layers so a fresh builder can reuse the exported dependencies.
+RUN CARGO_BUILD_JOBS=2 cargo chef cook --release --locked -p nanocodex2-bin --bin nanocodex2 --recipe-path recipe.json
+COPY .generated/remote-rust/ ./
+RUN CARGO_BUILD_JOBS=2 cargo build --release --locked -p nanocodex2-bin --bin nanocodex2 \
     && mkdir -p /out && cp target/release/nanocodex2 /out/nanocodex-remote
 
 # The SDK's Ubuntu 22.04 base has no labwc package. Bundle the VM's Debian
 # desktop stack with its own loader, preserving the SDK and shell libraries.
 FROM debian:trixie-slim AS desktop-libs
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils libwayland-dev libxkbcommon-dev labwc foot ffmpeg grim wlr-randr xwayland patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 # Compile natively even on Apple Silicon; Zig's generated translate-c executable
 # currently traps under Rosetta. The linker uses the target image's libraries.
 FROM --platform=$BUILDPLATFORM golang:1.26.5-trixie AS waymote
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 ARG BUILDARCH
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils pkg-config && rm -rf /var/lib/apt/lists/*
 RUN case "$BUILDARCH" in \
@@ -42,17 +62,32 @@ RUN git init && git remote add origin https://github.com/rockorager/waymote.git 
        /opt/zig/zig build -Dtarget=x86_64-linux-gnu.2.41 -Dcpu=baseline -Doptimize=ReleaseFast
 
 FROM desktop-libs AS desktop
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 COPY --from=waymote /src/waymote/zig-out/bin/waymote-streamd /src/waymote/zig-out/bin/waymote-streamd
 COPY scripts/bundle-hand-desktop.sh /tmp/bundle-hand-desktop.sh
 RUN sh /tmp/bundle-hand-desktop.sh
 
 # Linux toolchains; Apple SDKs and xcodebuild remain on macOS CI.
 FROM golang:1.26.5-bookworm AS go-toolchain
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 FROM swift:6.3.3-jammy AS swift-toolchain
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 FROM node:24.19.0-bookworm-slim AS node-toolchain
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 RUN npm install --global pnpm@11.25.0
 
 FROM docker.io/cloudflare/sandbox:0.12.4
+# Explicit upstream refresh without disabling normal source-layer reuse.
+ARG NANOCODEX_IMAGE_CACHE_EPOCH=1
+RUN test -n "$NANOCODEX_IMAGE_CACHE_EPOCH"
 COPY --from=swift-toolchain /usr /opt/swift/usr
 COPY --from=node-toolchain /usr/local /opt/node
 COPY --from=go-toolchain /usr/local/go /usr/local/go
@@ -114,6 +149,7 @@ RUN apt-get update \
 # Ubuntu 22.04's chromium-browser package requires Snap, which is unavailable
 # in the Sandbox container. Install Google's native AMD64 Debian package.
 RUN curl --fail --location --proto '=https' --tlsv1.2 \
+        --retry 3 --retry-all-errors --retry-delay 2 \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
         -o /tmp/google-chrome.deb \
     && apt-get update \
@@ -153,7 +189,8 @@ RUN sh /opt/hand-toolkit/install-paths.sh \
 ENV PATH=/opt/hand-python/bin:${PATH}
 
 COPY --chmod=0755 scripts/check-dev-stack.sh /usr/local/bin/nanocodex-check-dev-stack
-RUN sh /usr/local/bin/nanocodex-check-dev-stack
+ARG CI_TESTS_ENABLED=true
+RUN if [ "$CI_TESTS_ENABLED" != "false" ]; then sh /usr/local/bin/nanocodex-check-dev-stack; fi
 
 COPY --from=hand /out/nanocodex-remote /usr/local/bin/nanocodex-remote
 COPY --from=desktop /opt/nanocodex-desktop /opt/nanocodex-desktop

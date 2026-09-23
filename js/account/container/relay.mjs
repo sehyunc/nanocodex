@@ -258,20 +258,62 @@ async function proxyWebSocket(request, socket, head, upstreamOrigin, cliProxyOri
   if (canary) await waitForCliProxy(cliProxyOrigin);
   if (socket.destroyed) return;
 
+  const began = performance.now();
+  const relayId = firstHeader(request.headers["x-nanocodex-relay-id"]);
+  const timing = { began, process_age_ms: process.uptime() * 1_000 };
+  let timingLogged = false;
+  function logTiming(outcome, status) {
+    if (timingLogged) return;
+    timingLogged = true;
+    // Only durations, a locally generated correlation ID, and fixed outcomes.
+    // No socket addresses, upstream errors, headers, or message data.
+    try {
+      const durations = {
+        process_age_ms: timing.process_age_ms,
+        duration_ms: performance.now() - began,
+        socket_setup_ms: timing.socket_created - began,
+        dns_lookup_ms: timing.lookup - began,
+        tcp_connect_ms: timing.connected - (timing.lookup ?? began),
+        tls_handshake_ms: canary ? undefined : timing.secure - timing.connected,
+        upgrade_send_ms: timing.request_queued - (timing.secure ?? timing.connected),
+        upstream_first_byte_ms: timing.first_byte - timing.request_queued,
+        upstream_upgrade_ms: timing.headers - timing.request_queued,
+        header_read_ms: timing.headers - timing.first_byte,
+      };
+      // One JSON line survives container stdout ingestion without inspecting objects.
+      console.info(JSON.stringify({
+        type: "responses.relay.upstream", transport: "websocket", outcome,
+        ...(typeof relayId === "string"
+          && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(relayId)
+          ? { relay_id: relayId } : {}),
+        ...(Number.isInteger(status) && status >= 100 && status <= 599 ? { status } : {}),
+        socket_reused: false,
+        dns_observed: timing.lookup !== undefined,
+        ...Object.fromEntries(Object.entries(durations)
+          .filter(([, value]) => Number.isFinite(value) && value >= 0)
+          .map(([key, value]) => [key, Math.round(value * 100) / 100])),
+      }));
+    } catch { /* Observability must not change socket behavior. */ }
+  }
   const upstream = canary
     ? connectTcp({ host: cliProxyOrigin.hostname, port: Number(cliProxyOrigin.port) })
     : connectTls({ host: upstreamOrigin.hostname,
         port: Number(upstreamOrigin.port || 443), servername: upstreamOrigin.hostname });
+  timing.socket_created = performance.now();
+  upstream.once("lookup", () => { timing.lookup = performance.now(); });
+  upstream.once("connect", () => { timing.connected = performance.now(); });
   socket.setNoDelay(true);
   upstream.setNoDelay(true);
   let header = Buffer.alloc(0);
   let upgraded = false;
   const timeout = setTimeout(() => {
+    logTiming("timeout");
     upstream.destroy();
     rejectSocket(socket, 504, "upstream timeout");
   }, UPSTREAM_HANDSHAKE_TIMEOUT_MS);
 
   upstream.once(canary ? "connect" : "secureConnect", () => {
+    if (!canary) timing.secure = performance.now();
     const lines = [
       `GET ${canary ? CLIPROXY_RESPONSES_PATH : RESPONSES_PATH + incoming.search} HTTP/1.1`,
       `Host: ${canary ? cliProxyOrigin.host : upstreamOrigin.host}`,
@@ -285,11 +327,14 @@ async function proxyWebSocket(request, socket, head, upstreamOrigin, cliProxyOri
     for (const [name, value] of headers) lines.push(`${name}: ${value}`);
     lines.push("", "");
     upstream.write(lines.join("\r\n"));
+    timing.request_queued = performance.now();
   });
   upstream.on("data", function onHandshake(chunk) {
     if (upgraded) return;
+    timing.first_byte ??= performance.now();
     header = Buffer.concat([header, chunk]);
     if (header.byteLength > MAX_UPSTREAM_HEADER_BYTES) {
+      logTiming("headers_too_large");
       clearTimeout(timeout);
       upstream.destroy();
       rejectSocket(socket, 502, "upstream headers too large");
@@ -297,12 +342,14 @@ async function proxyWebSocket(request, socket, head, upstreamOrigin, cliProxyOri
     }
     const headerEnd = header.indexOf("\r\n\r\n");
     if (headerEnd === -1) return;
+    timing.headers = performance.now();
     clearTimeout(timeout);
     upgraded = true;
     upstream.off("data", onHandshake);
     socket.write(header);
     if (head.byteLength > 0) upstream.write(head);
     const status = responseStatus(header);
+    logTiming(status === 101 ? "upgraded" : "upstream_rejected", status);
     if (status !== 101) {
       upstream.pipe(socket);
       return;
@@ -311,12 +358,16 @@ async function proxyWebSocket(request, socket, head, upstreamOrigin, cliProxyOri
     upstream.pipe(socket);
   });
   upstream.once("error", () => {
+    logTiming("upstream_error");
     clearTimeout(timeout);
     if (!upgraded) rejectSocket(socket, 502, "upstream WebSocket failed");
     else socket.destroy();
   });
   socket.once("error", () => upstream.destroy());
-  socket.once("close", () => upstream.destroy());
+  socket.once("close", () => {
+    logTiming("downstream_closed");
+    upstream.destroy();
+  });
 }
 
 function isCliProxyCanary(headers) {

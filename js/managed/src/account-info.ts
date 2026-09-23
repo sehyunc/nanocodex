@@ -1,3 +1,6 @@
+import { discoveryMetadata, type DiscoveryRead } from "./account-discovery";
+import { consumeRpcData } from "nanocodex/cloudflare/rpc";
+import type { CloudflareAccountMetadataBinding } from "nanocodex/cloudflare/egress";
 import { isVmFactoryName } from "./vm-factory-name";
 import { connectorToolMetadata } from "./connector-tools";
 import { performanceStage } from "./performance";
@@ -16,9 +19,7 @@ import {
 const MAX_VAULT_ENTRIES = 100;
 const VAULT_ID = /^[A-Za-z0-9_-]{22,64}$/;
 
-type BrokerBinding = Readonly<{
-  fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
-}>;
+type BrokerBinding = CloudflareAccountMetadataBinding;
 
 export type VaultEntry =
   | Readonly<{
@@ -101,6 +102,8 @@ export type AccountInfo = Readonly<{
 export type AccountInfoOptions = Readonly<{
   /** A live or bounded owner/authority-scoped discovery snapshot. */
   catalog?: Promise<unknown>;
+  /** Safe metadata from the same discovery snapshot; omitted for a live refresh. */
+  vault?: Promise<readonly VaultEntry[]>;
   allowedConnectors?: readonly ConnectorCapabilityId[];
   allowedConnections?: ConnectorConnectionSelection;
   enabled: boolean;
@@ -120,6 +123,7 @@ export async function accountInfo(
     machines = [],
     signal,
     catalog,
+    vault: discoveredVault,
   }: AccountInfoOptions,
 ): Promise<AccountInfo> {
   machines = projectHandProviders(machines);
@@ -138,7 +142,8 @@ export async function accountInfo(
         }
         return response.json();
       })(),
-      performanceStage("account.vault", () => accountVault(binding, encodedUserId, signal)),
+      (discoveredVault ?? performanceStage("account.vault", () => accountVaultMetadata(binding, userId, signal)))
+        .then(vaultEntries).catch(() => { signal?.throwIfAborted(); return []; }),
     ]);
     signal?.throwIfAborted();
     const statuses = connectorStatuses(connectorMetadata);
@@ -268,35 +273,52 @@ function emptyInfo(
   };
 }
 
-async function accountVault(
+/** Reject unavailable or malformed metadata so discovery caches never retain a failed empty result. */
+export async function accountVaultMetadata(
   binding: BrokerBinding,
-  encodedUserId: string,
+  userId: string,
   signal?: AbortSignal,
+  discovery?: DiscoveryRead,
 ): Promise<readonly VaultEntry[]> {
   signal?.throwIfAborted();
-  try {
-    const url = `https://broker.internal/users/${encodedUserId}/credentials/vault`;
-    const response = signal === undefined
-      ? await binding.fetch(url)
-      : await binding.fetch(url, { signal });
-    if (!response.ok) {
-      await response.body?.cancel();
-      return [];
-    }
-    const value: unknown = await response.json();
-    return isRecord(value) ? vaultEntries(value.vault) : [];
-  } catch {
+  const project = (value: unknown) => {
+    const vault = validatedVaultEntries(value);
+    if (vault === undefined) throw new Error("account vault returned invalid metadata");
     signal?.throwIfAborted();
-    return [];
+    return Object.freeze(vault.map(entry => Object.freeze(entry)));
+  };
+  if (discovery && typeof binding.readAccountDiscovery === "function") {
+    return project(await discoveryMetadata(binding, userId, "vault", discovery));
+  }
+  const readAccountVault = binding.readAccountVault;
+  if (typeof readAccountVault === "function") {
+    const result = consumeRpcData(await Reflect.apply(readAccountVault, binding, [userId]));
+    if (result.status !== 200) throw new Error(`account vault failed with HTTP ${result.status}`);
+    return project(result.vault);
+  }
+  const url = `https://broker.internal/users/${encodeURIComponent(userId)}/credentials/vault`;
+  const response = signal === undefined
+    ? await binding.fetch(url)
+    : await binding.fetch(url, { signal });
+  try {
+    if (!response.ok) throw new Error(`account vault failed with HTTP ${response.status}`);
+    const value: unknown = await response.json();
+    return project(isRecord(value) ? value.vault : undefined);
+  } finally {
+    if (response.body !== null && !response.bodyUsed) await response.body.cancel();
   }
 }
 
 function vaultEntries(value: unknown): readonly VaultEntry[] {
-  if (!Array.isArray(value) || value.length > MAX_VAULT_ENTRIES) return [];
+  return validatedVaultEntries(value) ?? [];
+}
+
+function validatedVaultEntries(value: unknown): readonly VaultEntry[] | undefined {
+  if (!Array.isArray(value) || value.length > MAX_VAULT_ENTRIES) return undefined;
   const projected: VaultEntry[] = [];
   for (const entry of value) {
     const safe = vaultEntry(entry);
-    if (!safe) return [];
+    if (!safe) return undefined;
     projected.push(safe);
   }
   return projected;

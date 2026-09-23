@@ -12,9 +12,9 @@ function feed() {
   return { body, send(value) { controller.enqueue(encoder.encode(wire(value))); }, raw(value) { controller.enqueue(value); },
     close() { controller.close(); }, get cancelled() { return cancelled; } };
 }
-function setup(provider, upstream, signal) {
+function setup(provider, upstream, signal, model = "gpt-6-sol") {
   const observed = [], requests = [];
-  const options = { provider, model: "gpt-6-sol", reasoningEffort: provider === "cloudflare" ? "high" : "none", apiKey: "synthetic-secret",
+  const options = { provider, model, reasoningEffort: provider === "cloudflare" || model === "mimo-v2.6-pro" ? "high" : "none", apiKey: "synthetic-secret",
     ...(provider === "cloudflare" ? { accountId: "a".repeat(32) } : {}),
     fetch: async (_url, init) => { requests.push(JSON.parse(init.body)); return new Response(upstream.body, { headers: { "content-type": "text/event-stream" } }); },
     onRequest: () => ({ headers(status) { observed.push(status); }, firstToken() { observed.push("first"); }, finish(outcome) { observed.push(outcome); } }) };
@@ -97,7 +97,7 @@ test("native Responses tools map aliases and reject mismatched streamed argument
   }
 });
 
-for (const scenario of ["early-close", "missing-done", "malformed", "provider-error", "unknown-tool", "duplicate-tool", "incomplete-tool", "parallel-tool", "truncated-frame", "invalid-utf8"]) {
+for (const scenario of ["early-close", "missing-done", "malformed", "provider-error", "unknown-tool", "duplicate-tool", "incomplete-tool", "truncated-frame", "invalid-utf8"]) {
   test(`stream fails closed and redacts ${scenario}`, async () => {
     const upstream = feed(), fixture = setup("openrouter", upstream);
     const response = await fixture.invoke({ tools: [{ type: "function", name: "read" }], parallel_tool_calls: false });
@@ -106,8 +106,8 @@ for (const scenario of ["early-close", "missing-done", "malformed", "provider-er
     else if (scenario === "provider-error") upstream.send({ error: { message: "synthetic-secret" } });
     else if (scenario === "truncated-frame") upstream.raw(encoder.encode('data: {"synthetic-secret":'));
     else if (scenario === "invalid-utf8") upstream.raw(new Uint8Array([255, 10, 10]));
-    else if (["unknown-tool", "duplicate-tool", "incomplete-tool", "parallel-tool"].includes(scenario)) {
-      const count = ["duplicate-tool", "parallel-tool"].includes(scenario) ? 2 : 1;
+    else if (["unknown-tool", "duplicate-tool", "incomplete-tool"].includes(scenario)) {
+      const count = scenario === "duplicate-tool" ? 2 : 1;
       for (let index = 0; index < count; index++) upstream.send(chunk({ tool_calls: [{ index,
         id: scenario === "duplicate-tool" ? "same" : `call-${index}`, type: "function",
         function: { name: scenario === "unknown-tool" ? "synthetic-secret" : "tool_0", arguments: '{"x":1}' } }] }));
@@ -228,7 +228,7 @@ for (const scenario of ["early-close", "failed", "mismatched-final", "unknown-it
     if (scenario === "mismatched-final") upstream.send(nativeFinal("different"));
   }
   upstream.close();
-  await assert.rejects(pending, error => /^Responses: invalid provider stream \[[a-z_]+\]$/.test(error.message));
+  await assert.rejects(pending, error => /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/.test(error.message));
   assert.equal(fixture.observed.at(-1), "protocol_error");
 });
 
@@ -271,7 +271,7 @@ for (const scenario of ["unterminated-frame", "aggregate-text", "aggregate-tools
     else if (scenario === "aggregate-text") for (let index = 0; index < 9; index++) upstream.send(chunk({ content: block }));
     else if (scenario === "aggregate-tools") for (let index = 0; index < 5; index++) upstream.send(chunk({ tool_calls: [{ index: 0, function: { arguments: block } }] }));
     else upstream.send(chunk({ tool_calls: [{ index: 1024, function: { name: "tool_0" } }] }));
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
     assert.equal(fixture.observed.at(-1), "protocol_error");
     assert.equal(upstream.cancelled, 1);
   });
@@ -305,7 +305,7 @@ test("native Responses reject changes to declared tool identity", async () => {
     upstream.send({ type: "response.output_item.added", output_index: 0, item });
     upstream.send({ type: "response.function_call_arguments.delta", output_index: 0, item_id: item.id, delta: "{}" });
     upstream.send({ type: "response.completed", response: { object: "response", status: "completed", output: [{ ...item, status: "completed", arguments: "{}", [field]: field === "name" ? "tool_1" : "call-2" }] } });
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
     assert.deepEqual(fixture.observed, [200, "protocol_error"]);
   }
 });
@@ -348,7 +348,7 @@ for (const scenario of ["aggregate-distinct-tools", "total-wire-keepalives"]) {
     } else {
       for (let index = 0; index < 33; index++) upstream.raw(encoder.encode(`: ${block}\n\n`));
     }
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
     assert.deepEqual(fixture.observed, [200, "protocol_error"]);
     assert.equal(upstream.cancelled, 1);
   });
@@ -428,7 +428,7 @@ for (const scenario of ["no-usage", "changed-finish", "new-text", "new-reasoning
     upstream.send(trailer);
     if (scenario !== "missing-DONE") upstream.send("[DONE]");
     upstream.close();
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
     assert.deepEqual(fixture.observed, [200, "first", "protocol_error"]);
   });
 }
@@ -513,7 +513,7 @@ for (const scenario of ["before-finish", "nonempty-response", "missing-usage", "
     if (scenario === "output-after-trailer") upstream.send(chunk({ content: "unexpected" }));
     if (scenario !== "missing-DONE") upstream.send("[DONE]");
     upstream.close();
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
   });
 }
 
@@ -570,7 +570,7 @@ for (const detail of [{ type: "reasoning.text", text: { private: "fixture" } }, 
     const upstream = feed(), fixture = setup("openrouter", upstream), pending = all(await fixture.invoke());
     upstream.send(chunk({ reasoning_details: [detail] }));
     upstream.send(chunk({}, "stop")); upstream.send("[DONE]");
-    await assert.rejects(pending, { message: /^Responses: invalid provider stream \[[a-z_]+\]$/ });
+    await assert.rejects(pending, { message: /^Responses: invalid provider stream\nProtocol invariant: [a-z_]+$/ });
   });
 }
 
@@ -605,7 +605,11 @@ test("stream diagnostics distinguish parser, tool identity, terminal and normali
     const upstream = feed(), fixture = setup("openrouter", upstream);
     const pending = all(await fixture.invoke({ tools: [{ type: "function", name: "read" }] }));
     send(upstream);
-    await assert.rejects(pending, { message: `Responses: invalid provider stream [${code}]` });
+    await assert.rejects(pending, error => {
+      assert.equal(error.message.split("\n")[0], "Responses: invalid provider stream", "the native transport classifies the first line as non-retryable");
+      assert.equal(error.message, `Responses: invalid provider stream\nProtocol invariant: ${code}`);
+      return true;
+    });
     assert.deepEqual(fixture.observed, [200, "protocol_error"]);
     assert.equal(upstream.cancelled, 1);
   }
@@ -622,7 +626,65 @@ test("normalizer diagnostics reject unknown or forged exception details", async 
     }, () => []);
     const pending = response.text();
     upstream.send(chunk({}, "stop")); upstream.send("[DONE]");
-    await assert.rejects(pending, { message: "Responses: invalid provider stream [normalize_unknown]" });
+    await assert.rejects(pending, { message: "Responses: invalid provider stream\nProtocol invariant: normalize_unknown" });
     assert.equal(upstream.cancelled, 1);
   }
+});
+
+for (const provider of ["openrouter", "vercel"]) test(`${provider}: malformed custom wrappers and non-custom JSON stay redacted and fail closed`, async () => {
+  const scenarios = [
+    ["custom", '{"input":"synthetic-secret', "normalize_tool_json"],
+    ["custom", '["synthetic-secret"', "normalize_tool_json"],
+    ["custom", '"synthetic-secret', "normalize_tool_json"],
+    ["custom", " ", "normalize_tool_json"],
+    ["custom", '{"input":"synthetic-secret"}{"input":"synthetic-secret"}', "normalize_tool_json"],
+    ["custom", '"synthetic-secret"', "normalize_tool_arguments"],
+    ["custom", '{"input":42}', "normalize_custom_input"],
+    ["function", "text('synthetic-secret')", "normalize_tool_json"],
+    ["tool_search", "text('synthetic-secret')", "normalize_tool_json"],
+  ];
+  for (const [type, argumentsText, code] of scenarios) {
+    const upstream = feed(), fixture = setup(provider, upstream);
+    const tool = type === "tool_search" ? { type, execution: "client" } : { type, name: "run" };
+    const pending = all(await fixture.invoke({ tools: [tool] }));
+    upstream.send(chunk({ tool_calls: [{ index: 0, id: "synthetic-secret", type: "function",
+      function: { name: "tool_0", arguments: argumentsText } }] }));
+    upstream.send(chunk({}, "tool_calls")); upstream.send("[DONE]");
+    await assert.rejects(pending, { message: `Responses: invalid provider stream\nProtocol invariant: ${code}` });
+    assert.deepEqual(fixture.observed, [200, "protocol_error"]);
+    assert.equal(upstream.cancelled, 1);
+  }
+});
+
+for (const provider of ["openrouter", "vercel"]) test(`${provider}: fragmented raw custom input preserves bytes, IDs and replay after terminal validation`, async () => {
+  const upstream = feed(), fixture = setup(provider, upstream, undefined, "mimo-v2.6-pro");
+  const tools = [{ type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] }];
+  const input = " \ntext('synthetic-secret')\r\n// π 🐈 \t\n";
+  const response = await fixture.invoke({ tools, tool_choice: { type: "custom", namespace: "functions", name: "exec" } });
+  const seen = [];
+  const pending = (async () => { const reader = response.body.getReader(); for (let event; (event = await next(reader));) seen.push(event); return seen; })();
+  upstream.send(chunk({ tool_calls: [{ index: 0, id: "raw-call", type: "function", function: { name: "tool_", arguments: input.slice(0, 2) } }] }));
+  upstream.send(chunk({ tool_calls: [{ index: 0, function: { name: "0", arguments: input.slice(2, 17) } }] }));
+  upstream.send(chunk({ tool_calls: [{ index: 0, function: { arguments: input.slice(17) } }] }));
+  // Let the stream consume fragments; no executable call may escape before the
+  // terminal completion validates identity, arguments and the forced choice.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(seen.some(event => event.type === "response.output_item.added"), false);
+  upstream.send(chunk({}, "tool_calls")); upstream.send("[DONE]");
+  const emitted = await pending, result = emitted.at(-1).response;
+  assert.equal(result.output.length, 1);
+  const call = result.output[0];
+  assert.deepEqual({ type: call.type, call_id: call.call_id, name: call.name, namespace: call.namespace, input: call.input },
+    { type: "custom_tool_call", call_id: "raw-call", name: "exec", namespace: "functions", input });
+  assert.equal(emitted.find(event => event.type === "response.custom_tool_call_input.delta").delta, input);
+  assert.deepEqual(fixture.observed, [200, "first", "success"]);
+  assert.equal(upstream.cancelled, 1);
+  const replayUpstream = feed(), replay = setup(provider, replayUpstream, undefined, "mimo-v2.6-pro");
+  const replayPending = all(await replay.invoke({ tools, input: [{ role: "user", content: "run" }, ...result.output,
+    { type: "custom_tool_call_output", call_id: call.call_id, output: "ok" }] }));
+  assert.deepEqual(replay.requests[0].messages[1].tool_calls, [{ id: "raw-call", type: "function",
+    function: { name: "tool_0", arguments: JSON.stringify({ input }) } }]);
+  assert.equal(replay.requests[0].messages[2].tool_call_id, "raw-call");
+  replayUpstream.send(chunk({ content: "done" }, "stop")); replayUpstream.send("[DONE]");
+  assert.equal((await replayPending).at(-1).response.end_turn, true);
 });

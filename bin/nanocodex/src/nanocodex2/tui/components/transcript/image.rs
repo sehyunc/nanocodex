@@ -12,19 +12,20 @@ use std::{
     collections::{HashSet, VecDeque},
     env, fs, mem,
     path::{Path, PathBuf},
-    process::Command,
+    process::Stdio,
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     time::{Duration, Instant, SystemTime},
 };
+use tokio::process::Command;
 use url::Url;
 
 pub(super) const MAX_IMAGE_HEIGHT: u16 = 24;
 
-static PICKER: OnceLock<Picker> = OnceLock::new();
+static PICKER: tokio::sync::OnceCell<Picker> = tokio::sync::OnceCell::const_new();
 
 pub(super) struct Cache {
     entries: BoundedCache<CacheKey, CachedProtocol, PROTOCOL_CACHE_CAPACITY>,
@@ -169,12 +170,16 @@ struct TmuxClient {
 }
 
 pub(crate) fn video_picker() -> Picker {
-    PICKER.get_or_init(Picker::halfblocks).clone()
+    PICKER.get().cloned().unwrap_or_else(Picker::halfblocks)
 }
 
-pub(crate) fn initialize() {
+pub(crate) async fn initialize() {
+    PICKER.get_or_init(discover_picker).await;
+}
+
+async fn discover_picker() -> Picker {
     let inside_tmux = env::var_os("TMUX").is_some();
-    let tmux_client = inside_tmux.then(tmux_client).flatten();
+    let tmux_client = tmux_client().await;
     // The capability probe leaves a stdin reader behind on timeout. Keyboard
     // input must have one owner, even when a terminal never answers queries.
     let mut picker = tmux_client
@@ -200,7 +205,7 @@ pub(crate) fn initialize() {
     ) {
         picker.set_protocol_type(protocol);
     }
-    drop(PICKER.set(picker));
+    picker
 }
 
 fn window_font_size(size: crossterm::terminal::WindowSize) -> Option<FontSize> {
@@ -255,16 +260,31 @@ fn picker_supports_tmux_passthrough(term: Option<&str>, term_program: Option<&st
     term.is_some_and(|term| term.starts_with("tmux")) || term_program == Some("tmux")
 }
 
-fn tmux_client() -> Option<TmuxClient> {
+async fn tmux_client() -> Option<TmuxClient> {
     env::var_os("TMUX")?;
-    let output = Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "#{client_termtype}\t#{client_cell_width}\t#{client_cell_height}",
-        ])
-        .output()
-        .ok()?;
+    let mut command = Command::new("tmux");
+    command.args([
+        "display-message",
+        "-p",
+        "#{client_termtype}\t#{client_cell_width}\t#{client_cell_height}",
+    ]);
+    query_tmux_client(command).await
+}
+
+async fn query_tmux_client(mut command: Command) -> Option<TmuxClient> {
+    // Image hints must not leave startup waiting on a stalled tmux server, or
+    // let the helper read keystrokes owned by the terminal event stream.
+    let output = tokio::time::timeout(
+        Duration::from_secs(1),
+        command
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -308,7 +328,14 @@ impl Default for Cache {
 
 impl Cache {
     pub(super) fn load(&mut self, destination: &str, workspace: &Path, width: u16) -> LoadResult {
-        let picker = PICKER.get_or_init(Picker::halfblocks);
+        // Discovery runs after the first editable frame. An early image must
+        // not permanently install the fallback while the tmux query is pending.
+        if PICKER.get().is_none() && self.inline_images.is_none() {
+            self.blocked_retry = self.blocked_retry.max(LayoutChange::Pending);
+            self.next_poll.get_or_insert_with(Instant::now);
+            return LoadResult::Deferred;
+        }
+        let picker = video_picker();
         if !self
             .inline_images
             .unwrap_or_else(|| supports_inline_images(picker.protocol_type()))
@@ -455,7 +482,7 @@ impl Cache {
             return false;
         };
         let source = self.sources.get(&key.path).cloned();
-        let picker = PICKER.get_or_init(Picker::halfblocks).clone();
+        let picker = video_picker();
         let known_fingerprint = self.entries.get(&key).map(CachedProtocol::fingerprint);
         let epoch = Arc::clone(&self.epoch);
         let generation = self.generation;
@@ -703,6 +730,33 @@ mod tests {
             Some(ProtocolType::Iterm2)
         );
         assert_eq!(protocol_hint(Some("xterm-256color"), None, true), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tmux_hint_accepts_success_without_reading_terminal_input() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "if read -r ignored; then exit 1; fi; printf 'ghostty 1.3.1\\t22\\t49\\n'",
+        ]);
+        let client = super::query_tmux_client(command).await.unwrap();
+        assert_eq!(client.termtype, "ghostty 1.3.1");
+        let size = client.font_size.unwrap();
+        assert_eq!((size.width, size.height), (22, 49));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tmux_hint_rejects_failed_commands() {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", "printf 'kitty\\t10\\t20\\n'; exit 1"]);
+        assert!(super::query_tmux_client(command).await.is_none());
+        assert!(
+            super::query_tmux_client(tokio::process::Command::new("/nonexistent/tmux"))
+                .await
+                .is_none()
+        );
     }
 
     #[test]

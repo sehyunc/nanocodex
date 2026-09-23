@@ -16,7 +16,7 @@ import {
   releaseAgentSession,
   routePrompt,
 } from "../internal.mjs";
-import { pruneDurableReceipts as pruneWasmDurableReceipts, managedBootstrapPlan } from "../pkg-web/nanocodex.js";
+import { pruneDurableReceipts as pruneWasmDurableReceipts } from "../pkg-web/nanocodex.js";
 import * as Transport from "../browser/Transport.mjs";
 import { initializeBrowserEngine } from "../browser/engine.mjs";
 import { createCloudflareDurabilityStore } from "../runtime/cloudflare-durability-store.mjs";
@@ -28,6 +28,7 @@ import {
   importDurabilityState as importPortableState,
 } from "../runtime/durability-store.mjs";
 import { cloudflareEgress } from "./egress.mjs";
+import { prepareConnection } from "./prepared-connection.mjs";
 import { scopeCloudflareEgress } from "./egress-subject.mjs";
 import {
   clearCloudflareEventSocket,
@@ -66,10 +67,6 @@ export function bindAgent(module, hostAgent = HostAgent) {
   return Object.freeze({
     steerReceipt,
     steerInputKey,
-    bootstrapPlan: async (input) => {
-      await initializeBrowserEngine({ module });
-      return JSON.parse(managedBootstrapPlan(input));
-    },
     pruneDurableReceipts: (owner, options) => pruneDurableReceipts(module, owner, options),
     create: (owner, options) => create(module, owner, options, hostAgent),
     createEphemeral: (owner, options) => createEphemeral(module, owner, options),
@@ -281,13 +278,71 @@ export async function create(module, owner, options = {}, hostAgent = HostAgent)
   }
   lifecycle.creating = true;
   try {
-    return await createOwned(module, resolved, options, hostAgent, lifecycle);
+    const prepare = options?.[INTERNAL_RUNTIME]?.prepare;
+    if (prepare === undefined) return await createOwned(module, resolved, options, hostAgent, lifecycle);
+    return await createPrepared(module, resolved, options, hostAgent, lifecycle, prepare);
   } finally {
     lifecycle.creating = false;
   }
 }
 
-async function createOwned(module, resolved, options, hostAgent, lifecycle) {
+// Private managed construction barrier. The adapter retains lifecycle, identity,
+// endpoint and socket ownership throughout tool discovery; callers receive only
+// a single-use continuation, never a transport or a session identity.
+async function createPrepared(module, resolved, options, hostAgent, lifecycle, prepare) {
+  applicationOptions(options);
+  if (typeof prepare !== "function") throw new TypeError("Cloudflare Agent preparation must be a function");
+  const configuration = options[INTERNAL_CONFIGURATION];
+  validateInternalConfiguration(configuration);
+  if (!configuration || !["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(configuration.model)) {
+    throw new Error("Cloudflare Agent preparation requires a native root configuration");
+  }
+  const runtime = options[INTERNAL_RUNTIME];
+  if (Object.keys(runtime).some(key => !["prepare", "preparationSignal"].includes(key))) {
+    throw new TypeError("Cloudflare Agent preparation owns its native transport policy");
+  }
+  const signal = runtime.preparationSignal;
+  signal?.throwIfAborted();
+  createCloudflareDurabilityStore(resolved.context.storage);
+  const { sessionId, stateId } = durableIdentity(resolved.context.storage, options.durabilityId);
+  const endpoint = cloudflareEgress({ binding: scopeCloudflareEgress(resolved.egress, resolved.subject) });
+  const connection = prepareConnection(endpoint, sessionId, signal);
+  let completing;
+  let accepting = true;
+  let attempted = false;
+  try {
+    const result = await prepare((prepared) => {
+      if (!accepting || attempted) throw new Error("Cloudflare Agent preparation was already completed");
+      attempted = true;
+      signal?.throwIfAborted();
+      const runtime = prepared?.[INTERNAL_RUNTIME];
+      const pinned = prepared?.[INTERNAL_CONFIGURATION];
+      validateInternalConfiguration(pinned);
+      if (prepared?.durabilityId !== stateId
+        || ["model", "reasoning_mode"].some(key => pinned?.[key] !== configuration[key])
+        || runtime?.prepare !== undefined || runtime?.workersAi !== undefined || runtime?.gateway !== undefined
+        || (runtime?.inferenceForSession !== undefined && runtime?.preserveRootTransport !== true)) {
+        throw new Error("Cloudflare Agent preparation changed its pinned transport or configuration");
+      }
+      completing = createOwned(module, resolved, prepared, hostAgent, lifecycle, connection);
+      void completing.catch(() => {});
+      return completing;
+    });
+    if (completing === undefined || result !== await completing) {
+      throw new Error("Cloudflare Agent preparation must return its completed Agent");
+    }
+    return result;
+  } catch (error) {
+    const agent = await completing?.catch(() => undefined);
+    if (agent !== undefined) await agent.session.shutdown();
+    throw error;
+  } finally {
+    accepting = false;
+    await connection.dispose();
+  }
+}
+
+async function createOwned(module, resolved, options, hostAgent, lifecycle, preparedConnection) {
   const { context, egress, subject } = resolved;
   const configured = applicationOptions(options);
   const {
@@ -301,6 +356,14 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
     && (!internalRuntime || typeof internalRuntime !== "object" || Array.isArray(internalRuntime))) {
     throw new TypeError("Cloudflare Agent internal runtime options must be an object");
   }
+  if (internalRuntime?.onSocketTiming !== undefined
+    && typeof internalRuntime.onSocketTiming !== "function") {
+    throw new TypeError("Cloudflare Agent socket timing hook must be a function");
+  }
+  if (internalRuntime?.onRequestShape !== undefined
+    && typeof internalRuntime.onRequestShape !== "function") {
+    throw new TypeError("Cloudflare Agent request shape hook must be a function");
+  }
   if (internalRuntime?.subagentLifecycle !== undefined
     && typeof internalRuntime.subagentLifecycle !== "function") {
     throw new TypeError("Cloudflare Agent subagent lifecycle hook must be a function");
@@ -308,6 +371,10 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
   if (internalRuntime?.waitForPreconnect !== undefined
     && typeof internalRuntime.waitForPreconnect !== "boolean") {
     throw new TypeError("Cloudflare Agent internal waitForPreconnect must be a boolean");
+  }
+  if (internalRuntime?.preserveRootTransport !== undefined
+    && typeof internalRuntime.preserveRootTransport !== "boolean") {
+    throw new TypeError("Cloudflare Agent root transport policy must be a boolean");
   }
   if (internalRuntime?.inferenceForSession !== undefined
     && typeof internalRuntime.inferenceForSession !== "function") {
@@ -331,7 +398,8 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
     throw new TypeError("Gateway profile must match the pinned model and thinking, with one transport only");
   }
   const routedInference = internalRuntime?.inferenceForSession !== undefined;
-  const directInference = workersAi !== undefined || gateway !== undefined || routedInference;
+  const directInference = workersAi !== undefined || gateway !== undefined
+    || (routedInference && internalRuntime?.preserveRootTransport !== true);
   if (workersAi !== undefined && (internalConfiguration?.model !== "@cf/zai-org/glm-5.3"
     || workersAi.model !== internalConfiguration.model || workersAi.thinking !== internalConfiguration.thinking)) {
     throw new TypeError("Workers AI profile must match the pinned model and thinking");
@@ -358,50 +426,73 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
         // actual root/child branch registered by the Rust host bridge.
         const routedSessionId = request.threadId ?? id;
         const profile = await internalRuntime.inferenceForSession(routedSessionId);
-        if (!profile || typeof profile.model !== "string" || !["low", "medium", "high"].includes(profile.thinking)) {
-          throw new Error("Session inference route is missing or invalid");
-        }
-        if (routedSessionId === sessionId && (profile.model !== internalConfiguration?.model
-          || profile.thinking !== internalConfiguration?.thinking)) {
-          throw new Error("Root inference route conflicts with its pinned configuration");
-        }
-        const parsed = JSON.parse(body);
-        if (parsed.model !== profile.model || parsed.reasoning?.effort !== profile.thinking) {
-          throw new Error("Inference request conflicts with the session model or thinking pin");
-        }
-        if (profile.workersAi !== undefined && profile.gateway !== undefined) {
-          throw new Error("Session inference route has multiple transports");
-        }
-        if (profile.gateway !== undefined) {
-          if (profile.gateway.model !== profile.model || profile.gateway.reasoningEffort !== profile.thinking) {
-            throw new Error("Gateway profile conflicts with the session pin");
+        if (profile?.native === true) {
+          if (internalRuntime?.preserveRootTransport !== true || profile.gateway !== undefined || profile.workersAi !== undefined) {
+            throw new Error("Native inference cannot replace a routed transport");
           }
-          selected = createGatewayResponses(profile.gateway);
-        } else if (profile.workersAi !== undefined) {
-          if (profile.model !== "@cf/zai-org/glm-5.3" || profile.workersAi.model !== profile.model
-            || profile.workersAi.thinking !== profile.thinking) {
-            throw new Error("Workers AI profile conflicts with the session pin");
+          const parsed = JSON.parse(body);
+          if (!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(parsed.model)
+            || !["none", "low", "medium", "high", "xhigh", "max"].includes(parsed.reasoning?.effort)) {
+            throw new Error("Native inference requires a supported model and thinking");
           }
-          selected = createWorkersAiResponses(profile.workersAi.ai);
-        } else {
-          if (!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(profile.model)) {
-            throw new Error("Session model requires an explicit inference binding");
-          }
+          // Native roots and children retain Rust-owned live defaults/overrides.
+          // Only routed sessions have immutable model/thinking pins.
           selected = frontierEndpoint;
+        } else {
+          if (!profile || typeof profile.model !== "string" || !["low", "medium", "high"].includes(profile.thinking)) {
+            throw new Error("Session inference route is missing or invalid");
+          }
+          if (routedSessionId === sessionId && (profile.model !== internalConfiguration?.model
+            || profile.thinking !== internalConfiguration?.thinking)) {
+            throw new Error("Root inference route conflicts with its pinned configuration");
+          }
+          const parsed = JSON.parse(body);
+          if (parsed.model !== profile.model || parsed.reasoning?.effort !== profile.thinking) {
+            throw new Error("Inference request conflicts with the session model or thinking pin");
+          }
+          if (profile.workersAi !== undefined && profile.gateway !== undefined) {
+            throw new Error("Session inference route has multiple transports");
+          }
+          if (profile.gateway !== undefined) {
+            if (profile.gateway.model !== profile.model || profile.gateway.reasoningEffort !== profile.thinking) {
+              throw new Error("Gateway profile conflicts with the session pin");
+            }
+            selected = createGatewayResponses(profile.gateway);
+          } else if (profile.workersAi !== undefined) {
+            if (profile.model !== "@cf/zai-org/glm-5.3" || profile.workersAi.model !== profile.model
+              || profile.workersAi.thinking !== profile.thinking) {
+              throw new Error("Workers AI profile conflicts with the session pin");
+            }
+            selected = createWorkersAiResponses(profile.workersAi.ai);
+          } else {
+            if (!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(profile.model)) {
+              throw new Error("Session model requires an explicit inference binding");
+            }
+            selected = frontierEndpoint;
+          }
+          if (url !== `${endpoint.apiBaseUrl}/responses`) {
+            throw new Error("Routed inference supports only full-history Responses requests");
+          }
+          url = `${selected.apiBaseUrl}/responses`;
         }
-        if (url !== `${endpoint.apiBaseUrl}/responses`) {
-          throw new Error("Routed inference supports only full-history Responses requests");
-        }
-        url = `${selected.apiBaseUrl}/responses`;
       }
       return selected.createResponse(url, id, { ...request, body });
     },
     async createWebSocket(url, id, request) {
       if (directInference) throw new Error("Direct inference threads require HTTP Responses transport");
+      if (routedInference && (request.threadId ?? id) !== sessionId) {
+        const profile = await internalRuntime.inferenceForSession(request.threadId ?? id);
+        if (profile?.native !== true || profile.gateway !== undefined || profile.workersAi !== undefined) {
+          throw new Error("Routed children require full-history HTTP Responses transport");
+        }
+      }
       try {
-        const opened = await endpoint.createWebSocket(url, id, request);
+        const preparation = request.authorization === "preconnect" ? preparedConnection : undefined;
+        if (preparation !== undefined) preparedConnection = undefined;
+        const opened = await (preparation === undefined
+          ? endpoint.createWebSocket(url, id, request) : preparation.take(url, id, request));
         if (request.authorization === "preconnect") startup.resolve();
-        return { ...opened, socket: responseControlsSocket(opened.socket, internalRuntime?.responseControls) };
+        return { ...opened, socket: responseControlsSocket(opened.socket, internalRuntime?.responseControls, internalRuntime?.onRequestShape) };
       } catch (error) {
         if (request.authorization === "preconnect") startup.reject(error);
         throw error;
@@ -436,6 +527,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
         subagentMaxConcurrency: internalRuntime?.subagentMaxConcurrency,
         subagentSessions,
         subagentRouting: internalRuntime?.subagentRouting,
+        onSocketTiming: internalRuntime?.onSocketTiming,
         [CLOUDFLARE_SESSION_RESERVATION]: sessionReservation,
       },
       transport,

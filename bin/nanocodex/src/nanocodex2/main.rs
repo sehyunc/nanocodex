@@ -21,6 +21,8 @@ mod hand_workspace;
 mod host;
 #[allow(dead_code)]
 mod installation;
+#[path = "../launcher.rs"]
+mod launcher;
 mod native_hand;
 mod observation_providers;
 mod reload;
@@ -35,6 +37,7 @@ mod screen_ice;
 mod screen_macos;
 mod screen_native;
 mod screen_publisher;
+mod screen_supervisor;
 mod screen_video;
 #[cfg(target_os = "linux")]
 mod screen_wayland;
@@ -45,6 +48,7 @@ mod screen_wayland_input;
 mod service;
 #[allow(dead_code)]
 mod skill;
+mod startup_timing;
 #[allow(dead_code, unused_imports)]
 mod tui;
 #[cfg(any(
@@ -548,17 +552,16 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<(), ManagedError> {
+    let _startup = startup_timing::Stage::new("process");
+    launcher::initialize_install_root();
     let _ = dotenvy::dotenv();
     #[cfg(target_os = "linux")]
     if std::env::var(screen_wayland_encoder::HELPER_ENV).as_deref() == Ok("1") {
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| ManagedError::Configuration(e.to_string()))?
-            .block_on(screen_wayland_encoder::run(
-                std::env::args().skip(1).collect(),
-            ))
-            .map_err(|e| ManagedError::Configuration(e.to_string()));
+        return run_with_runtime(async {
+            screen_wayland_encoder::run(std::env::args().skip(1).collect())
+                .await
+                .map_err(|error| ManagedError::Configuration(error.to_string()))
+        });
     }
     let cli = Cli::parse();
     #[cfg(target_os = "linux")]
@@ -588,17 +591,29 @@ fn try_main() -> Result<(), ManagedError> {
         };
         (cli, prepared)
     };
-    tokio::runtime::Builder::new_multi_thread()
+    run_with_runtime(async move {
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = prepared {
+            return screen_host::serve(prepared).await;
+        }
+        run(cli).await
+    })
+}
+
+fn run_with_runtime(
+    future: impl std::future::Future<Output = Result<(), ManagedError>>,
+) -> Result<(), ManagedError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(|error| ManagedError::Configuration(format!("failed to start Tokio: {error}")))?
-        .block_on(async move {
-            #[cfg(target_os = "linux")]
-            if let Some(prepared) = prepared {
-                return screen_host::serve(prepared).await;
-            }
-            run(cli).await
-        })
+        .map_err(|error| ManagedError::Configuration(format!("failed to start Tokio: {error}")))?;
+    let result = runtime.block_on(future);
+    // Application cleanup has completed. Optional presentation discovery or DNS
+    // can still own blocking work that Tokio cannot cancel. Foreground work and
+    // its owned cleanup were awaited above; give no extra exit grace period to
+    // these disposable background tasks.
+    runtime.shutdown_background();
+    result
 }
 
 async fn run(cli: Cli) -> Result<(), ManagedError> {
@@ -677,21 +692,17 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         Some(Command::Attach(Attach { agent: Some(agent) })) => agent.managed_origin.as_deref(),
         _ => None,
     };
-    let client = client_from_environment(managed_origin)?;
-    let mut device = if matches!(
+    let client = {
+        let _timing = startup_timing::Stage::new("managed_client");
+        client_from_environment(managed_origin)?
+    };
+    // The OS-owned Hand publishes independently. Its local observer must not
+    // hold the terminal or inference behind service startup or IPC readiness.
+    let device = matches!(
         &command,
         None | Some(Command::Attach(_) | Command::Run(_) | Command::Voice(_))
-    ) {
-        match device_hand::BackgroundHand::start(&client).await {
-            Ok(device) => Some(device),
-            Err(error) => {
-                eprintln!("Warning: local computer Hand unavailable: {error}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    )
+    .then(|| device_hand::BackgroundHandTask::start(client.clone()));
     let result = match command {
         Some(
             Command::Tui(_)
@@ -763,7 +774,7 @@ async fn run(cli: Cli) -> Result<(), ManagedError> {
         Some(Command::VmCloneImage { .. }) => unreachable!("handled before managed client setup"),
         None => new_tui(&client).await,
     };
-    if let Some(device) = device.as_mut() {
+    if let Some(device) = device {
         device.stop().await;
     }
     result
@@ -1075,7 +1086,7 @@ async fn open_workspace_agent_from(
         client,
         agent_id,
         state,
-        AgentSettings::default(),
+        control::InitialSettings::default().resolve(),
         event_observer,
     )
     .await
@@ -1088,6 +1099,7 @@ async fn open_workspace_agent_with_settings(
     settings: AgentSettings,
     event_observer: Option<tokio::sync::mpsc::UnboundedSender<ManagedEvent>>,
 ) -> Result<(Nanocodex, AgentEvents, String, std::path::PathBuf), ManagedError> {
+    let _opening = startup_timing::Stage::new("workspace_open");
     let config =
         HostConfig::load().map_err(|error| ManagedError::Configuration(error.to_string()))?;
     let workspace = config.workspace().to_path_buf();
@@ -1103,13 +1115,19 @@ async fn open_workspace_agent_with_settings(
     let mut tools = Tools::builder()
         .without_defaults()
         .add(WorkspaceTools::new(&workspace));
-    if let Some(config) = nanocodex_computer::ComputerConfig::discover_or_install()
-        .await
-        .map_err(ManagedError::Configuration)?
-    {
-        let computer = nanocodex_computer::ComputerTools::connect(config)
+    let computer_config = {
+        let _timing = startup_timing::Stage::new("computer_discovery");
+        nanocodex_computer::ComputerConfig::discover_or_install()
             .await
-            .map_err(|error| ManagedError::Configuration(error.to_string()))?;
+            .map_err(ManagedError::Configuration)?
+    };
+    if let Some(config) = computer_config {
+        let computer = {
+            let _timing = startup_timing::Stage::new("computer_catalog");
+            nanocodex_computer::ComputerTools::connect(config)
+                .await
+                .map_err(|error| ManagedError::Configuration(error.to_string()))?
+        };
         for tool in computer.tools() {
             tools = tools.add(tool);
         }
@@ -1136,7 +1154,10 @@ async fn open_workspace_agent_with_settings(
         Some(observer) => builder.event_observer(observer),
         None => builder,
     };
-    let (agent, events) = builder.build().await.map_err(agent_error)?;
+    let (agent, events) = {
+        let _timing = startup_timing::Stage::new("managed_backend");
+        builder.build().await.map_err(agent_error)?
+    };
     let agent_id = agent.agent_id().to_owned();
     Ok((agent, events, agent_id, workspace))
 }
@@ -1211,6 +1232,82 @@ fn write_json_line<T: serde::Serialize>(value: &T) -> Result<(), ManagedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_waits_for_foreground_cleanup_before_success_or_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for fails in [false, true] {
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&cleaned);
+            let result = run_with_runtime(async move {
+                // The application future owns and awaits this cleanup, even on
+                // its error path. Runtime background shutdown must follow it.
+                let cleanup = tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    observed.store(true, Ordering::SeqCst);
+                });
+                cleanup.await.unwrap();
+                if fails {
+                    Err(ManagedError::Configuration(
+                        "synthetic runtime failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert_eq!(result.is_err(), fails);
+        }
+    }
+
+    #[test]
+    fn runtime_shutdown_does_not_wait_for_background_blocking_work() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        for fails in [false, true] {
+            let (release, blocked) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            let started = Instant::now();
+            let result = run_with_runtime(async move {
+                let (ready, received) = tokio::sync::oneshot::channel();
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = ready.send(());
+                    let _ = blocked.recv_timeout(Duration::from_secs(5));
+                    let _ = finished.send(());
+                }));
+                received.await.unwrap();
+                if fails {
+                    Err(ManagedError::Configuration(
+                        "synthetic runtime failure".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            let elapsed = started.elapsed();
+            // Release our synthetic blocking task even if the timing assertion fails.
+            let _ = release.send(());
+            completion.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "shutdown took {elapsed:?}"
+            );
+            assert_eq!(result.is_err(), fails);
+            if let Err(error) = result {
+                assert!(matches!(
+                    error,
+                    ManagedError::Configuration(message) if message == "synthetic runtime failure"
+                ));
+            }
+        }
+    }
 
     #[test]
     fn parses_attach_url_into_its_agent_id() {

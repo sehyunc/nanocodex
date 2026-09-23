@@ -85,6 +85,8 @@ impl VersionStore {
     pub(super) fn discover() -> Result<Self> {
         let root = if let Some(root) = std::env::var_os("NANOCODEX_DIR") {
             PathBuf::from(root)
+        } else if let Some(root) = crate::launcher::running_install_root() {
+            root
         } else {
             let home = std::env::var_os("HOME")
                 .or_else(|| std::env::var_os("USERPROFILE"))
@@ -518,6 +520,12 @@ impl VersionStore {
 
     #[cfg(unix)]
     fn install_launcher(&self) -> Result<()> {
+        let path = self.root.join("bin").join(BINARY_NAME);
+        if fs::read(self.root.join("current").join(BINARY_NAME))
+            .is_ok_and(|contents| crate::launcher::supports_native_launcher(&contents))
+        {
+            return atomic_symlink(&path, &Path::new("../current").join(BINARY_NAME));
+        }
         const LAUNCHER: &str = r#"#!/bin/sh
 set -eu
 
@@ -525,8 +533,13 @@ case "$0" in
     */*) launcher=$0 ;;
     *) launcher=$(command -v "$0") ;;
 esac
-bin_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
-install_root=$(dirname -- "$bin_dir")
+case "$launcher" in
+    */*) launcher_dir=${launcher%/*} ;;
+    *) launcher_dir=. ;;
+esac
+bin_dir=$(CDPATH= cd -- "${launcher_dir:-/}" && pwd -P)
+install_root=${bin_dir%/*}
+install_root=${install_root:-/}
 export NANOCODEX_DIR="$install_root"
 
 if [ "${1-}" = "update" ] && [ -f "$install_root/updater/nanocodex.sha256" ]; then
@@ -579,6 +592,25 @@ case "$0" in
     */*) launcher=$0 ;;
     *) launcher=$(command -v "$0") ;;
 esac
+case "$launcher" in
+    */*) launcher_dir=${launcher%/*} ;;
+    *) launcher_dir=. ;;
+esac
+bin_dir=$(CDPATH= cd -- "${launcher_dir:-/}" && pwd -P)
+install_root=${bin_dir%/*}
+install_root=${install_root:-/}
+export NANOCODEX_DIR="$install_root"
+exec "$install_root/current/nanocodex2" "$@"
+"#;
+
+        // Recognize wrappers installed before the builtin path setup as well.
+        const LEGACY_LAUNCHER: &str = r#"#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) launcher=$0 ;;
+    *) launcher=$(command -v "$0") ;;
+esac
 bin_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
 install_root=$(dirname -- "$bin_dir")
 export NANOCODEX_DIR="$install_root"
@@ -590,16 +622,61 @@ exec "$install_root/current/nanocodex2" "$@"
             &self.version_dir(key).join(NANOCODEX2_BINARY_NAME),
             &self.version_dir(key).join(NANOCODEX2_CHECKSUM_FILE),
         )? {
+            let contents = fs::read(self.version_dir(key).join(NANOCODEX2_BINARY_NAME))?;
+            if crate::launcher::supports_native_launcher(&contents) {
+                return atomic_symlink(
+                    &path,
+                    &Path::new("../current").join(NANOCODEX2_BINARY_NAME),
+                );
+            }
             return atomic_write(&path, LAUNCHER.as_bytes(), true);
         }
+        // Inspect the link itself, including a dangling link after activating a
+        // legacy version without the companion. Never follow/remove custom links.
+        if fs::read_link(&path).is_ok_and(|target| {
+            target == Path::new("../current").join(NANOCODEX2_BINARY_NAME)
+                || target == self.root.join("current").join(NANOCODEX2_BINARY_NAME)
+        }) {
+            return fs::remove_file(&path)
+                .wrap_err_with(|| format!("failed to remove {}", path.display()));
+        }
+        if path.is_symlink() {
+            return Ok(());
+        }
         match fs::read(&path) {
-            Ok(contents) if contents == LAUNCHER.as_bytes() => fs::remove_file(&path)
-                .wrap_err_with(|| format!("failed to remove {}", path.display())),
+            Ok(contents)
+                if contents == LAUNCHER.as_bytes() || contents == LEGACY_LAUNCHER.as_bytes() =>
+            {
+                fs::remove_file(&path)
+                    .wrap_err_with(|| format!("failed to remove {}", path.display()))
+            }
             Ok(_) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error).wrap_err_with(|| format!("failed to read {}", path.display())),
         }
     }
+}
+
+/// Replace either an older wrapper or link without exposing a missing launcher.
+#[cfg(unix)]
+fn atomic_symlink(path: &Path, target: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    if fs::read_link(path).is_ok_and(|existing| existing == target) {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| eyre!("launcher has no parent"))?;
+    fs::create_dir_all(parent)?;
+    // A private directory reserves a unique name without unlinking another
+    // update's staging path. Rename occurs on the same filesystem.
+    let staging = tempfile::Builder::new()
+        .prefix(".launcher-")
+        .tempdir_in(parent)?;
+    let temporary = staging.path().join("link");
+    symlink(target, &temporary)?;
+    fs::rename(&temporary, path).wrap_err_with(|| format!("failed to install {}", path.display()))
 }
 
 fn validate_key(key: &str) -> Result<()> {
@@ -668,6 +745,200 @@ pub(super) fn atomic_write(path: &Path, contents: &[u8], executable: bool) -> Re
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_launchers_switch_atomically_and_fall_back_for_older_versions() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+        let binary = crate::launcher::NATIVE_LAUNCHER_MARKER;
+        store
+            .install_bundle("native", binary, binary, None, None)
+            .unwrap();
+        store.activate("native").unwrap();
+        for name in [BINARY_NAME, NANOCODEX2_BINARY_NAME] {
+            let link = directory.path().join("bin").join(name);
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                Path::new("../current").join(name)
+            );
+            assert_eq!(fs::read(&link).unwrap(), binary);
+        }
+        let launcher = directory.path().join("bin").join(BINARY_NAME);
+        let inode = fs::symlink_metadata(&launcher).unwrap().ino();
+        store.install_launcher().unwrap();
+        assert_eq!(fs::symlink_metadata(&launcher).unwrap().ino(), inode);
+
+        store.install("legacy", b"old binary").unwrap();
+        store.activate("legacy").unwrap();
+        assert!(!launcher.is_symlink());
+        assert!(
+            fs::read_to_string(&launcher)
+                .unwrap()
+                .contains("updater/nanocodex")
+        );
+        assert_eq!(fs::read(store.binary_path("native")).unwrap(), binary);
+        let companion = directory.path().join("bin").join(NANOCODEX2_BINARY_NAME);
+        assert!(fs::symlink_metadata(&companion).is_err());
+
+        // An older bundle gets its compatible companion wrapper as well.
+        store
+            .install_bundle("older-bundle", b"old", b"old2", None, None)
+            .unwrap();
+        store.activate("older-bundle").unwrap();
+        assert!(!companion.is_symlink());
+        store.activate("native").unwrap();
+        assert!(companion.is_symlink());
+        fs::remove_file(&companion).unwrap();
+        symlink("/custom/missing/companion", &companion).unwrap();
+        store.activate("legacy").unwrap();
+        assert_eq!(
+            fs::read_link(&companion).unwrap(),
+            Path::new("/custom/missing/companion")
+        );
+    }
+
+    #[test]
+    fn launchers_preserve_paths_arguments_and_cwd_without_external_utilities() {
+        use std::{os::unix::fs::symlink, process::Command};
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let original = parent.join("original install");
+        let store = VersionStore::at(&original);
+        let script = b"#!/bin/sh\nprintf '%s\\n' \"$NANOCODEX_DIR\" \"$PWD\" \"$@\"\nexit 23\n";
+        store
+            .install_bundle("test", script, script, None, None)
+            .unwrap();
+        store.activate("test").unwrap();
+        let root = parent.join("moved install");
+        fs::rename(original, &root).unwrap();
+        symlink(root.join("bin"), parent.join("linked bin")).unwrap();
+        let bin = root.join("bin");
+        let arguments = ["a b", "", "*.txt", "--flag", "line\nbreak"];
+
+        for name in [BINARY_NAME, NANOCODEX2_BINARY_NAME] {
+            let cases = [
+                (bin.join(name), parent.clone(), String::new()),
+                (
+                    PathBuf::from(format!("moved install/bin/../bin//{name}")),
+                    parent.clone(),
+                    String::new(),
+                ),
+                (
+                    parent.join("linked bin").join(name),
+                    parent.clone(),
+                    String::new(),
+                ),
+                (
+                    PathBuf::from(name),
+                    parent.clone(),
+                    format!("{}/", bin.display()),
+                ),
+                (
+                    PathBuf::from(name),
+                    parent.clone(),
+                    "moved install/bin/".to_owned(),
+                ),
+                (PathBuf::from(name), bin.clone(), String::new()),
+            ];
+            for (launcher, cwd, path) in cases {
+                let output = Command::new("/bin/sh")
+                    .args(["-c", "exec \"$@\"", "launcher-test"])
+                    .arg(&launcher)
+                    .args(arguments)
+                    .current_dir(&cwd)
+                    .env("PATH", path)
+                    .env("CDPATH", &parent)
+                    .env("NANOCODEX_DIR", "must be replaced")
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(23), "{launcher:?}: {output:?}");
+                let expected = format!(
+                    "{}\n{}\n{}\n",
+                    root.display(),
+                    cwd.display(),
+                    arguments.join("\n")
+                );
+                assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            }
+        }
+
+        // A bare $0 and command -v result exercise the dirname(.) fallback.
+        let launcher = fs::read_to_string(bin.join(BINARY_NAME)).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &launcher, BINARY_NAME])
+            .current_dir(&bin)
+            .env("PATH", "")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(23));
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n{}\n", root.display(), bin.display())
+        );
+    }
+
+    #[test]
+    fn launcher_redirects_update_only_with_updater_marker() {
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+        store
+            .install("test", b"#!/bin/sh\nprintf 'current:%s\\n' \"$@\"\n")
+            .unwrap();
+        store.activate("test").unwrap();
+        atomic_write(
+            &store.updater_path(),
+            b"#!/bin/sh\nprintf 'updater:%s\\n' \"$@\"\n",
+            true,
+        )
+        .unwrap();
+        let launch = |args: &[&str]| {
+            let output = Command::new(directory.path().join("bin/nanocodex"))
+                .args(args)
+                .env("PATH", "")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(launch(&["update", "a b"]), "current:update\ncurrent:a b\n");
+        fs::write(store.updater_checksum_path(), b"present").unwrap();
+        assert_eq!(launch(&["update", "a b"]), "updater:update\nupdater:a b\n");
+        assert_eq!(launch(&["--version"]), "current:--version\n");
+    }
+
+    #[test]
+    fn removes_legacy_companion_wrapper_but_preserves_custom_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = VersionStore::at(directory.path());
+        store.install("stable", b"legacy").unwrap();
+        let launcher = directory.path().join("bin/nanocodex2");
+        let legacy = r#"#!/bin/sh
+set -eu
+
+case "$0" in
+    */*) launcher=$0 ;;
+    *) launcher=$(command -v "$0") ;;
+esac
+bin_dir=$(CDPATH= cd -- "$(dirname -- "$launcher")" && pwd -P)
+install_root=$(dirname -- "$bin_dir")
+export NANOCODEX_DIR="$install_root"
+exec "$install_root/current/nanocodex2" "$@"
+"#;
+        atomic_write(&launcher, legacy.as_bytes(), true).unwrap();
+        store.activate("stable").unwrap();
+        assert!(!launcher.exists());
+        atomic_write(&launcher, b"#!/bin/sh\n# custom wrapper\n", true).unwrap();
+        store.activate("stable").unwrap();
+        assert_eq!(
+            fs::read(&launcher).unwrap(),
+            b"#!/bin/sh\n# custom wrapper\n"
+        );
+    }
 
     #[test]
     fn retains_versions_and_switches_the_active_link() {

@@ -158,6 +158,9 @@ pub struct AgentList {
 /// Compact account-owned agent summary.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AgentSummary {
+    /// Advisory presentation metadata, preserved by the list JSON command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<serde_json::Value>,
     /// Current session title.
     pub title: String,
     /// Creation timestamp supplied by the service.
@@ -311,60 +314,6 @@ pub struct ReadSessionResponse {
     pub turns: Vec<SessionTurn>,
     /// Durable citations supporting the response.
     pub citations: Vec<HistoryCitation>,
-}
-
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
-
-/// Versioned account-memory identity.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct MemoryKey {
-    /// Positive JavaScript-safe memory identifier.
-    pub id: u64,
-    /// Positive JavaScript-safe memory version.
-    pub version: u64,
-}
-
-impl MemoryKey {
-    pub(crate) fn validate(self) -> Result<(), ManagedError> {
-        if self.id == 0
-            || self.version == 0
-            || self.id > MAX_SAFE_INTEGER
-            || self.version > MAX_SAFE_INTEGER
-        {
-            return Err(ManagedError::Configuration(
-                "managed memory id and version must be positive safe integers".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// One versioned account-memory record.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct MemoryRecord {
-    /// Versioned memory identity.
-    pub key: MemoryKey,
-    /// Complete retained memory content.
-    pub content: String,
-    /// Creation time in Unix milliseconds.
-    pub created_at_ms: i64,
-    /// Last-update time in Unix milliseconds.
-    pub updated_at_ms: i64,
-    /// Last memory-scan time in Unix milliseconds.
-    pub last_scanned_at_ms: Option<i64>,
-    /// Number of scans recorded by the service.
-    pub scan_count: u64,
-    /// Last use time in Unix milliseconds.
-    pub last_used_at_ms: Option<i64>,
-    /// Number of recorded uses.
-    pub use_count: u64,
-    /// Optional probation deadline in Unix milliseconds.
-    pub probation_until_ms: Option<i64>,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct MemoryListResponse {
-    pub(crate) memories: Vec<MemoryRecord>,
 }
 
 /// Server-advertised capabilities for one managed agent.
@@ -1266,9 +1215,7 @@ fn decode_raw<T: DeserializeOwned>(raw: &RawValue) -> Result<T, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FindSessionsRequest, ManagedEvent, ManagedEventData, MemoryKey, ReadSessionRequest,
-    };
+    use super::{FindSessionsRequest, ManagedEvent, ManagedEventData, ReadSessionRequest};
 
     #[test]
     fn cron_input_has_no_client_byte_ceiling() {
@@ -1339,20 +1286,6 @@ mod tests {
             ReadSessionRequest {
                 session_id: uuid::Uuid::from_bytes(non_rfc_bytes).to_string(),
                 turn_ids: None,
-            }
-            .validate()
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn memory_keys_must_be_positive_safe_integers() {
-        assert!(MemoryKey { id: 1, version: 1 }.validate().is_ok());
-        assert!(MemoryKey { id: 0, version: 1 }.validate().is_err());
-        assert!(
-            MemoryKey {
-                id: 9_007_199_254_740_992,
-                version: 1,
             }
             .validate()
             .is_err()
@@ -1439,5 +1372,28 @@ mod tests {
     fn turn_completed_requires_protocol_citations() {
         let json = r#"{"cursor":"9","created_at":2,"turn_id":"turn-3","type":"turn_completed","id":"turn-3","final_message":"done","usage":null}"#;
         assert!(serde_json::from_str::<ManagedEvent>(json).is_err());
+    }
+}
+
+#[cfg(test)]
+mod presentation_contract_tests {
+    #[test]
+    fn list_json_preserves_presentation_and_accepts_legacy_summaries() {
+        let mut value = serde_json::json!({"data":["synthetic"],"summaries":{"synthetic":{
+            "title":"Fallback", "created_at":1, "updated_at":2, "turn_count":1,
+            "presentation":{"revision":3,"title":"Check tests","status":"running",
+                "activity":"I am checking tests","lastUserPrompt":"Verify the change"}
+        }}});
+        let list: super::AgentList = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(list).unwrap()["summaries"]["synthetic"]["presentation"],
+            value["summaries"]["synthetic"]["presentation"]
+        );
+        value["summaries"]["synthetic"]
+            .as_object_mut()
+            .unwrap()
+            .remove("presentation");
+        let list: super::AgentList = serde_json::from_value(value).unwrap();
+        assert!(list.summaries["synthetic"].presentation.is_none());
     }
 }

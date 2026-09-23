@@ -156,8 +156,6 @@ declare const cloudflareStorage: CloudflareDurableObjectStorage;
 declare const cloudflareBinding: import("../cloudflare/egress.mjs").CloudflareEgressBinding;
 declare const cloudflareContext: CloudflareAgent.DurableObjectContext;
 declare const cloudflareOwner: CloudflareAgent.DurableObjectOwner;
-const bootstrapPlan: Promise<CloudflareAgent.BootstrapPlan> = CloudflareAgent.bootstrapPlan("Elena birthday");
-void bootstrapPlan;
 
 // @ts-expect-error durability-only types are exported from nanocodex/durability.
 type RootDurabilityStore = RootPublicTypes.DurabilityStore;
@@ -317,6 +315,10 @@ async function check() {
   await CloudflareAgent.createEphemeral(cloudflareOwner, {
     // @ts-expect-error transport remains owned by the Cloudflare adapter.
     transport: HostTransport.hostManaged(),
+  });
+  await CloudflareAgent.create(cloudflareOwner, {
+    // @ts-expect-error the timing hook is available only through internalRuntime.
+    onSocketTiming() {},
   });
   await CloudflareAgent.create(cloudflareOwner, {
     // @ts-expect-error broker subjects are not caller-selected.
@@ -638,6 +640,10 @@ async function check() {
     transport: Transport.openAi({ apiKey }),
     module: new WebAssembly.Module(new Uint8Array()),
   });
+  // @ts-expect-error socket diagnostics are internal, not a public Agent option.
+  await Agent.create({ transport: Transport.openAi({ apiKey }), onSocketTiming() {} });
+  // @ts-expect-error socket diagnostics are not credential/transport options.
+  BrowserTransport.openAi({ apiKey, onSocketTiming() {} });
   // @ts-expect-error transport queue policy is private to the adapter.
   await Agent.create({ transport: Transport.openAi({ apiKey }), maxQueuedMessages: 1 });
   // @ts-expect-error browser send-buffer policy is private to the adapter.
@@ -688,3 +694,30 @@ const startupEnvironment: AgentEnvironment = projectEnvironment({
   connectorAccounts: {}, identity: {}, stablecoins: [], authorizations: [], vault: [],
 }, { runtime: "test", default_cwd: "/brain" });
 contextData("environment", startupEnvironment);
+
+// Metadata service bindings remain fetch-compatible and expose only validated unknown data.
+const metadataBinding: import("nanocodex/cloudflare/egress").CloudflareAccountMetadataBinding = {
+  ...cloudflareBinding,
+  async readAccountCatalog(userId) {
+    void userId;
+    return { status: 200, catalog: { connectors: {}, mcp_connections: [] } };
+  },
+  async readAccountVault() { return { status: 200, vault: [] }; },
+  async readAccountDiscovery(userId, component, options) {
+    const owner: string = userId;
+    const authority: string = options.authorityKey;
+    const reload: boolean | undefined = options.reload;
+    void owner; void authority; void reload;
+    return { schema: 1, status: 200, expiresAt: Date.now() + 900_000,
+      data: component === "catalog" ? { connectors: {}, mcp_connections: [] } : [] };
+  },
+};
+const fetchOnlyMetadata: import("nanocodex/cloudflare/egress").CloudflareAccountMetadataBinding = cloudflareBinding;
+void metadataBinding;
+void fetchOnlyMetadata;
+
+metadataBinding.readAccountDiscovery?.("owner", "catalog", { authorityKey: "epoch", reload: true });
+// @ts-expect-error Discovery does not accept authentication decisions or credentials.
+metadataBinding.readAccountDiscovery?.("owner", "vault", { authorityKey: "epoch", accessToken: "secret" });
+// @ts-expect-error Live presence is not a metadata cache component.
+metadataBinding.readAccountDiscovery?.("owner", "machines", { authorityKey: "epoch" });

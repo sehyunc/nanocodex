@@ -19,6 +19,7 @@ mod eval;
 mod eval;
 mod hand_service;
 mod hand_setup;
+mod launcher;
 mod login;
 mod managed_memory;
 mod managed_server;
@@ -43,7 +44,7 @@ mod vm;
 #[path = "vm_unsupported.rs"]
 mod vm;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, builder::NonEmptyStringValueParser};
 use eyre::{Result, WrapErr, eyre};
@@ -180,23 +181,31 @@ fn main() -> ExitCode {
 }
 
 fn try_main() -> Result<()> {
+    launcher::initialize_install_root();
+    launcher::dispatch_update()?;
     nanocodex::oai::transport::install_default_rustls_crypto_provider();
     // Keep direct `cargo run` behavior consistent with the Justfile without
     // requiring shell-specific syntax to load the repository's `.env` file.
     let _ = dotenvy::dotenv();
 
-    if let Err(error) = update::prepare_legacy_nightly_bootstrap() {
-        eprintln!("warning: failed to prepare the Nanocodex updater bootstrap: {error:#}");
-    }
-
     let cli = Cli::parse();
     if let Some(Command::VmRunConfig(command)) = &cli.command {
         return command.run();
     }
-    tokio::runtime::Builder::new_multi_thread()
+    run_with_runtime(run(cli))
+}
+
+fn run_with_runtime(future: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run(cli))
+        .build()?;
+    let result = runtime.block_on(future);
+    // Application cleanup has completed. Optional MCP discovery can still own a
+    // blocking DNS lookup, which Tokio cannot cancel. Foreground work and its
+    // owned cleanup were awaited above; give no extra exit grace period to
+    // these disposable background tasks.
+    runtime.shutdown_background();
+    result
 }
 
 fn process_exit_code(error: &eyre::Report) -> u8 {
@@ -208,10 +217,16 @@ fn process_exit_code(error: &eyre::Report) -> u8 {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if !matches!(&cli.command, Some(Command::Update(_)))
-        && let Err(error) = update::ensure_default_automatic_updates()
-    {
-        eprintln!("Could not configure automatic updates: {error:#}");
+    // Interactive startup owns maintenance after its first editable frame.
+    if !matches!(&cli.command, None | Some(Command::Resume(_))) {
+        if let Err(error) = update::prepare_legacy_nightly_bootstrap() {
+            eprintln!("warning: failed to prepare the Nanocodex updater bootstrap: {error:#}");
+        }
+        if !matches!(&cli.command, Some(Command::Update(_)))
+            && let Err(error) = update::ensure_default_automatic_updates()
+        {
+            eprintln!("Could not configure automatic updates: {error:#}");
+        }
     }
     match cli.command {
         Some(Command::Tui(command)) => command.run().await.map_err(Into::into),
@@ -260,24 +275,23 @@ async fn run(cli: Cli) -> Result<()> {
             let session = rollouts
                 .load_session(&thread_id)
                 .wrap_err_with(|| format!("failed to load Codex thread {thread_id}"))?;
-            let workspace = PathBuf::from(session.workspace());
-            let _observability = command.observability.install(true, &workspace)?;
-            tui::run(
+            tui::run_observed(
                 command.agent,
                 command.vm,
                 command.prompt.map(tui::InitialPrompt::plain),
                 Some(session),
+                Some(command.observability),
             )
             .await
         }
         Some(Command::Update(command)) => command.run().await,
         None => {
-            let _observability = cli.observability.install(true, cli.agent.cwd())?;
-            tui::run(
+            tui::run_observed(
                 cli.agent,
                 cli.vm,
                 cli.prompt.map(tui::InitialPrompt::plain),
                 None,
+                Some(cli.observability),
             )
             .await
         }
@@ -287,6 +301,72 @@ async fn run(cli: Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_waits_for_foreground_cleanup_before_success_or_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        for fails in [false, true] {
+            let cleaned = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&cleaned);
+            let result = run_with_runtime(async move {
+                // The application future owns and awaits this cleanup, even on
+                // its error path. Runtime background shutdown must follow it.
+                let cleanup = tokio::spawn(async move {
+                    tokio::task::yield_now().await;
+                    observed.store(true, Ordering::SeqCst);
+                });
+                cleanup.await.unwrap();
+                if fails {
+                    Err(eyre!("synthetic runtime failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(cleaned.load(Ordering::SeqCst));
+            assert_eq!(result.is_err(), fails);
+        }
+    }
+
+    #[test]
+    fn runtime_shutdown_does_not_wait_for_background_blocking_work() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        for fails in [false, true] {
+            let (release, blocked) = mpsc::channel();
+            let (finished, completion) = mpsc::channel();
+            let started = Instant::now();
+            let result = run_with_runtime(async move {
+                let (ready, received) = tokio::sync::oneshot::channel();
+                drop(tokio::task::spawn_blocking(move || {
+                    let _ = ready.send(());
+                    let _ = blocked.recv_timeout(Duration::from_secs(5));
+                    let _ = finished.send(());
+                }));
+                received.await.unwrap();
+                if fails {
+                    Err(eyre!("synthetic runtime failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            let elapsed = started.elapsed();
+            // Release our synthetic blocking task even if the timing assertion fails.
+            let _ = release.send(());
+            completion.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "shutdown took {elapsed:?}"
+            );
+            assert_eq!(result.is_err(), fails);
+        }
+    }
 
     #[test]
     fn cookie_commands_auto_detect_supported_browsers_for_an_exact_origin() {

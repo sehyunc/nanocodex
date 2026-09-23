@@ -76,3 +76,101 @@ test("legacy mediaType and unique nominated pair work without exposing candidate
   legacy.set("another", { id: "another", type: "candidate-pair", timestamp: 1000, nominated: true, state: "succeeded", currentRoundTripTime: .01 });
   assert.equal(sampler.sample(legacy).roundTripMs, undefined, "never guess between several nominated paths");
 });
+
+
+test("path diagnostics expose only selected candidate enums, never network addresses or credentials", () => {
+  const sample = report();
+  sample.set("pair", { ...sample.get("pair")!, localCandidateId: "local", remoteCandidateId: "remote" });
+  sample.set("local", { id: "local", type: "local-candidate", timestamp: 1000,
+    candidateType: "relay", protocol: "udp", relayProtocol: "tls", address: "private-address",
+    url: "turn:private-endpoint", usernameFragment: "private-credential", port: 12345 });
+  sample.set("remote", { id: "remote", type: "remote-candidate", timestamp: 1000,
+    candidateType: "prflx", protocol: "udp", address: "private-peer-address" });
+  const stats = new RemoteStatsSampler().sample(sample);
+  assert.equal(stats.localCandidateType, "relay");
+  assert.equal(stats.remoteCandidateType, "prflx");
+  assert.equal(stats.candidateProtocol, "udp");
+  assert.equal(stats.relayProtocol, "tls");
+  assert.equal(stats.roundTripMs, 25);
+  assert.equal(JSON.stringify(stats).includes("private"), false);
+});
+
+test("unknown candidate fields cannot escape the allowlist or label a direct pair as TURN", () => {
+  const sample = report();
+  sample.set("pair", { ...sample.get("pair")!, localCandidateId: "local", remoteCandidateId: "remote" });
+  sample.set("local", { id: "local", type: "local-candidate", timestamp: 1000,
+    candidateType: "host", protocol: "private-address", relayProtocol: "tls" });
+  sample.set("remote", { id: "remote", type: "remote-candidate", timestamp: 1000,
+    candidateType: "private-credential" });
+  const stats = new RemoteStatsSampler().sample(sample);
+  assert.equal(stats.localCandidateType, "host");
+  assert.equal(stats.remoteCandidateType, undefined);
+  assert.equal(stats.candidateProtocol, undefined);
+  assert.equal(stats.relayProtocol, undefined);
+  assert.equal(JSON.stringify(stats).includes("private"), false);
+});
+
+
+test("an unavailable selected pair cannot fall back to a retired or unrelated path", () => {
+  const sampler = new RemoteStatsSampler(), sample = report();
+  sample.delete("pair");
+  assert.equal(sampler.sample(sample).roundTripMs, undefined, "explicit selection takes precedence over an old nominated pair");
+  sample.set("transport", { id: "transport", type: "transport", timestamp: 1000 });
+  sample.set("old-pair", { ...sample.get("old-pair")!, transportId: "another-transport" });
+  assert.equal(sampler.sample(sample).roundTripMs, undefined, "another transport is not the video path");
+});
+
+
+test("selected address-family diagnostics reveal only validated family enums", () => {
+  for (const [address, expected] of [
+    ["192.0.2.25", "ipv4"], ["2001:db8::25", "ipv6"], ["::ffff:192.0.2.25", "ipv6"],
+    ["private-host.local", "unknown"], ["999.0.0.1", "unknown"], ["private:invalid", "unknown"],
+    ["2001:db8::1]/private", "unknown"], [undefined, "unknown"],
+  ] as const) {
+    const sample = report();
+    sample.set("pair", { ...sample.get("pair")!, localCandidateId: "local", remoteCandidateId: "remote" });
+    sample.set("local", { id: "local", type: "local-candidate", timestamp: 1000, candidateType: "host", address });
+    sample.set("remote", { id: "remote", type: "remote-candidate", timestamp: 1000, candidateType: "srflx", ip: address });
+    const stats = new RemoteStatsSampler().sample(sample);
+    assert.equal(stats.localAddressFamily, expected);
+    assert.equal(stats.remoteAddressFamily, expected);
+    if (address) assert.equal(JSON.stringify(stats).includes(address), false);
+  }
+});
+
+
+test("jitter diagnostics independently measure actual, target and network minimum interval averages", () => {
+  const sampler = new RemoteStatsSampler();
+  sampler.sample(report({ jitterBufferTargetDelay: 150, jitterBufferMinimumDelay: 40 }));
+  const stats = sampler.sample(report({ timestamp: 2000, jitterBufferEmittedCount: 1050,
+    jitterBufferDelay: 103, jitterBufferTargetDelay: 152, jitterBufferMinimumDelay: 40.5 }));
+  assert.equal(stats.jitterBufferMs, 60);
+  assert.equal(stats.jitterBufferTargetMs, 40);
+  assert.equal(stats.jitterBufferMinimumMs, 10);
+});
+
+for (const value of [undefined, NaN, Infinity, -1, "1"]) test(`missing or invalid jitter targets/minima stay absent: ${String(value)}`, () => {
+  const sampler = new RemoteStatsSampler();
+  sampler.sample(report({ jitterBufferTargetDelay: 100, jitterBufferMinimumDelay: 100 }));
+  const stats = sampler.sample(report({ timestamp: 2000, jitterBufferEmittedCount: 1050,
+    jitterBufferDelay: 103, jitterBufferTargetDelay: value, jitterBufferMinimumDelay: value }));
+  assert.equal(stats.jitterBufferMs, 60);
+  assert.equal("jitterBufferTargetMs" in stats, false);
+  assert.equal("jitterBufferMinimumMs" in stats, false);
+});
+
+test("jitter targets/minima reject resets, missing baselines and empty intervals while preserving real zero", () => {
+  for (const initial of [undefined, 100]) {
+    const sampler = new RemoteStatsSampler();
+    sampler.sample(report({ jitterBufferTargetDelay: initial, jitterBufferMinimumDelay: initial }));
+    const stats = sampler.sample(report({ timestamp: 2000, jitterBufferEmittedCount: 1050,
+      jitterBufferTargetDelay: 1, jitterBufferMinimumDelay: 0 }));
+    assert.equal(stats.jitterBufferTargetMs, undefined); assert.equal(stats.jitterBufferMinimumMs, undefined);
+  }
+  const sampler = new RemoteStatsSampler();
+  sampler.sample(report({ jitterBufferTargetDelay: 0, jitterBufferMinimumDelay: 0 }));
+  const empty = sampler.sample(report({ timestamp: 2000, jitterBufferTargetDelay: 0, jitterBufferMinimumDelay: 0 }));
+  assert.equal(empty.jitterBufferTargetMs, undefined); assert.equal(empty.jitterBufferMinimumMs, undefined);
+  const zero = sampler.sample(report({ timestamp: 3000, jitterBufferEmittedCount: 1050, jitterBufferTargetDelay: 0, jitterBufferMinimumDelay: 0 }));
+  assert.equal(zero.jitterBufferTargetMs, 0); assert.equal(zero.jitterBufferMinimumMs, 0);
+});

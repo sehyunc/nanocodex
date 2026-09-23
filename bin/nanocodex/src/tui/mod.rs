@@ -12,8 +12,10 @@ mod scheduler;
 mod selection;
 mod simplify;
 mod split;
+mod startup;
 mod telemetry;
 mod terminal;
+mod terminal_profile;
 mod transcript;
 mod view;
 pub(crate) mod voice;
@@ -23,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crossterm::event::{
@@ -43,7 +45,7 @@ use nanocodex_voice::{
     CHATGPT_REALTIME_VOICES, PLATFORM_REALTIME_VOICES, RealtimeVoice, VoiceAgentControl,
     VoiceEvent, VoiceEvents, VoiceSession, VoiceSessionBuilder, VoiceSpeaker,
 };
-use ratatex::{Ratatex, TerminalProfile};
+use ratatex::Ratatex;
 use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep_until},
@@ -630,7 +632,11 @@ impl UiModel {
                 let updated = self.app.on_main_agent_event(0, &event);
                 request_navigated_branch_switch(&mut self.app, commands)?;
                 if updated {
-                    Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+                    Ok(UiUpdate::Redraw(if self.app.take_first_response_redraw() {
+                        RedrawPriority::Immediate
+                    } else {
+                        RedrawPriority::Streaming
+                    }))
                 } else {
                     Ok(UiUpdate::Ignore)
                 }
@@ -677,7 +683,11 @@ impl UiModel {
                     });
                 }
                 handle_worker_update(&mut self.app, update, commands)?;
-                Ok(UiUpdate::Redraw(RedrawPriority::Streaming))
+                Ok(UiUpdate::Redraw(if self.app.take_first_response_redraw() {
+                    RedrawPriority::Immediate
+                } else {
+                    RedrawPriority::Streaming
+                }))
             }
             UiAction::WorkerStopped => {
                 self.app
@@ -736,102 +746,175 @@ enum VoiceControl {
     List,
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
-)]
 pub(crate) async fn run(
     config: AgentArgs,
     vm: crate::vm::VmArgs,
     initial_prompt: Option<InitialPrompt>,
     resume: Option<DurableSession>,
 ) -> Result<()> {
-    let voice_mute_key = config.voice_mute_key.clone();
-    let voice_animations = config.voice_animations;
+    run_observed(config, vm, initial_prompt, resume, None).await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the ordered terminal, agent, worker, and render event loop is intentionally cohesive"
+)]
+pub(crate) async fn run_observed(
+    config: AgentArgs,
+    vm: crate::vm::VmArgs,
+    initial_prompt: Option<InitialPrompt>,
+    resume: Option<DurableSession>,
+    observability: Option<crate::observability::ObservabilityArgs>,
+) -> Result<()> {
     let resumed_model = resume.as_ref().map(DurableSession::model);
     let initial_thinking = config.thinking();
     let initial_fast_mode = config.fast_mode();
-    let restored_transcript = resume
-        .as_ref()
-        .map(|session| session.transcript().to_vec())
-        .unwrap_or_default();
     let cwd = resume
         .as_ref()
         .map(|session| PathBuf::from(session.workspace()))
-        .unwrap_or(resolve_cwd(&config)?);
-    let configured = if let Some(session) = resume {
-        config.build_resumed_tui(session, vm).await?
-    } else {
-        config.build_tui(vm).await?
+        .unwrap_or_else(|| config.cwd().to_path_buf());
+    let mut app = App::new(cwd)
+        .with_model(resumed_model.unwrap_or_default())
+        .with_thinking(initial_thinking)
+        .with_fast_mode(initial_fast_mode);
+    app.voice.mute_key = config.voice_mute_key.clone();
+    app.voice.animations = config.voice_animations;
+    "Initializing".clone_into(&mut app.main.status);
+    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+    let mut ui = UiModel::new(app, Arc::from(""));
+    let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
+    let mut stream_telemetry = StreamTelemetry::default();
+    let mut notifier = Notifier::from_env();
+    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
+    let mut input_events = Some(EventStream::new());
+    let mut ticker = ui_ticker();
+    // No credentials, log files, subprocesses, renderer workers, or network
+    // discovery are required to paint and edit the first frame.
+    render_due_frame(
+        &mut ui,
+        &mut terminal,
+        &mut scheduler,
+        &mut stream_telemetry,
+        &mut notifier,
+        None,
+    )?;
+
+    if let Some(session) = &resume {
+        ui.app
+            .restore_transcript(session.transcript().iter().cloned());
+    }
+    submit_initial_prompt(&mut ui.app, "", &worker_tx, initial_prompt)?;
+    scheduler.request_immediate(Instant::now());
+    // Synchronous pieces of backend construction run on a runtime worker, never
+    // in the input loop. Both tasks are owned and cancelled on every exit path.
+    let mut backend = startup::Backend::start(config, vm, resume, observability);
+    let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
+    let mut display = startup::Task::spawn(async move {
+        let profile = terminal_profile::detect().await;
+        startup::display_renderer(profile, move || {
+            let _ = math_update_tx.try_send(());
+        })
+    });
+    let mut math_renderer: Option<Ratatex> = None;
+    let mut pending = startup::Commands::default();
+    let startup_result: Result<Option<startup::Backend>> = async {
+        loop {
+            pending.drain(&mut ui.app, &mut worker_rx);
+            render_due_frame(&mut ui, &mut terminal, &mut scheduler, &mut stream_telemetry, &mut notifier, math_renderer.as_ref())?;
+            let deadline = scheduler.deadline();
+            tokio::select! {
+                // Typed input and quit already waiting at readiness are applied
+                // before flushing any buffered work to the agent.
+                biased;
+                event = input_events.as_mut().expect("terminal input is active").next() => {
+                    let event = event.transpose()?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed"))?;
+                    let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
+                    if update == UiUpdate::ExternalEditor {
+                        let events = input_events.take().expect("terminal input is active");
+                        input_events = Some(run_external_editor(events, &mut terminal, &mut ui.app).await?);
+                        if let Some(renderer) = &math_renderer { renderer.reupload_all(); }
+                        ui.app.invalidate_math_layouts();
+                        scheduler.request_immediate(Instant::now());
+                    } else if update == UiUpdate::RestoreTerminalGraphics {
+                        if let Some(renderer) = &math_renderer { renderer.reupload_all(); }
+                        ui.app.invalidate_math_layouts();
+                        scheduler.request_immediate(Instant::now());
+                    } else if apply_update(update, &mut scheduler) { break Ok(None); }
+                }
+                ready = backend.finish() => { break ready.wrap_err("TUI initialization task failed")?.map(Some); }
+                ready = display.finish(), if display.is_pending() => {
+                    if let Some(renderer) = ready.wrap_err("TUI display initialization task failed")?? {
+                        ui.app.set_math_renderer(renderer.clone());
+                        math_renderer = Some(renderer);
+                        scheduler.request_immediate(Instant::now());
+                    }
+                }
+                () = async { if let Some(deadline) = deadline { sleep_until(deadline.into()).await; } }, if deadline.is_some() => {}
+                _ = ticker.tick(), if ui.app.mouse_selection_needs_redraw() => {
+                    apply_update(ui.update(UiAction::Tick, &worker_tx)?, &mut scheduler);
+                }
+                _ = math_update_rx.recv(), if math_renderer.is_some() => {
+                    ui.app.invalidate_math_layouts();
+                    scheduler.request_immediate(Instant::now());
+                }
+            }
+        }
+    }.await;
+    let initialized = match startup_result {
+        Ok(Some(backend)) => backend,
+        result => {
+            drop((terminal, worker_tx, worker_rx, input_events));
+            if let Some(renderer) = &math_renderer {
+                renderer.shutdown();
+            }
+            let backend_cleanup = startup::stop_backend(&mut backend).await;
+            let display_cleanup = startup::stop_display(&mut display).await;
+            result?;
+            backend_cleanup?;
+            return display_cleanup;
+        }
     };
-    let initial_model = resumed_model.unwrap_or(configured.model);
+    let configured = initialized.configured;
+    let _observability = initialized.observability;
+    let mut control_server = initialized.control_server;
+    ui.app.cwd = initialized.cwd;
+    ui.app
+        .model_changed(resumed_model.unwrap_or(configured.model));
+    if ui.app.main.status == "Initializing" {
+        "Ready".clone_into(&mut ui.app.main.status);
+    }
     let agent = configured.handle;
     let mut agent_events = configured.events;
-    let realtime = configured.realtime;
     let root_session_id = Arc::<str>::from(agent_events.request_id());
+    ui.root_session_id = Arc::clone(&root_session_id);
     let mut subagent_updates = configured.subagent_updates;
     let child_agents = configured.child_agents;
     let mpp_adapter = configured.mpp_adapter;
-    let mcp = configured.mcp;
     let browser = configured.browser;
     let vm = configured.vm;
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel();
     let (update_tx, mut update_rx) = mpsc::unbounded_channel();
+    pending.drain(&mut ui.app, &mut worker_rx);
     let worker = spawn_agent_worker(
         agent,
         Arc::clone(&root_session_id),
-        realtime,
-        mcp,
+        configured.realtime,
+        configured.mcp,
         worker_rx,
         update_tx,
     );
-
-    let mut terminal = TerminalSession::enter().wrap_err("failed to initialize the terminal")?;
-    let terminal_profile = TerminalProfile::query(Duration::from_millis(750));
-    let (math_update_tx, mut math_update_rx) = mpsc::channel(1);
-    let math_renderer = Ratatex::builder(terminal_profile)
-        .on_update(move || {
-            let _ = math_update_tx.try_send(());
-        })
-        .build()
-        .wrap_err("failed to initialize the display-math renderer")?;
-    let availability = math_renderer.availability();
-    tracing::debug!(
-        graphics = availability.graphics,
-        cell_width = terminal_profile.cell.width,
-        cell_height = terminal_profile.cell.height,
-        "initialized Ratatex"
-    );
-    let mut input_events = EventStream::new();
-    let mut ticker = ui_ticker();
-    let mut app = App::new(cwd)
-        .with_model(initial_model)
-        .with_thinking(initial_thinking)
-        .with_fast_mode(initial_fast_mode);
-    app.voice.mute_key = voice_mute_key;
-    app.voice.animations = voice_animations;
-    app.set_math_renderer(math_renderer.clone());
-    app.restore_transcript(restored_transcript);
-    let mut ui = UiModel::new(app, Arc::clone(&root_session_id));
-    let mut control_server = if nanocodex_tui_control::Server::enabled() {
-        Some(nanocodex_tui_control::Server::start("native")?)
-    } else {
-        None
-    };
     if let Some(server) = &control_server {
         ui.control = Some(server.bridge.clone());
-        worker_tx.send(WorkerCommand::AttachControl(server.bridge.clone()))?;
     }
-    let mut scheduler = RenderScheduler::new(STREAM_FRAME_INTERVAL, Instant::now());
-    let mut stream_telemetry = StreamTelemetry::default();
     let mut view_telemetry = ViewTelemetry::new(Arc::clone(&root_session_id));
-    let mut notifier = Notifier::from_env();
     let mut subagent_completion_tracker = SubagentCompletionTracker::default();
     let mut control_subagents = HashMap::new();
-
-    submit_initial_prompt(&mut ui.app, &root_session_id, &worker_tx, initial_prompt)?;
+    scheduler.request_immediate(Instant::now());
 
     let loop_result: Result<()> = async {
+        if let Some(bridge) = &ui.control {
+            worker_tx.send(WorkerCommand::AttachControl(bridge.clone()))?;
+        }
+        pending.flush(&worker_tx)?;
         loop {
             if let Some(bridge) = &ui.control {
                 bridge.state(active_session_id(&ui.app, &root_session_id), ui.app.control_snapshot());
@@ -843,7 +926,7 @@ pub(crate) async fn run(
                 &mut scheduler,
                 &mut stream_telemetry,
                 &mut notifier,
-                &math_renderer,
+                math_renderer.as_ref(),
             )?;
 
             let render_deadline = scheduler.deadline();
@@ -856,21 +939,22 @@ pub(crate) async fn run(
                     sleep_until(deadline.into()).await;
                 }
             }, if render_deadline.is_some() => {}
-            event = input_events.next() => {
+            event = input_events.as_mut().expect("terminal input is active").next() => {
                 let event = event.transpose()?.ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "terminal input closed")
                 })?;
                 let update = ui.update(UiAction::Terminal(event), &worker_tx)?;
                 if update == UiUpdate::RestoreTerminalGraphics {
-                    math_renderer.reupload_all();
+                    if let Some(renderer) = &math_renderer { renderer.reupload_all(); }
                     ui.app.invalidate_math_layouts();
                 } else if update == UiUpdate::ExternalEditor {
                     if let Some(bridge)=&ui.control {
                         let mut state=ui.app.control_snapshot(); state["ui_blocked"]=serde_json::json!(true); state["menu"]=serde_json::json!("external_editor");
                         bridge.state(active_session_id(&ui.app,&root_session_id),state);
                     }
-                    input_events = run_external_editor(input_events, &mut terminal, &mut ui.app).await?;
-                    math_renderer.reupload_all();
+                    let events = input_events.take().expect("terminal input is active");
+                        input_events = Some(run_external_editor(events, &mut terminal, &mut ui.app).await?);
+                    if let Some(renderer) = &math_renderer { renderer.reupload_all(); }
                     ui.app.invalidate_math_layouts();
                     scheduler.request_immediate(Instant::now());
                 } else if apply_update(update, &mut scheduler) {
@@ -903,7 +987,7 @@ pub(crate) async fn run(
                 if let Some(received) = received {
                     stream_telemetry.event_applied(
                         received,
-                        matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
+                        matches!(update, UiUpdate::Redraw(_)),
                     );
                 }
                 if apply_update(update, &mut scheduler) {
@@ -943,7 +1027,14 @@ pub(crate) async fn run(
                     break Ok(());
                 }
             }
-            _ = math_update_rx.recv() => {
+            ready = display.finish(), if display.is_pending() => {
+                if let Some(renderer) = ready.wrap_err("TUI display initialization task failed")?? {
+                    ui.app.set_math_renderer(renderer.clone());
+                    math_renderer = Some(renderer);
+                    scheduler.request_immediate(Instant::now());
+                }
+            }
+            _ = math_update_rx.recv(), if math_renderer.is_some() => {
                 ui.app.invalidate_math_layouts();
                 scheduler.request_immediate(Instant::now());
             }
@@ -954,9 +1045,14 @@ pub(crate) async fn run(
 
     // Restore the terminal before disconnecting the paid WebSocket session.
     drop((terminal, worker_tx, agent_events));
-    math_renderer.shutdown();
-    let shutdown_result = shutdown_runtime(worker, child_agents, mpp_adapter, browser, vm).await;
+    if let Some(renderer) = &math_renderer {
+        renderer.shutdown();
+    }
+    let display_cleanup = startup::stop_display(&mut display).await;
+    let shutdown_result =
+        shutdown_runtime(Some(worker), child_agents, mpp_adapter, browser, vm).await;
     loop_result?;
+    display_cleanup?;
     shutdown_result
 }
 
@@ -968,7 +1064,7 @@ fn resolve_cwd(config: &AgentArgs) -> Result<PathBuf> {
 }
 
 async fn shutdown_runtime(
-    worker: tokio::task::JoinHandle<()>,
+    worker: Option<tokio::task::JoinHandle<()>>,
     child_agents: Option<std::sync::Arc<crate::subagents::ChildAgents>>,
     mpp_adapter: Option<crate::mpp::MppAdapter>,
     browser: Option<crate::browser::ConfiguredBrowser>,
@@ -977,8 +1073,12 @@ async fn shutdown_runtime(
     if let Some(child_agents) = child_agents {
         child_agents.shutdown().await;
     }
-    worker.abort();
-    let worker_result = worker.await;
+    let worker_result = if let Some(worker) = worker {
+        worker.abort();
+        worker.await
+    } else {
+        Ok(())
+    };
     let browser_shutdown_result = if let Some(browser) = browser {
         browser.shutdown().await
     } else {
@@ -1044,10 +1144,7 @@ fn apply_main_agent_event(
     });
     let update = ui.update(action, worker_tx)?;
     if let Some(received) = received {
-        stream_telemetry.event_applied(
-            received,
-            matches!(update, UiUpdate::Redraw(RedrawPriority::Streaming)),
-        );
+        stream_telemetry.event_applied(received, matches!(update, UiUpdate::Redraw(_)));
     }
     Ok(apply_update(update, scheduler))
 }
@@ -1058,7 +1155,7 @@ fn render_due_frame(
     scheduler: &mut RenderScheduler,
     stream_telemetry: &mut StreamTelemetry,
     notifier: &mut Notifier,
-    math_renderer: &Ratatex,
+    math_renderer: Option<&Ratatex>,
 ) -> Result<()> {
     if !scheduler.is_due(Instant::now()) {
         return Ok(());
@@ -1066,7 +1163,10 @@ fn render_due_frame(
     ui.apply_pending_mouse_scroll();
     ui.app.advance_smooth_scroll();
     let render_started = Instant::now();
-    let math_output_bytes = flush_math_commands(terminal, math_renderer)?;
+    let math_output_bytes = math_renderer
+        .map(|renderer| flush_math_commands(terminal, renderer))
+        .transpose()?
+        .unwrap_or(0);
     let mut draw_metrics = match scheduler.scope().unwrap_or(RenderScope::Full) {
         RenderScope::Full => terminal.draw(|frame| view::render(frame, &mut ui.app))?,
         RenderScope::Animation => terminal.draw_reusing_last_frame(|frame, reused| {
@@ -3732,7 +3832,9 @@ fn collapse_btw_prompt(thread_id: &str) -> SubmittedPrompt {
 
 fn active_session_id<'a>(app: &'a App, root_session_id: &'a str) -> Option<&'a str> {
     match app.focus {
-        PaneId::Main => app.main_branch_request_id().or(Some(root_session_id)),
+        PaneId::Main => app
+            .main_branch_request_id()
+            .or((!root_session_id.is_empty()).then_some(root_session_id)),
         PaneId::Btw(id) => app
             .btw
             .as_ref()
@@ -4524,6 +4626,68 @@ mod tests {
     }
 
     #[test]
+    fn first_response_is_scheduled_once_while_branch_navigator_hides_its_viewport() {
+        let mut app = App::new("/workspace".into());
+        app.main
+            .transcript
+            .push_editable_user("root prompt".to_owned(), 1);
+        app.move_up();
+        assert!(app.start_historical_edit());
+        app.replace_input("branch prompt".to_owned());
+        let request = app.commit_historical_edit().unwrap();
+        let _ = app.main_branch_opened(
+            request.new_branch,
+            request.source_branch,
+            request.prompt,
+            Arc::from("branch-session"),
+        );
+        assert!(app.toggle_branch_navigator());
+        app.move_branch_navigator(-1);
+        let (commands, _worker) = mpsc::unbounded_channel();
+        let mut ui = UiModel::new(app, Arc::from("main-session"));
+        let (events, mut agent_events) = EventSink::channel("test".to_owned());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+
+        for (text, expected) in [
+            ("A", RedrawPriority::Immediate),
+            ("B", RedrawPriority::Streaming),
+        ] {
+            events
+                .emit(
+                    AgentEventKind::AssistantDelta,
+                    json!({"model_call_index": 0, "text": text}),
+                )
+                .unwrap();
+            let update = ui
+                .update(
+                    UiAction::Worker(WorkerEvent::MainBranchAgentEvent {
+                        id: request.new_branch,
+                        event: agent_events.try_recv_timed().unwrap(),
+                    }),
+                    &commands,
+                )
+                .unwrap();
+            assert_eq!(update, UiUpdate::Redraw(expected));
+            terminal
+                .draw(|frame| super::view::render(frame, &mut ui.app))
+                .unwrap();
+            assert!(terminal.backend().to_string().contains("Branch 0 preview"));
+            assert!(
+                ui.app.first_response_pending(),
+                "hidden viewport has not settled"
+            );
+        }
+
+        ui.app.close_branch_navigator();
+        terminal
+            .draw(|frame| super::view::render(frame, &mut ui.app))
+            .unwrap();
+        assert!(terminal.backend().to_string().contains("AB"));
+        assert!(!ui.app.first_response_pending());
+    }
+
+    #[test]
     fn main_event_batches_apply_assistant_deltas_individually() {
         let (events, mut agent_events) = EventSink::channel("test".to_owned());
         events
@@ -4577,6 +4741,22 @@ mod tests {
                 &mut scheduler,
                 &mut agent_events,
                 first,
+            )
+            .unwrap()
+        );
+        assert_eq!(ui.app.main.transcript.assistant_sources(), ["A"]);
+        assert!(scheduler.is_due(Instant::now()));
+        ui.app.main.settle_viewport(80, 24);
+        scheduler.presented(Instant::now());
+        let next = agent_events.try_recv_timed();
+        assert!(
+            !apply_main_agent_event_batch(
+                &mut ui,
+                &commands,
+                &mut telemetry,
+                &mut scheduler,
+                &mut agent_events,
+                next,
             )
             .unwrap()
         );

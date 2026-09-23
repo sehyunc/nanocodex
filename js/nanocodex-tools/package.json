@@ -34,10 +34,6 @@
       "types": "./tools/just-bash-browser.d.mts",
       "import": "./tools/just-bash-browser.mjs"
     },
-    "./memory": {
-      "types": "./dist/memory.d.ts",
-      "import": "./dist/memory.js"
-    },
     "./session": {
       "types": "./dist/session.d.ts",
       "import": "./dist/session.js"
@@ -68,6 +64,7 @@
     },
     "./standard": "./tools/standard.mjs",
     "./standard-descriptions": "./tools/standardDescriptions.mjs",
+    "./runtime/code-tools": "./runtime/code-tools.mjs",
     "./runtime/code-values": "./runtime/code-values.mjs",
     "./runtime/code-runtime": "./runtime/code-runtime.mjs",
     "./runtime/tool-configuration": "./runtime/tool-configuration.mjs",

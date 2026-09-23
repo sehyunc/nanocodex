@@ -1,3 +1,4 @@
+import { TRUSTED_INGRESS_HEADER, placementRegion as sessionModelRelayRegion } from "nanocodex/cloudflare/durable-placement";
 const MANAGED_SESSION_SUBJECT_PREFIX = "managed-session-v1_";
 
 export function managedCredentialSubject(storageId: string): string {
@@ -73,12 +74,18 @@ export function sessionCredentialOwner(input: Readonly<{
   return binding.owner_id;
 }
 
+export { placementRegion as sessionModelRelayRegion } from "nanocodex/cloudflare/durable-placement";
+
 /** Preserve the SDK's context identity and scope only its private model egress. */
 export function scopedManagedModelEgress(
   binding: Fetcher,
   storageId: string,
   subject: string,
-  sessionModel?: Readonly<{ binding: Fetcher; owner(): string | undefined }>,
+  sessionModel?: Readonly<{
+    binding: Fetcher;
+    owner(): string | undefined;
+    clientIngressColo?(): string | null;
+  }>,
   chatGptAccountId?: string,
   agentId?: string,
   model?: string,
@@ -91,6 +98,9 @@ export function scopedManagedModelEgress(
         throw new TypeError("managed model subject mismatch");
       }
       request.headers.set("x-nanocodex-subject", subject);
+      // Runtime headers never establish placement, including generic fallback.
+      request.headers.delete("x-nanocodex-model-region");
+      request.headers.delete(TRUSTED_INGRESS_HEADER);
       // The retained session configuration owns selection, never a runtime header.
       request.headers.delete("x-nanocodex-chatgpt-account-id");
       request.headers.delete("x-nanocodex-session-model-agent");
@@ -104,6 +114,8 @@ export function scopedManagedModelEgress(
         const owner = sessionModel.owner();
         if (!owner) throw new Error("managed model ownership is unavailable");
         request.headers.set("x-nanocodex-session-model-owner", owner);
+        const region = sessionModelRelayRegion(sessionModel.clientIngressColo?.());
+        if (region) request.headers.set("x-nanocodex-model-region", region);
         return sessionModel.binding.fetch(request);
       }
       return binding.fetch(request);
