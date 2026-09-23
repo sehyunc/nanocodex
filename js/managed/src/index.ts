@@ -420,6 +420,7 @@ export interface Env extends
   NANOCODEX: Fetcher;
   NANOCODEX_REALTIME?: Fetcher;
   NANOCODEX_SESSION_MODEL_EGRESS?: Fetcher;
+  CLIPROXY_CANARY_AGENT_ID?: string;
   NANOCODEX_X?: Fetcher;
   NANOCODEX_HISTORY: R2Bucket;
   NANOCODEX_WORKSPACES: R2Bucket;
@@ -9952,6 +9953,8 @@ export class DurableAgentSession extends DurableComputerSession {
         }),
       },
       this.#configuration().chatgpt_account_id,
+      this.#session()?.session_id === this.env.CLIPROXY_CANARY_AGENT_ID ? this.#session()?.session_id : undefined,
+      this.#settings().model,
     );
   }
 

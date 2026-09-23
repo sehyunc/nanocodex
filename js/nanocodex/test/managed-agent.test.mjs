@@ -412,6 +412,23 @@ test("managed Agent preserves Sol and Luna none/pro policy", async () => {
   }
 });
 
+test("managed Agent admits subscription Claude models with compatible settings", async () => {
+  let body;
+  const options = { baseUrl: origin, fetch: async (_url, init) => {
+    body = JSON.parse(init.body);
+    return Response.json({ agent_id: agentId });
+  } };
+  for (const model of ["claude-fable-5-1", "claude-opus-5-5"]) {
+    await Agent.create({ ...options, settings: {
+      model, thinking: "low", reasoningMode: "standard", fastMode: false,
+    } });
+    assert.equal(body.settings.model, model);
+  }
+  await assert.rejects(Agent.create({ ...options, settings: {
+    model: "claude-opus-5-5", thinking: "none", reasoningMode: "standard", fastMode: false,
+  } }), /Claude/);
+});
+
 test("managed Agent rejects incomplete, retired, and Astra-incompatible creation policy", async () => {
   const options = { baseUrl: origin, fetch: async () => Response.json({ agent_id: agentId }) };
   await assert.rejects(Agent.create({

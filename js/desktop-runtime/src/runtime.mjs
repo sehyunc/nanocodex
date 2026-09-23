@@ -27,6 +27,10 @@ export function validateSettings(settings) {
     if (!["low", "medium", "high", "xhigh", "max"].includes(settings.thinking)) throw new Error("Astra supports Low through Max reasoning. Choose High to get started.");
     if (settings.reasoning_mode !== "standard") throw new Error("Astra uses Standard mode.");
   }
+  if (settings.model?.startsWith("claude-") && (!["low", "medium", "high"].includes(settings.thinking)
+    || settings.reasoning_mode !== "standard" || settings.fast_mode)) {
+    throw new Error("Claude supports Low through High reasoning, Standard mode, and no Fast mode.");
+  }
   return settings;
 }
 

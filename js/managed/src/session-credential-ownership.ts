@@ -80,6 +80,8 @@ export function scopedManagedModelEgress(
   subject: string,
   sessionModel?: Readonly<{ binding: Fetcher; owner(): string | undefined }>,
   chatGptAccountId?: string,
+  agentId?: string,
+  model?: string,
 ): Pick<Fetcher, "fetch"> {
   if (subject !== storageId && subject !== managedCredentialSubject(storageId)) throw new TypeError("invalid managed subject");
   return {
@@ -91,6 +93,10 @@ export function scopedManagedModelEgress(
       request.headers.set("x-nanocodex-subject", subject);
       // The retained session configuration owns selection, never a runtime header.
       request.headers.delete("x-nanocodex-chatgpt-account-id");
+      request.headers.delete("x-nanocodex-session-model-agent");
+      request.headers.delete("x-nanocodex-session-model");
+      if (agentId !== undefined) request.headers.set("x-nanocodex-session-model-agent", agentId);
+      if (model !== undefined) request.headers.set("x-nanocodex-session-model", model);
       if (chatGptAccountId !== undefined) request.headers.set("x-nanocodex-chatgpt-account-id", chatGptAccountId);
       if (sessionModel && request.url === "https://nanocodex.internal/v1/responses" && (request.method === "GET" || request.method === "POST")) {
         // Check authoritative local state at connection time, including every

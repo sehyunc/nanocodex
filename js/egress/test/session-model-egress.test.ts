@@ -15,6 +15,55 @@ function request() {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("Session-only model egress", () => {
+  it("routes only the configured managed agent through the private CLIProxyAPI canary", async () => {
+    const forwarded: Request[] = [];
+    const relay = vi.fn(async (input: Request) => {
+      forwarded.push(input);
+      return new Response('data: {"type":"response.completed"}\n\n', { headers: { "content-type": "text/event-stream" } });
+    });
+    const env = {
+      CLIPROXY_CANARY_AGENT_ID: "canary-agent",
+      USER_CREDENTIALS: { getByName: () => ({ resolveModelCredential: async () => ({ status: 200,
+        credential: { kind: "chatgpt", revision: 1, secret: "fixture-provider-secret", accountId: "fixture-account" } }) }) },
+      CHATGPT_EGRESS: { idFromName: () => "relay", get: () => ({ fetch: relay }) },
+    } as unknown as EgressEnv;
+    const entrypoint = new SessionModelEgress(createExecutionContext(), env);
+    for (const agent of ["canary-agent", "other-agent"]) {
+      const headers = new Headers(request().headers);
+      headers.delete("upgrade");
+      headers.set("content-type", "application/json");
+      headers.set("x-nanocodex-session-model-agent", agent);
+      headers.set("x-nanocodex-cliproxy-canary", "v1");
+      const response = await entrypoint.fetch(new Request("https://nanocodex.internal/v1/responses", {
+        method: "POST", headers, body: '{"model":"gpt-6-luna","stream":true,"input":[]}',
+      }));
+      expect(response.status).toBe(200);
+      await response.body?.cancel();
+    }
+    expect(forwarded).toHaveLength(2);
+    expect(forwarded[0]!.headers.get("x-nanocodex-cliproxy-canary")).toBe("v1");
+    expect(forwarded[1]!.headers.has("x-nanocodex-cliproxy-canary")).toBe(false);
+    expect(forwarded[0]!.headers.get("authorization")).toBe("Bearer fixture-provider-secret");
+    expect(forwarded[0]!.headers.get("chatgpt-account-id")).toBe("fixture-account");
+    env.CLIPROXY_RESPONSES_ENABLED = "true";
+    const allAgents = new Headers(request().headers);
+    allAgents.delete("upgrade");
+    allAgents.set("content-type", "application/json");
+    const allResponse = await entrypoint.fetch(new Request("https://nanocodex.internal/v1/responses", {
+      method: "POST", headers: allAgents, body: '{"model":"gpt-6-luna","stream":true,"input":[]}',
+    }));
+    expect(allResponse.status).toBe(200);
+    await allResponse.body?.cancel();
+    expect(forwarded[2]!.headers.get("x-nanocodex-cliproxy-canary")).toBe("v1");
+    allAgents.set("x-nanocodex-session-model", "claude-fable-5-1");
+    const claudeResponse = await entrypoint.fetch(new Request("https://nanocodex.internal/v1/responses", {
+      method: "POST", headers: allAgents, body: '{"model":"claude-fable-5-1","stream":true,"input":[]}',
+    }));
+    expect(claudeResponse.status).toBe(200);
+    await claudeResponse.body?.cancel();
+    expect(forwarded[3]!.headers.get("x-nanocodex-cliproxy-provider")).toBe("claude");
+  });
+
   it("uses the private binding's live Session assertion without a callback and still reads current credentials", async () => {
     const lookup = vi.fn(async () => ({ status: 200, resolve_ms: 3, resolve_id: "01234567-0123-4567-89ab-0123456789ab", credential: { kind: "openai", revision: 1, secret: "fixture-provider-secret" } }));
     const getByName = vi.fn(() => ({ resolveModelCredential: lookup }));

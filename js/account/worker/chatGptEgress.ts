@@ -4,6 +4,67 @@ export class ChatGptEgress extends Container {
   defaultPort = 8080;
   enableInternet = true;
   sleepAfter = "1h";
+  #claudeAuthLoaded = false;
+
+  /** Only the account-authorized broker may import this user's Claude OAuth file. */
+  async importClaudeAuth(auth: string): Promise<void> {
+    if (new TextEncoder().encode(auth).byteLength > 16_384) throw new TypeError("Claude auth is too large");
+    let value: Record<string, unknown>;
+    try { value = JSON.parse(auth) as Record<string, unknown>; } catch { throw new TypeError("invalid Claude auth"); }
+    if (value?.type !== "claude" || typeof value.access_token !== "string"
+      || typeof value.refresh_token !== "string" || !value.access_token || !value.refresh_token) {
+      throw new TypeError("invalid Claude auth");
+    }
+    await this.ctx.storage.put("claude-oauth-v1", auth);
+    this.#claudeAuthLoaded = false;
+    await this.#restoreClaudeAuth(true);
+  }
+
+  async claudeAuthStatus(): Promise<{ connected: boolean }> {
+    return { connected: (await this.ctx.storage.get<string>("claude-oauth-v1")) !== undefined };
+  }
+
+  async #restoreClaudeAuth(force = false): Promise<void> {
+    const auth = await this.ctx.storage.get<string>("claude-oauth-v1");
+    if (auth === undefined) return;
+    if (!this.ctx.container?.running) this.#claudeAuthLoaded = false;
+    if (this.#claudeAuthLoaded) return;
+    if (!force && this.ctx.container?.running) {
+      const current = await super.fetch(new Request("https://chatgpt-egress.internal/internal/claude-auth"));
+      if (current.ok) {
+        const live = await current.text();
+        if (new TextEncoder().encode(live).byteLength <= 16_384) {
+          if (live !== auth) await this.ctx.storage.put("claude-oauth-v1", live);
+          this.#claudeAuthLoaded = true;
+          return;
+        }
+      } else await current.body?.cancel();
+    }
+    const response = await super.fetch(new Request("https://chatgpt-egress.internal/internal/claude-auth", {
+      method: "PUT", headers: { "content-type": "application/json" }, body: auth,
+    }));
+    await response.body?.cancel();
+    if (!response.ok) throw new Error("Claude auth restore failed");
+    this.#claudeAuthLoaded = true;
+  }
+
+  async #captureClaudeAuth(): Promise<void> {
+    if (!this.#claudeAuthLoaded) return;
+    const response = await super.fetch(new Request("https://chatgpt-egress.internal/internal/claude-auth"));
+    if (!response.ok) { await response.body?.cancel(); return; }
+    const auth = await response.text();
+    if (new TextEncoder().encode(auth).byteLength > 16_384) throw new Error("Claude auth capture too large");
+    const saved = await this.ctx.storage.get<string>("claude-oauth-v1");
+    if (auth !== saved) await this.ctx.storage.put("claude-oauth-v1", auth);
+  }
+
+  override async onActivityExpired(): Promise<void> {
+    if (this.ctx.container?.running) {
+      await this.#restoreClaudeAuth();
+      await this.#captureClaudeAuth();
+    }
+    await super.onActivityExpired();
+  }
 
   /** Private egress binding: transfer the small SDP exchange in one RPC reply. */
   async createRealtimeCall(body: string, headers: Record<string, string>, search: string): Promise<{
@@ -23,8 +84,13 @@ export class ChatGptEgress extends Container {
   }
 
   override async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname === "/internal/claude-auth") return new Response(null, { status: 404 });
+    const claude = request.headers.get("x-nanocodex-cliproxy-provider") === "claude";
+    if (claude) await this.#restoreClaudeAuth();
     if (new URL(request.url).pathname !== "/backend-api/codex/realtime/calls") {
-      return super.fetch(request);
+      const response = await super.fetch(request);
+      if (claude) await this.#captureClaudeAuth();
+      return response;
     }
     const began = performance.now();
     const wasRunning = this.ctx.container?.running;

@@ -220,6 +220,8 @@ export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv {
   CHATGPT_EGRESS?: DurableObjectNamespace;
   CHATGPT_VOICE_RELAY_RPC?: string;
   CODEX_RELAY_URL?: string;
+  CLIPROXY_CANARY_AGENT_ID?: string;
+  CLIPROXY_RESPONSES_ENABLED?: string;
   ALLOW_INSECURE_LOOPBACK_RELAY?: string;
   NANOCODEX_BROKER_PROBE_TOKEN?: string;
   DEPLOYMENT_SHA?: string;
@@ -610,9 +612,27 @@ async function handleEgressWithOwner(
         if (operation.id === "responses") {
           // Keep model HTTP/handshake failures distinguishable and correctly retryable.
           // Provider messages may echo input or credentials; project known codes only.
+          let rejectionText: string | undefined;
           if (!upstream.bodyUsed) {
-            try { rejectionBody = JSON.parse(await readBoundedText(upstream, 64 * 1024)); }
+            try {
+              rejectionText = await readBoundedText(upstream, 64 * 1024);
+              rejectionBody = JSON.parse(rejectionText);
+            }
             catch { /* Malformed, oversized, or failed bodies retain their HTTP status. */ }
+          }
+          if (upstreamStatus === 502 && credential.kind === "chatgpt") {
+            const error = isRecord(rejectionBody) && isRecord(rejectionBody.error)
+              ? rejectionBody.error : undefined;
+            const message = typeof error?.message === "string" ? error.message.toLowerCase() : "";
+            console.warn(JSON.stringify({ type: "egress.cliproxy_502",
+              body: rejectionText?.startsWith("upstream request failed") ? "relay_fetch"
+                : rejectionText?.startsWith("upstream WebSocket failed") ? "relay_socket"
+                  : rejectionBody ? "json" : "other",
+              relayError: /^(?:E[A-Z0-9_]{2,40}|UND_ERR_[A-Z0-9_]{2,40})$/.test(upstream.headers.get("x-nanocodex-relay-error") ?? "")
+                ? upstream.headers.get("x-nanocodex-relay-error") : undefined,
+              hints: ["upstream", "connection", "authorization", "websocket", "timeout", "unavailable"]
+                .filter((word) => message.includes(word)),
+            }));
           }
           const diagnostic = modelRejectionDiagnostic(rejectionBody);
           const { code } = diagnostic;
@@ -2202,11 +2222,33 @@ async function handleControl(request: Request, url: URL, env: EgressEnv): Promis
   }
 
   const userMatch = url.pathname.match(
-    /^\/users\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/credentials(?:\/(openai|chatgpt|chatgpt\/login|chatgpt\/login\/status|chatgpt\/local-claim))?$/,
+    /^\/users\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\/credentials(?:\/(openai|chatgpt|chatgpt\/login|chatgpt\/login\/status|chatgpt\/local-claim|claude\/import|claude\/status))?$/,
   );
   if (!userMatch) return jsonError(404, "not_found");
   const userId = userMatch[1]!;
   const operation = userMatch[2];
+
+  if (operation === "claude/import" && request.method === "PUT") {
+    if (!env.CHATGPT_EGRESS || request.headers.get("content-type")?.toLowerCase() !== "application/json") {
+      return jsonError(503, "claude_auth_unavailable");
+    }
+    let auth: string;
+    try { auth = await readBoundedText(request, 16_384); }
+    catch { return jsonError(400, "invalid_claude_auth"); }
+    const relay = env.CHATGPT_EGRESS.get(env.CHATGPT_EGRESS.idFromName(`user-v1:${userId}`)) as DurableObjectStub & {
+      importClaudeAuth(auth: string): Promise<void>;
+    };
+    try { await relay.importClaudeAuth(auth); }
+    catch { return jsonError(400, "invalid_claude_auth"); }
+    return json({ connected: true }, 200);
+  }
+  if (operation === "claude/status" && request.method === "GET") {
+    if (!env.CHATGPT_EGRESS) return jsonError(503, "claude_auth_unavailable");
+    const relay = env.CHATGPT_EGRESS.get(env.CHATGPT_EGRESS.idFromName(`user-v1:${userId}`)) as DurableObjectStub & {
+      claudeAuthStatus(): Promise<{ connected: boolean }>;
+    };
+    return json(await relay.claudeAuthStatus(), 200);
+  }
 
   if (operation === "chatgpt/local-claim") {
     if (request.method !== "POST") return jsonError(405, "method_not_allowed");
@@ -2394,6 +2436,16 @@ function buildUpstreamRequest(
   for (const name of allowed) {
     const value = original.headers.get(name);
     if (value !== null) headers.set(name, value);
+  }
+  if (operation.id === "responses" && credential.kind === "chatgpt"
+    && (env.CLIPROXY_RESPONSES_ENABLED === "true"
+      || (env.CLIPROXY_CANARY_AGENT_ID?.trim()
+        && original.headers.get("x-nanocodex-session-model-agent") === env.CLIPROXY_CANARY_AGENT_ID.trim()))) {
+    headers.set("x-nanocodex-cliproxy-canary", "v1");
+    if (original.headers.get("x-nanocodex-session-model")?.startsWith("claude-")) {
+      headers.set("x-nanocodex-cliproxy-provider", "claude");
+    }
+    console.info(JSON.stringify({ type: "egress.cliproxy_route", transport: original.method }));
   }
   if (realtime) {
     const realtimeSessionId = original.headers.get("x-session-id");

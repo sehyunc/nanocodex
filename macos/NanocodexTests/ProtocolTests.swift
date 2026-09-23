@@ -1053,6 +1053,18 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(restored.settingsForTab("draft").model, "gpt-6-luna")
     }
 
+    func testClaudeSelectionNormalizesUnsupportedSettings() {
+        var settings = AgentSettings(model: "gpt-6-sol", thinking: "max", reasoning_mode: "pro", fast_mode: true)
+        settings.selectModel("claude-fable-5-1")
+        XCTAssertEqual(settings.modelName, "Fable 5.1")
+        XCTAssertEqual(settings.thinking, "low")
+        XCTAssertEqual(settings.reasoning_mode, "standard")
+        XCTAssertFalse(settings.fast_mode)
+        XCTAssertFalse(settings.supportsThinking("xhigh"))
+        settings.selectModel("claude-opus-5-5")
+        XCTAssertEqual(settings.modelName, "Opus 5.5")
+    }
+
     @MainActor
     func testBrowserRestoresReviewedConversationWithoutHiddenFiltering() async throws {
         let model = AppModel(runtimeDirectory: "/tmp/nanocodex-browser-default-filter")

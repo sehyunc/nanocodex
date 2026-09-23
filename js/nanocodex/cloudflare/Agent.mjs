@@ -384,7 +384,7 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle) {
           }
           selected = createWorkersAiResponses(profile.workersAi.ai);
         } else {
-          if (!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"].includes(profile.model)) {
+          if (!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(profile.model)) {
             throw new Error("Session model requires an explicit inference binding");
           }
           selected = frontierEndpoint;
@@ -630,14 +630,16 @@ function validateInternalConfiguration(configuration) {
       "reasoning_mode",
       "fast_mode",
     ].includes(key))
-    || !["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"]
+    || !["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"]
       .includes(configuration.model)
     || !["none", "low", "medium", "high", "xhigh", "max"].includes(configuration.thinking)
     || !["standard", "pro"].includes(configuration.reasoning_mode)
     || typeof configuration.fast_mode !== "boolean"
     || (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(configuration.model)
       && (!(configuration.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(configuration.thinking) || configuration.reasoning_mode !== "standard"))
-    || (configuration.model === "gpt-6-astra" && configuration.thinking === "none")) {
+    || (configuration.model === "gpt-6-astra" && configuration.thinking === "none")
+    || (configuration.model?.startsWith("claude-") && (!["low", "medium", "high"].includes(configuration.thinking)
+      || configuration.reasoning_mode !== "standard" || configuration.fast_mode))) {
     throw new TypeError("Cloudflare Agent internal configuration is invalid");
   }
 }

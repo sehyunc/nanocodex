@@ -150,6 +150,17 @@ test("GPT-6 Sol and Luna retain None and Pro", () => {
     assert.equal(validateSettings({ ...settings, reasoning_mode: "pro" }).reasoning_mode, "pro");
   }
 });
+test("Claude desktop settings accept Fable and Opus without unsupported modes", () => {
+  for (const model of ["claude-fable-5-1", "claude-opus-5-5"]) {
+    const settings = { model, thinking: "low", reasoning_mode: "standard", fast_mode: false };
+    assert.equal(validateSettings(settings), settings);
+    for (const thinking of ["none", "xhigh", "max"]) {
+      assert.throws(() => validateSettings({ ...settings, thinking }), /Low through High/);
+    }
+    assert.throws(() => validateSettings({ ...settings, reasoning_mode: "pro" }), /Standard/);
+    assert.throws(() => validateSettings({ ...settings, fast_mode: true }), /no Fast/);
+  }
+});
 test("new desktop threads default to GPT-6 Sol", () => {
   assert.deepEqual(DEFAULT_SETTINGS, { model: "gpt-6-sol", thinking: "medium", reasoning_mode: "standard", fast_mode: false });
 });

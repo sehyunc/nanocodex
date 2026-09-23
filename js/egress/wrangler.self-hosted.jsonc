@@ -28,7 +28,9 @@
   },
   "services": [],
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    "CLIPROXY_CANARY_AGENT_ID": "ee17cbbe-2b4d-89b9-af60-0a548fd9b513",
+    "CLIPROXY_RESPONSES_ENABLED": "true"
   },
   "durable_objects": {
     "bindings": [

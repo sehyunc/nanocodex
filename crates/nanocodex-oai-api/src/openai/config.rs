@@ -83,6 +83,7 @@ impl ModelConfig {
     pub fn system_prompt(&self) -> Cow<'_, str> {
         let base = self.system_prompt.as_deref().unwrap_or(match self.model {
             Model::Astra => ASTRA_SYSTEM_PROMPT,
+            Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55 => SOL_SYSTEM_PROMPT,
             Model::Glm53 | Model::Kimi | Model::Mimo => GLM_SYSTEM_PROMPT,
             Model::Sol => SOL_SYSTEM_PROMPT,
             Model::Luna => LUNA_SYSTEM_PROMPT,

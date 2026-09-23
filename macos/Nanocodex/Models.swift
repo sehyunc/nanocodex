@@ -60,15 +60,20 @@ struct AgentSettings: Codable, Equatable, Sendable {
     var thinking = "medium"
     var reasoning_mode = "standard"
     var fast_mode = false
-    var modelName: String { ["gpt-6-astra": "Astra", "gpt-6-sol": "Sol", "gpt-6-luna": "Luna"][model] ?? model }
-    var supportsProReasoning: Bool { model != "gpt-6-astra" }
-    var supportsNoReasoning: Bool { model != "gpt-6-astra" }
+    var modelName: String { ["gpt-6-astra": "Astra", "gpt-6-sol": "Sol", "gpt-6-luna": "Luna", "claude-fable-5-1": "Fable 5.1", "claude-opus-5-5": "Opus 5.5", "claude-sonnet-5": "Sonnet 5"][model] ?? model }
+    var supportsProReasoning: Bool { model != "gpt-6-astra" && !model.hasPrefix("claude-") }
+    var supportsNoReasoning: Bool { model != "gpt-6-astra" && !model.hasPrefix("claude-") }
+    var supportsFastMode: Bool { !model.hasPrefix("claude-") }
+    func supportsThinking(_ value: String) -> Bool {
+        !model.hasPrefix("claude-") || ["low", "medium", "high"].contains(value)
+    }
 
     /// Normalize only an explicit model change; retained settings keep their values.
     mutating func selectModel(_ value: String) {
         model = value
-        if !supportsNoReasoning && thinking == "none" { thinking = "high" }
+        if !supportsThinking(thinking) { thinking = model.hasPrefix("claude-") ? "low" : "high" }
         if !supportsProReasoning && reasoning_mode == "pro" { reasoning_mode = "standard" }
+        if !supportsFastMode { fast_mode = false }
     }
 }
 struct AgentThread: Codable, Identifiable, Equatable, Sendable {

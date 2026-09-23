@@ -477,22 +477,39 @@ impl AgentSettings {
     pub(crate) fn validate(self) -> Result<Self, ManagedError> {
         if !self.model.supports_thinking(self.thinking) {
             return Err(ManagedError::Configuration(
-                (if self.model == Model::Glm53 {
-                    "GLM-5.3 requires low, medium, or high reasoning effort"
-                } else {
-                    "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
+                (match self.model {
+                    Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55 => {
+                        "Claude requires low, medium, or high reasoning effort"
+                    }
+                    Model::Glm53 => "GLM-5.3 requires low, medium, or high reasoning effort",
+                    Model::Astra => {
+                        "GPT-6 Astra requires low, medium, high, xhigh, or max reasoning effort"
+                    }
+                    _ => "selected model does not support this reasoning effort",
                 })
                 .to_owned(),
             ));
         }
         if !self.model.supports_reasoning_mode(self.reasoning_mode) {
             return Err(ManagedError::Configuration(
-                (if self.model == Model::Glm53 {
-                    "GLM-5.3 does not support pro reasoning mode"
-                } else {
-                    "GPT-6 Astra does not support pro reasoning mode"
+                (match self.model {
+                    Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55 => {
+                        "Claude does not support pro reasoning mode"
+                    }
+                    Model::Glm53 => "GLM-5.3 does not support pro reasoning mode",
+                    Model::Astra => "GPT-6 Astra does not support pro reasoning mode",
+                    _ => "selected model does not support pro reasoning mode",
                 })
                 .to_owned(),
+            ));
+        }
+        if matches!(
+            self.model,
+            Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55
+        ) && self.fast_mode
+        {
+            return Err(ManagedError::Configuration(
+                "Claude does not support fast mode".to_owned(),
             ));
         }
         Ok(self)
@@ -501,6 +518,10 @@ impl AgentSettings {
     pub(crate) const fn is_valid(&self) -> bool {
         self.model.supports_thinking(self.thinking)
             && self.model.supports_reasoning_mode(self.reasoning_mode)
+            && !(matches!(
+                self.model,
+                Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55
+            ) && self.fast_mode)
     }
 }
 
@@ -589,6 +610,9 @@ mod model_serde {
             "gpt-6-sol" => Ok(Model::Sol),
             "gpt-6-luna" => Ok(Model::Luna),
             "gpt-6-astra" => Ok(Model::Astra),
+            "claude-sonnet-5" => Ok(Model::ClaudeSonnet5),
+            "claude-fable-5-1" => Ok(Model::ClaudeFable51),
+            "claude-opus-5-5" => Ok(Model::ClaudeOpus55),
             "@cf/zai-org/glm-5.3" => Ok(Model::Glm53),
             "kimi-k3" => Ok(Model::Kimi),
             "mimo-v2.6-pro" => Ok(Model::Mimo),
@@ -598,6 +622,9 @@ mod model_serde {
                     "gpt-6-sol",
                     "gpt-6-luna",
                     "gpt-6-astra",
+                    "claude-sonnet-5",
+                    "claude-fable-5-1",
+                    "claude-opus-5-5",
                     "@cf/zai-org/glm-5.3",
                 ],
             )),

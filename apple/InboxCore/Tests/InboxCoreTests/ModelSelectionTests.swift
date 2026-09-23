@@ -11,6 +11,9 @@ final class ModelSelectionTests: XCTestCase {
         XCTAssertEqual(Set(ModelChoice.all.map(\.id)).count, ModelChoice.all.count)
         XCTAssertNotNil(ModelChoice.find("gpt-6-sol"))
         XCTAssertNotNil(ModelChoice.find("gpt-6-luna"))
+        XCTAssertEqual(ModelChoice.find("claude-fable-5-1")?.efforts, ["low", "medium", "high"])
+        XCTAssertEqual(ModelChoice.find("claude-opus-5-5")?.efforts, ["low", "medium", "high"])
+        XCTAssertFalse(ModelChoice.all.contains { $0.id == "claude-sonnet-5" })
         XCTAssertNil(ModelChoice.find("gpt-5.6-sol"))
         XCTAssertNil(ModelChoice.find("gpt-5.6-luna"))
         XCTAssertNil(ModelChoice.find("gpt-5.6-terra"))
@@ -35,6 +38,11 @@ final class ModelSelectionTests: XCTestCase {
         XCTAssertTrue(card.modelLocked); XCTAssertFalse(card.effortLocked); XCTAssertEqual(card.provider, "ChatGPT")
         card.model = "gpt-6-sol"
         XCTAssertTrue(card.effortLocked)
+    }
+    func testClaudeStateShowsAnthropicProvider() throws {
+        var card = AgentCard(id: "fixture", title: "Fixture")
+        try card.apply(state: state(["settings": .object(["model": .string("claude-opus-5-5"), "thinking": .string("low")])]))
+        XCTAssertEqual(card.provider, "Anthropic")
     }
 
     func testPinnedLegacyModelRemainsExactButIsNotOffered() throws {

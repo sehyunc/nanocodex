@@ -166,12 +166,15 @@ const BrowserAgentTerminal = memo(function BrowserAgentTerminal({
   }, [onConversationActivity]);
   const updateModel = useCallback(async (model: Model) => {
     if (!agent || conversationStarted) return;
-    const thinking = model === "gpt-6-astra" && settings.thinking === "none"
+    const thinking = model?.startsWith("claude-") && !["low", "medium", "high"].includes(settings.thinking)
+      ? "low"
+      : model === "gpt-6-astra" && settings.thinking === "none"
       ? "high"
       : settings.thinking;
+    if (model?.startsWith("claude-") && settings.fastMode) await agent.session.setFastMode(false);
     if (thinking !== settings.thinking) await agent.session.setThinking(thinking);
     await agent.session.setModel(model);
-    setSettings((current) => ({ ...current, model, thinking }));
+    setSettings((current) => ({ ...current, model, thinking, fastMode: model?.startsWith("claude-") ? false : current.fastMode }));
   }, [agent, conversationStarted, settings.thinking]);
   const updateThinking = useCallback(async (thinking: Thinking) => {
     if (!agent || (settings.model === "gpt-6-astra" && thinking === "none")) return;
@@ -355,6 +358,11 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
             onFastMode={(fastMode) => updateManagedSettings({ fastMode })}
             onModel={(model) => updateManagedSettings({
               model,
+              ...(model?.startsWith("claude-") ? {
+                fastMode: false,
+                ...(settings.thinking === "none" || settings.thinking === "xhigh" || settings.thinking === "max"
+                  ? { thinking: "low" as const } : {}),
+              } : {}),
               ...(model === "gpt-6-astra" && settings.thinking === "none"
                 ? { thinking: "high" }
                 : {}),

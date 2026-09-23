@@ -10,6 +10,9 @@ const models: readonly [Model, string][] = [
   ["gpt-6-astra", "GPT-6 Astra"],
   ["gpt-6-sol", "GPT-6 Sol"],
   ["gpt-6-luna", "GPT-6 Luna"],
+  ["claude-fable-5-1", "Claude Fable 5.1"],
+  ["claude-opus-5-5", "Claude Opus 5.5"],
+  ["claude-sonnet-5", "Claude Sonnet 5"],
 ];
 const efforts: readonly [Thinking, string][] = [
   ["none", "None"],
@@ -99,16 +102,14 @@ export function AgentModelMenu({
                   </Menu.Label>
                   <Menu.RadioGroup
                     value={settings.model}
-                    onValueChange={(value) =>
-                      void run(() => onModel(value as Model))
-                    }
                   >
-                    {models.map(([id, label]) => (
+                    {models.filter(([id]) => id !== "claude-sonnet-5").map(([id, label]) => (
                       <Menu.RadioItem
                         className="agent-model-menu-item"
                         key={id}
                         value={id}
                         disabled={modelLocked || pending}
+                        onSelect={() => void run(() => onModel(id))}
                       >
                         <span>{label}</span>
                         <Menu.ItemIndicator>
@@ -151,7 +152,8 @@ export function AgentModelMenu({
                         value={id}
                         disabled={
                           pending ||
-                          (settings.model === "gpt-6-astra" && id === "none")
+                          (settings.model === "gpt-6-astra" && id === "none") ||
+                          (settings.model?.startsWith("claude-") && !["low", "medium", "high"].includes(id))
                         }
                       >
                         <span>{label}</span>
@@ -168,7 +170,7 @@ export function AgentModelMenu({
             <Menu.CheckboxItem
               className="agent-model-menu-item"
               checked={settings.fastMode}
-              disabled={pending}
+              disabled={pending || settings.model?.startsWith("claude-")}
               onCheckedChange={(value) => void run(() => onFastMode(value))}
             >
               <span className="agent-model-fast">
