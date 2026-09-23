@@ -7,10 +7,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "wrangler deploy --dry-run --outdir dist --config wrangler.jsonc",
+    "build": "wrangler deploy --dry-run --outdir dist --config \"${NANOCODEX_WRANGLER_CONFIG:-wrangler.jsonc}\"",
     "check": "npm run typecheck && npm test && npm run build",
     "predeploy": "npm run prepare:code-evaluator",
-    "deploy": "wrangler deploy --env=\"\" --config wrangler.jsonc",
+    "deploy": "wrangler deploy --env=\"\" --config \"${NANOCODEX_WRANGLER_CONFIG:-wrangler.jsonc}\"",
     "prebuild": "npm run prepare:code-evaluator",
     "prepare:code-evaluator": "node scripts/prepare-code-evaluator.mjs && node scripts/prepare-hand-image.mjs",
     "test": "vitest run && npm run test:routing",

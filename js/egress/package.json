@@ -11,8 +11,8 @@
     "test": "vitest run",
     "dry-run:agent": "wrangler deploy --dry-run --config wrangler.agent.jsonc",
     "deploy:agent": "wrangler deploy --config wrangler.agent.jsonc",
-    "dry-run:broker": "wrangler deploy --dry-run --config wrangler.broker.jsonc",
-    "deploy:broker": "wrangler deploy --env=\"\" --config wrangler.broker.jsonc"
+    "dry-run:broker": "wrangler deploy --dry-run --config \"${NANOCODEX_WRANGLER_CONFIG:-wrangler.broker.jsonc}\"",
+    "deploy:broker": "wrangler deploy --env=\"\" --config \"${NANOCODEX_WRANGLER_CONFIG:-wrangler.broker.jsonc}\""
   },
   "dependencies": {
     "accounts": "0.17.0",

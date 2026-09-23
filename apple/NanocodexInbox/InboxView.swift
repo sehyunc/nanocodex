@@ -1178,6 +1178,8 @@ private struct AttachmentImageView: View {
 private struct ConnectView: View {
     @ObservedObject var model: InboxModel
     @State private var origin = "https://nanocodex.gakonst.workers.dev"
+    @State private var apiKey = ""
+    @State private var connectingWithKey = false
     @State private var phone = ""
     @State private var region = PhoneNumberInput.defaultRegion()
     @State private var code = SMSCodeInput()
@@ -1282,12 +1284,32 @@ private struct ConnectView: View {
             }
             if model.challenge == nil {
                 DisclosureGroup("Advanced") {
-                    TextField("Server", text: $origin).textFieldStyle(.roundedBorder).autocorrectionDisabled()
-                        #if os(iOS)
-                        .textInputAutocapitalization(.never).keyboardType(.URL)
-                        #endif
-                        .padding(.top, 8)
-                }.font(.caption).foregroundStyle(Ink.muted).disabled(model.signingIn)
+                    VStack(alignment: .leading, spacing: 12) {
+                        TextField("Server", text: $origin).textFieldStyle(.roundedBorder).autocorrectionDisabled()
+                            #if os(iOS)
+                            .textInputAutocapitalization(.never).keyboardType(.URL)
+                            #endif
+                        SecureField("Account API key", text: $apiKey).textFieldStyle(.roundedBorder)
+                            .textContentType(.password).autocorrectionDisabled()
+                            #if os(iOS)
+                            .textInputAutocapitalization(.never)
+                            #endif
+                        Button(connectingWithKey ? "Connecting…" : "Connect with API key") {
+                            connectingWithKey = true
+                            inputError = nil
+                            Task {
+                                defer { connectingWithKey = false }
+                                do {
+                                    try await model.connect(origin: origin, key: apiKey)
+                                    apiKey = ""
+                                } catch {
+                                    inputError = error.localizedDescription
+                                }
+                            }
+                        }
+                        .disabled(connectingWithKey || apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }.padding(.top, 8)
+                }.font(.caption).foregroundStyle(Ink.muted).disabled(model.signingIn || connectingWithKey)
             }
             #if DEBUG
             Button("Explore the demo") {

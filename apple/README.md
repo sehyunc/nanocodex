@@ -156,6 +156,10 @@ typed codes submit automatically once, with an explicit retry after errors.
 Resend cooldowns and errors are handled in the app.
 The HTTPS service origin can be changed under **Advanced**. Drafts and seen
 positions are stored on this device, scoped to that connection.
+For an owner-only self-hosted service without SMS, **Advanced** also accepts an
+account API key issued by that service. Enter its HTTPS origin and the key once;
+the app validates the account and stores the credential in Keychain, as it does
+after SMS sign-in. Do not put the owner login secret in this field.
 On cold launch, the last tab's history request overlaps the authenticated account
 list. History is published only after the account list confirms that tab still
 exists. Other conversations and scheduled-job prefetch wait for the initial

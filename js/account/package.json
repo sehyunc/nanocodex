@@ -18,7 +18,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "gen:types": "wrangler types",
     "build": "tsc --noEmit && vite build && npm run check:docs",
-    "deploy": "wrangler deploy --env=\"\" --config dist/nanocodex/wrangler.json",
+    "deploy": "wrangler deploy --env=\"\" --config \"${NANOCODEX_DEPLOY_CONFIG:-dist/nanocodex/wrangler.json}\"",
     "preview": "vite preview"
   },
   "portless": {

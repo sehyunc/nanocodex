@@ -221,7 +221,7 @@ const teamStorageKey = (teamId: string) => `team:${teamId}`;
 const userMembershipStorageKey = (userId: string) => `membership:user:${userId}`;
 
 type AccountSessionPayload = Readonly<{
-  authentication?: "anonymous" | "sms_otp";
+  authentication?: "anonymous" | "sms_otp" | "owner";
   userId: string;
   issuedAt: number;
   expiresAt: number;
@@ -666,6 +666,29 @@ async function verifySmsOtp(
     headers: {
       "set-cookie": accountCookie(token, PERSISTENT_SESSION_TTL_SECONDS, url.protocol),
     },
+  });
+}
+
+/** Called only after the self-hosted entrypoint verifies the owner's secret. */
+export async function createOwnerAccountSession(
+  env: AccountAuthEnv,
+  userId: string,
+): Promise<Response> {
+  if (!isUserId(userId)) throw new Error("Invalid owner identity");
+  const [wallet] = await Promise.all([
+    ensureAccountWallet(env, userId),
+    ensureAccount(env, userId, true),
+  ]);
+  const token = `s_${randomBase64Url(32)}`;
+  const now = Math.floor(Date.now() / 1_000);
+  await authStore(env, "account").set(accountSessionKey(token), {
+    authentication: "owner",
+    userId,
+    issuedAt: now,
+    expiresAt: now + SESSION_TTL_SECONDS,
+  } satisfies AccountSessionPayload, { ttl: SESSION_TTL_SECONDS });
+  return json({ user: { address: wallet.address, id: userId, persistent: true } }, {
+    headers: { "set-cookie": accountCookie(token, PERSISTENT_SESSION_TTL_SECONDS, "https:") },
   });
 }
 

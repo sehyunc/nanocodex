@@ -1,0 +1,194 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-v2",
+  "compatibility_date": "2026-05-22",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "main": "./worker/self-hosted.ts",
+  "upload_source_maps": true,
+  "workers_dev": true,
+  "preview_urls": true,
+  "keep_vars": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": false,
+      "persist": true
+    },
+    "traces": {
+      "enabled": false
+    }
+  },
+  "assets": {
+    "binding": "ASSETS",
+    "not_found_handling": "none",
+    "run_worker_first": [
+      "/",
+      "/agent",
+      "/agent/*",
+      "/demos/chief-of-staff",
+      "/multiplayer",
+      "/world",
+      "/artifact-runtime",
+      "/changelog",
+      "/code",
+      "/commits",
+      "/requests",
+      "/connect",
+      "/connect/*",
+      "/connect-dialog",
+      "/connect-dialog/*",
+      "/docs",
+      "/docs/*",
+      "/evals",
+      "/evals/*",
+      "/og.png",
+      "/api/*",
+      "/v1/*",
+      "/git/*",
+      "/.well-known/urpc/consumer.json",
+      "/owner"
+    ]
+  },
+  "services": [],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ELEVENLABS_ACCOUNTS",
+        "class_name": "ElevenLabsAccount"
+      },
+      {
+        "name": "BYOK_SESSIONS",
+        "class_name": "ByokSession"
+      },
+      {
+        "name": "CHATGPT_SESSIONS",
+        "class_name": "ChatGptSession"
+      },
+      {
+        "name": "GIT_REPOSITORY",
+        "class_name": "GitRepository"
+      },
+      {
+        "name": "THREAD_GIT_REPOSITORY",
+        "class_name": "ThreadGitRepository"
+      },
+      {
+        "name": "EVAL_COORDINATOR",
+        "class_name": "EvalCoordinator"
+      },
+      {
+        "name": "CHATGPT_EGRESS",
+        "class_name": "ChatGptEgress"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ByokSession",
+        "ChatGptSession",
+        "GitRepository",
+        "ThreadGitRepository",
+        "EvalCoordinator",
+        "ChatGptEgress"
+      ]
+    },
+    {
+      "tag": "v2-elevenlabs",
+      "new_sqlite_classes": [
+        "ElevenLabsAccount"
+      ]
+    }
+  ],
+  "containers": [
+    {
+      "class_name": "ChatGptEgress",
+      "image": "./container/Dockerfile",
+      "max_instances": 1,
+      "instance_type": "lite"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "AUTH_START_LIMIT",
+      "namespace_id": "987601",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    },
+    {
+      "name": "AUTH_GLOBAL_LIMIT",
+      "namespace_id": "987602",
+      "simple": {
+        "limit": 100,
+        "period": 60
+      }
+    },
+    {
+      "name": "SESSION_POLL_LIMIT",
+      "namespace_id": "987603",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "AGENT_SOCKET_LIMIT",
+      "namespace_id": "987604",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "AGENT_TOOL_LIMIT",
+      "namespace_id": "987605",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    },
+    {
+      "name": "AGENT_IMAGE_LIMIT",
+      "namespace_id": "987606",
+      "simple": {
+        "limit": 4,
+        "period": 60
+      }
+    },
+    {
+      "name": "MULTIPLAYER_CREATE_LIMIT",
+      "namespace_id": "987607",
+      "simple": {
+        "limit": 4,
+        "period": 60
+      }
+    },
+    {
+      "name": "MULTIPLAYER_GLOBAL_LIMIT",
+      "namespace_id": "987608",
+      "simple": {
+        "limit": 120,
+        "period": 60
+      }
+    },
+    {
+      "name": "MULTIPLAYER_ROUTE_LIMIT",
+      "namespace_id": "987609",
+      "simple": {
+        "limit": 240,
+        "period": 60
+      }
+    }
+  ],
+  "r2_buckets": [],
+  "vars": {
+    "ENVIRONMENT": "production"
+  }
+}

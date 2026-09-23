@@ -3,7 +3,8 @@
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "outputs": ["dist/**"],
+      "env": ["NANOCODEX_WRANGLER_CONFIG"]
     },
     "nanocodex#build": {
       "dependsOn": ["^build"],
@@ -23,7 +24,8 @@
     "nanocodex-web#build": {
       "cache": false,
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "outputs": ["dist/**"],
+      "env": ["NANOCODEX_WRANGLER_CONFIG"]
     },
     "dev": {
       "dependsOn": ["^build"],
