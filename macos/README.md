@@ -40,6 +40,9 @@ Nanocodex icon into the application. Bundle identity is
 `xyz.paradigm.nanocodex.macos`; its display name, menu, icon, About panel, and
 window title are **Nanocodex**. Local builds use ad hoc signing. Distribution
 signing and notarization require the distributor's Apple Developer identity.
+The local ad hoc build uses `VoiceAdHoc.entitlements` so its hardened runtime can
+load the bundled WebRTC framework. Distribution builds retain
+`Voice.entitlements` and should sign the app and framework with one team.
 The bundled `nanocodex2` helper uses the nightly CLI's hypervisor signing policy
 so it is ready to host VMs without a runtime copy and re-sign. Its firmware
 loader uses `DYLD_LIBRARY_PATH`; the helper is signed separately from the

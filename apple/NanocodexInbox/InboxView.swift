@@ -56,7 +56,7 @@ struct InboxView: View {
     var body: some View {
         inbox
         .safeAreaInset(edge: .top, spacing: 0) {
-            if !model.isDemo, let update = appUpdates.update {
+            if model.usesUpstreamUpdateFeed, let update = appUpdates.update {
                 HStack(spacing: 12) {
                     Image(systemName: "arrow.down.app.fill").font(.title2)
                     VStack(alignment: .leading, spacing: 3) {
@@ -79,8 +79,8 @@ struct InboxView: View {
                 .accessibilityIdentifier("app-update-banner")
             }
         }
-        .task(id: updateScenePhase) {
-            guard updateScenePhase == .active, !model.isDemo else { return }
+        .task(id: model.usesUpstreamUpdateFeed ? updateScenePhase : .background) {
+            guard updateScenePhase == .active, model.usesUpstreamUpdateFeed else { return }
             while !Task.isCancelled {
                 await appUpdates.check()
                 do { try await Task.sleep(for: .seconds(60)) }

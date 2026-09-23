@@ -168,6 +168,9 @@ final class InboxModel: ObservableObject {
     private var client: ManagedClient?
     let voice = VoiceSession()
     private var accountCredential: AccountCredential?
+    var usesUpstreamUpdateFeed: Bool {
+        connected && accountCredential?.origin == "https://nanocodex.gakonst.workers.dev"
+    }
     var chatGptAccountsURL: URL? {
         guard connected, !isDemo, let accountCredential else { return nil }
         return URL(string: "/connect#chatgpt-accounts", relativeTo: URL(string: accountCredential.origin))?.absoluteURL
