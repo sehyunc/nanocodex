@@ -45,16 +45,6 @@ describe("Session-only model egress", () => {
     expect(forwarded[1]!.headers.has("x-nanocodex-cliproxy-canary")).toBe(false);
     expect(forwarded[0]!.headers.get("authorization")).toBe("Bearer fixture-provider-secret");
     expect(forwarded[0]!.headers.get("chatgpt-account-id")).toBe("fixture-account");
-    const claudeOnly = new Headers(request().headers);
-    claudeOnly.delete("upgrade");
-    claudeOnly.set("content-type", "application/json");
-    claudeOnly.set("x-nanocodex-session-model", "claude-fable-5-1");
-    const claudeOnlyResponse = await entrypoint.fetch(new Request("https://nanocodex.internal/v1/responses", {
-      method: "POST", headers: claudeOnly, body: '{"model":"claude-fable-5-1","stream":true,"input":[]}',
-    }));
-    expect(claudeOnlyResponse.status).toBe(200);
-    await claudeOnlyResponse.body?.cancel();
-    expect(forwarded[2]!.headers.get("x-nanocodex-cliproxy-provider")).toBe("claude");
     env.CLIPROXY_RESPONSES_ENABLED = "true";
     const allAgents = new Headers(request().headers);
     allAgents.delete("upgrade");
@@ -64,14 +54,14 @@ describe("Session-only model egress", () => {
     }));
     expect(allResponse.status).toBe(200);
     await allResponse.body?.cancel();
-    expect(forwarded[3]!.headers.get("x-nanocodex-cliproxy-canary")).toBe("v1");
+    expect(forwarded[2]!.headers.get("x-nanocodex-cliproxy-canary")).toBe("v1");
     allAgents.set("x-nanocodex-session-model", "claude-fable-5-1");
     const claudeResponse = await entrypoint.fetch(new Request("https://nanocodex.internal/v1/responses", {
       method: "POST", headers: allAgents, body: '{"model":"claude-fable-5-1","stream":true,"input":[]}',
     }));
     expect(claudeResponse.status).toBe(200);
     await claudeResponse.body?.cancel();
-    expect(forwarded[4]!.headers.get("x-nanocodex-cliproxy-provider")).toBe("claude");
+    expect(forwarded[3]!.headers.get("x-nanocodex-cliproxy-provider")).toBe("claude");
   });
 
   it("uses the private binding's live Session assertion without a callback and still reads current credentials", async () => {

@@ -2534,13 +2534,12 @@ function buildUpstreamRequest(
     const value = original.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
-  const claudeModel = original.headers.get("x-nanocodex-session-model")?.startsWith("claude-") === true;
   if (operation.id === "responses" && credential.kind === "chatgpt"
-    && (claudeModel || env.CLIPROXY_RESPONSES_ENABLED === "true"
+    && (env.CLIPROXY_RESPONSES_ENABLED === "true"
       || (env.CLIPROXY_CANARY_AGENT_ID?.trim()
         && original.headers.get("x-nanocodex-session-model-agent") === env.CLIPROXY_CANARY_AGENT_ID.trim()))) {
     headers.set("x-nanocodex-cliproxy-canary", "v1");
-    if (claudeModel) {
+    if (original.headers.get("x-nanocodex-session-model")?.startsWith("claude-")) {
       headers.set("x-nanocodex-cliproxy-provider", "claude");
     }
     console.info(JSON.stringify({ type: "egress.cliproxy_route", transport: original.method }));
