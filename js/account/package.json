@@ -20,7 +20,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "gen:types": "wrangler types",
     "build": "tsc --noEmit && vite build && npm run check:docs",
-    "deploy": "wrangler deploy --env=\"\" --config dist/nanocodex/wrangler.json",
+    "deploy": "wrangler deploy --env=\"\" --config \"dist/${NANOCODEX_WORKER_OUTPUT:-nanocodex}/wrangler.json\"",
     "preview": "vite preview",
     "test:claude-connection": "node scripts/claude-connection-smoke.mjs",
     "test:whatsapp": "node scripts/whatsapp-ui-journey.mjs",

@@ -56,6 +56,14 @@ describe("private regional ChatGPT text relay", () => {
       for (const header of [ownerHeader, regionHeader, "x-nanocodex-subject"]) expect(sent.headers.has(header)).toBe(false);
     },
   );
+  it.each(["POST", "GET"])("reuses the account relay when regional routing is disabled for %s", async (method) => {
+    const f = fixture(true);
+    Object.assign(f.env, { CHATGPT_RELAY_REGIONAL_ROUTING: "false" });
+    expect((await f.entrypoint.fetch(request("weur", method))).status).toBe(204);
+    expect(f.get).toHaveBeenCalledWith(`user-v1:${owner}`, undefined);
+    for (const relay of Object.values(f.regionalNamespaces)) expect(relay.get).not.toHaveBeenCalled();
+    expect(f.relay.mock.calls[0]![0].headers.has(regionHeader)).toBe(false);
+  });
   it("preserves the regional relay WebSocket protocol through the existing failover wrapper", async () => {
     const f = fixture(true);
     const [client, server] = Object.values(new WebSocketPair());

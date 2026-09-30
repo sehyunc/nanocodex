@@ -233,6 +233,7 @@ export interface EgressEnv extends BrokerEnv, ConnectorBrokerEnv, IngressPlaceme
   MANAGED_AGENT_OWNERSHIP?: Fetcher;
   MCP_CONNECTIONS: DurableObjectNamespace<McpConnectionDirectory>;
   CHATGPT_EGRESS?: DurableObjectNamespace;
+  CHATGPT_RELAY_REGIONAL_ROUTING?: string;
   // Optional during phased account/egress rollout; absent bindings use legacy.
   CHATGPT_EGRESS_WNAM?: DurableObjectNamespace;
   CHATGPT_EGRESS_ENAM?: DurableObjectNamespace;
@@ -354,7 +355,8 @@ export class SessionModelEgress extends WorkerEntrypoint<EgressEnv> {
     forwarded.headers.delete(SESSION_MODEL_OWNER_HEADER);
     // Only the private Session wrapper may assert placement; generic egress
     // never derives a region from this header. Nothing private goes upstream.
-    const region = validatedRelayRegion(forwarded.headers.get(SESSION_MODEL_REGION_HEADER));
+    const region = this.env.CHATGPT_RELAY_REGIONAL_ROUTING === "false"
+      ? undefined : validatedRelayRegion(forwarded.headers.get(SESSION_MODEL_REGION_HEADER));
     forwarded.headers.delete(SESSION_MODEL_REGION_HEADER);
     return handleEgress(forwarded, this.env, this.ctx, fetch, undefined, { subject, owner, ...(region ? { region } : {}) });
   }
@@ -2917,7 +2919,8 @@ async function fetchUpstream(
   if (credential.kind !== "chatgpt" || env.CODEX_RELAY_URL || operation.directChatGpt) {
     return upstreamFetch(request);
   }
-  const region = operation.id === "realtime-call" ? validatedRelayRegion(voiceRegion)
+  const region = env.CHATGPT_RELAY_REGIONAL_ROUTING === "false" ? undefined
+    : operation.id === "realtime-call" ? validatedRelayRegion(voiceRegion)
     : operation.id === "responses" ? validatedRelayRegion(textRegion) : undefined;
   // DO hints place the controller; the selected application's constraints place
   // its container. Validated text and voice regions share regional pools while

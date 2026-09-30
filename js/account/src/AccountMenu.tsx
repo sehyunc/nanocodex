@@ -30,6 +30,7 @@ import {
 } from "./walletFunding";
 import { TempoWalletConnectionCard } from "./TempoWalletConnectionCard";
 import { useWalletFunding } from "./useWalletFunding";
+import { ownerOnlyDeployment } from "./ownerDeployment";
 
 type ApiKeyMetadata = Readonly<{
   id: string;
@@ -535,12 +536,12 @@ function AccountMenuContent({ inline }: { inline: boolean }) {
               <section className={inline ? "wizard-section account-identity" : "account-summary"}>
                 {inline ? (
                   <header className="wizard-section-title">
-                    <div><span>Account</span><h2>SMS identity</h2></div>
+                    <div><span>Account</span><h2>{ownerOnlyDeployment ? "Owner identity" : "SMS identity"}</h2></div>
                     <small>{shortIdentity(session.account.id)}</small>
                   </header>
                 ) : (
                   <>
-                    <span>{session.account.persistent ? "SMS identity" : "Browser session"}</span>
+                    <span>{ownerOnlyDeployment ? "Owner identity" : session.account.persistent ? "SMS identity" : "Browser session"}</span>
                     <span>{session.account.persistent ? "Available across devices" : "Verify your phone to keep it"}</span>
                   </>
                 )}

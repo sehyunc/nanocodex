@@ -1,0 +1,323 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "nanocodex-v2-durable-agent",
+  "main": "src/self-hosted.ts",
+  "compatibility_date": "2026-07-29",
+  "compatibility_flags": [
+    "nodejs_compat",
+    "global_fetch_strictly_public",
+    "enable_request_signal",
+    "durable_object_io_tasks_prevent_eviction"
+  ],
+  "alias": {
+    "node-rsa": "../nanocodex/tools/browser/unsupportedNodeRsa.mjs"
+  },
+  "find_additional_modules": true,
+  "base_dir": "src",
+  "rules": [
+    {
+      "type": "ESModule",
+      "globs": [
+        "**/just-bash-lazy.mjs"
+      ]
+    }
+  ],
+  "workers_dev": false,
+  "triggers": {
+    "crons": []
+  },
+  "minify": true,
+  "upload_source_maps": true,
+  "observability": {
+    "enabled": true,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    },
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "services": [
+    {
+      "binding": "NANOCODEX",
+      "service": "nanocodex-v2-egress"
+    },
+    {
+      "binding": "NANOCODEX_SESSION_MODEL_EGRESS",
+      "service": "nanocodex-v2-egress",
+      "entrypoint": "SessionModelEgress"
+    }
+  ],
+  "worker_loaders": [
+    {
+      "binding": "LOADER"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "NANOCODEX_HISTORY",
+      "bucket_name": "nanocodex-managed-history"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_BRAIN",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_0",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_1",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_2",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_3",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_4",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_5",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_6",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_7",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_8",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_9",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_10",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_11",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_12",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_13",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_14",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_WORKSPACES_15",
+      "bucket_name": "nanocodex-sandbox-workspaces"
+    },
+    {
+      "binding": "NANOCODEX_USER_DATA_OBJECTS",
+      "bucket_name": "nanocodex-v2-user-data"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NANOCODEX_INFERENCE_KEYS",
+        "class_name": "InferenceKey"
+      },
+      {
+        "name": "NANOCODEX_INFERENCE_ACCOUNTS",
+        "class_name": "InferenceAccount"
+      },
+      {
+        "name": "NANOCODEX_INFERENCE_SESSIONS",
+        "class_name": "InferenceSession"
+      },
+      {
+        "name": "NANOCODEX_PROVIDER_PROBE_COORDINATOR",
+        "class_name": "ProviderProbeCoordinator"
+      },
+      {
+        "name": "NANOCODEX_PHONES",
+        "class_name": "PhoneContainer"
+      },
+      {
+        "name": "NANOCODEX_SESSIONS",
+        "class_name": "DurableAgentSession"
+      },
+      {
+        "name": "NANOCODEX_ACCOUNT_TOOLS",
+        "class_name": "AccountHostedTools"
+      },
+      {
+        "name": "NANOCODEX_VM_HOST_POOLS",
+        "class_name": "VmHostPool"
+      },
+      {
+        "name": "NANOCODEX_ROOMS",
+        "class_name": "MultiplayerRoom"
+      },
+      {
+        "name": "NANOCODEX_MULTIPLAYER_QUOTA",
+        "class_name": "MultiplayerQuota"
+      },
+      {
+        "name": "NANOCODEX_AUTH",
+        "class_name": "NonceStorage"
+      },
+      {
+        "name": "NANOCODEX_USERS",
+        "class_name": "UserAccount"
+      },
+      {
+        "name": "NANOCODEX_API_KEYS",
+        "class_name": "ApiKeyRecord"
+      },
+      {
+        "name": "NANOCODEX_MEMORY",
+        "class_name": "MemoryScope"
+      },
+      {
+        "name": "NANOCODEX_SANDBOXES",
+        "class_name": "Sandbox"
+      },
+      {
+        "name": "NANOCODEX_ORGANIZATIONS",
+        "class_name": "Organization"
+      },
+      {
+        "name": "NANOCODEX_USER_DATA",
+        "class_name": "UserDataScope"
+      },
+      {
+        "name": "NANOCODEX_HAND_RELAYS",
+        "class_name": "RegionalHandRelay"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "NanocodexSession",
+        "MultiplayerRoom",
+        "MultiplayerQuota"
+      ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "NonceStorage",
+        "UserAccount",
+        "ApiKeyRecord"
+      ]
+    },
+    {
+      "tag": "v3",
+      "new_sqlite_classes": [
+        "MemoryScope"
+      ]
+    },
+    {
+      "tag": "v4",
+      "new_sqlite_classes": [
+        "Organization"
+      ]
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": [
+        "DurableAgentSession"
+      ],
+      "deleted_classes": [
+        "NanocodexSession"
+      ]
+    },
+    {
+      "tag": "v6",
+      "new_sqlite_classes": [
+        "Sandbox"
+      ]
+    },
+    {
+      "tag": "v7",
+      "new_sqlite_classes": [
+        "AccountHostedTools"
+      ]
+    },
+    {
+      "tag": "v8",
+      "new_sqlite_classes": [
+        "VmHostPool"
+      ]
+    },
+    {
+      "tag": "v9",
+      "new_sqlite_classes": [
+        "PhoneContainer"
+      ]
+    },
+    {
+      "tag": "v10",
+      "new_sqlite_classes": [
+        "ProviderProbeCoordinator"
+      ]
+    },
+    {
+      "tag": "v11",
+      "new_sqlite_classes": [
+        "InferenceKey",
+        "InferenceAccount",
+        "InferenceSession"
+      ]
+    },
+    {
+      "tag": "v14",
+      "new_sqlite_classes": [
+        "UserDataScope"
+      ]
+    },
+    {
+      "tag": "v15",
+      "new_sqlite_classes": [
+        "RegionalHandRelay"
+      ]
+    }
+  ],
+  "vars": {
+    "ENVIRONMENT": "production",
+    "AGENT_IDLE_TIMEOUT_MS": "30000",
+    "MANAGED_AGENT_DIRECT_CREDENTIALS": "true",
+    "NANOCODEX_OWNER_ORIGIN": "https://nanocodex-v2.sehyun.workers.dev"
+  },
+  "ratelimits": [
+    {
+      "name": "OWNER_LOGIN_LIMIT",
+      "namespace_id": "987611",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    }
+  ]
+}

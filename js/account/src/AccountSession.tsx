@@ -5,6 +5,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -16,6 +17,7 @@ import {
 } from "./accountSessionRequest";
 import { logoutBrowserAccountSession } from "nanocodex-connect-ui/browserAccountSession";
 import { clientFailureMessage } from "./clientFailure";
+import { ownerOnlyDeployment } from "./ownerDeployment";
 
 export { isRecord, responseFailure } from "./accountSessionRequest";
 export type { AuthenticatedAccount } from "./accountSessionRequest";
@@ -45,6 +47,9 @@ export function AccountSessionProvider({ children }: { children: ReactNode }) {
   const error = operationError ?? (query.error ? accountFailure(query.error, "Couldn’t check your account session.") : null);
   const [operation, setOperation] = useState<AccountOperation | null>(null);
   const reauthenticationRequired = query.data?.reauthenticationRequired ?? false;
+  useEffect(() => {
+    if (ownerOnlyDeployment && status === "ready" && !user) window.location.replace("/owner");
+  }, [status, user]);
   const refresh = useCallback(async () => {
     setError(null);
     await queryClient.invalidateQueries({ queryKey: sessionQueryKey }, { cancelRefetch: false });
@@ -76,6 +81,10 @@ export function AccountSessionProvider({ children }: { children: ReactNode }) {
     try {
       await queryClient.cancelQueries({ queryKey: sessionQueryKey });
       await logoutBrowserAccountSession();
+      if (ownerOnlyDeployment) {
+        window.location.replace("/owner");
+        return;
+      }
       await acceptSession(null);
       await refresh();
     } catch (cause) {
