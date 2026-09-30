@@ -1968,6 +1968,7 @@ async function managedFetchRoute(
         ctx.waitUntil(registrationPreparation);
         let created: Response;
         const sessionCreationStartedAt = performance.now();
+        const sessionDispatchAt = Date.now();
         try {
           created = await fetchCreateStage(stub, firstTurn
             ? "https://session.internal/create-run" : "https://session.internal/create", {
