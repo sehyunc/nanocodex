@@ -153,6 +153,7 @@ export async function createBrowserBash(rawFs, thread, options = {}) {
     };
     const runtime = await createJustBashRuntime({
         filesystem,
+        loadInterpreter: () => import("nanocodex-tools/just-bash/browser"),
         cwd: THREAD_GIT_DIRECTORY,
         env: {
             HOME: THREAD_GIT_DIRECTORY,
