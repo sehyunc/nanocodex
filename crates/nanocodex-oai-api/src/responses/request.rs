@@ -740,6 +740,9 @@ impl<'a> ResponseCreate<'a> {
                 mode: (!matches!(
                     policy.model,
                     crate::Model::Astra
+                        | crate::Model::ClaudeSonnet5
+                        | crate::Model::ClaudeFable51
+                        | crate::Model::ClaudeOpus55
                         | crate::Model::Glm53
                         | crate::Model::Kimi
                         | crate::Model::Mimo
@@ -763,7 +766,15 @@ impl<'a> ResponseCreate<'a> {
             // GPT-6 standard mode is explicit so a project-level Fast default
             // cannot silently change processing or the local cost estimate.
             service_tier: match (policy.model, policy.fast_mode) {
-                (crate::Model::Glm53 | crate::Model::Kimi | crate::Model::Mimo, _) => None,
+                (
+                    crate::Model::ClaudeSonnet5
+                    | crate::Model::ClaudeFable51
+                    | crate::Model::ClaudeOpus55
+                    | crate::Model::Glm53
+                    | crate::Model::Kimi
+                    | crate::Model::Mimo,
+                    _,
+                ) => None,
                 (_, true) => Some("priority"),
                 (crate::Model::Sol | crate::Model::Luna | crate::Model::Astra, false) => {
                     Some("default")

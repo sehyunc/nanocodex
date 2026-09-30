@@ -27,7 +27,7 @@ export type RetainedChildRoute = {
   routeId: string;
   parentSessionId: string;
   hostContextRef: string;
-  /** null preserves native GPT spawning; it is never a missing routed pin. */
+  /** null preserves native subscription spawning; it is never a missing routed pin. */
   route: ThreadRoute | null;
 };
 export interface ChildRouteStore {
@@ -50,7 +50,7 @@ export function createSubagentRouteController(options: {
   availability: () => RoutingAvailability | Promise<RoutingAvailability>;
   store: ChildRouteStore;
   authorize: (parentSessionId: string, hostContextRef: string) => void;
-  /** Manual GPT lineages can retain native defaults and authorization. */
+  /** Manual subscription lineages can retain native defaults and authorization. */
   native?: {
     parentIsNative: (parentSessionId: string) => boolean;
     authorize: (parentSessionId: string, hostContextRef: string) => void;
@@ -82,7 +82,7 @@ export function createSubagentRouteController(options: {
       const model = request.model === undefined ? undefined : aliases.get(request.model) ?? request.model;
       if (model === "gpt-6.1-sol" && request.thinking === "none") throw new Error("GPT-6.1 Sol requires reasoning effort");
       const native = options.native?.parentIsNative(request.parentSessionId) === true
-        && (model === undefined || ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(model));
+        && (model === undefined || ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(model));
       if (native) options.native!.authorize(request.parentSessionId, request.hostContextRef);
       else options.authorize(request.parentSessionId, request.hostContextRef);
       expirePending();

@@ -21,17 +21,34 @@ const active = {
 };
 
 describe("Session-owned credential authority", () => {
+  it("projects the managed canary agent ID on the directory credential path", async () => {
+    const captured: Request[] = [];
+    const general = { fetch: vi.fn(async (request: Request) => {
+      captured.push(request); return new Response(null, { status: 204 });
+    }) } as unknown as Fetcher;
+    const scoped = scopedManagedModelEgress(general, storageId, active.subject, undefined, undefined, sessionId, "claude-sonnet-5");
+    await scoped.fetch("https://nanocodex.internal/v1/responses", { method: "POST", headers: {
+      "x-nanocodex-subject": storageId,
+      "x-nanocodex-session-model-agent": "forged-agent",
+      "x-nanocodex-session-model": "forged-model",
+    } });
+    expect(captured[0]?.headers.get("x-nanocodex-session-model-agent")).toBe(sessionId);
+    expect(captured[0]?.headers.get("x-nanocodex-session-model")).toBe("claude-sonnet-5");
+    expect(captured[0]?.headers.get("x-nanocodex-subject")).toBe(active.subject);
+  });
+
   it.each(["GET", "POST"])("checks local lifecycle authority on every private %s model request and keeps other egress untrusted", async (method) => {
     const general = { fetch: vi.fn(async () => new Response(null, { status: 204 })) } as unknown as Fetcher;
     const requests: Request[] = [];
     const model = { fetch: vi.fn(async (request: Request) => { requests.push(request); return new Response(null, { status: 204 }); }) } as unknown as Fetcher;
     let available = true;
     const owner = vi.fn(() => available ? sessionCredentialOwner(active) : undefined);
-    const scoped = scopedManagedModelEgress(general, storageId, active.subject, { binding: model, owner });
+    const scoped = scopedManagedModelEgress(general, storageId, active.subject, { binding: model, owner }, undefined, sessionId);
     const headers = { "x-nanocodex-subject": storageId, upgrade: "websocket" };
     await scoped.fetch("https://nanocodex.internal/v1/responses", { method, headers });
     expect(requests[0]?.headers.get("x-nanocodex-session-model-owner")).toBe(ownerId);
     expect(requests[0]?.headers.get("x-nanocodex-subject")).toBe(active.subject);
+    expect(requests[0]?.headers.get("x-nanocodex-session-model-agent")).toBe(sessionId);
     expect(general.fetch).not.toHaveBeenCalled();
     available = false;
     expect(() => scoped.fetch("https://nanocodex.internal/v1/responses", { method, headers })).toThrow(/ownership is unavailable/);

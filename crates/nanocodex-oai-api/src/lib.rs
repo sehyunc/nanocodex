@@ -165,6 +165,15 @@ pub enum Model {
     /// GPT-6 Astra.
     #[default]
     Astra,
+    /// Claude Sonnet 5 through the private Responses-compatible broker.
+    #[serde(rename = "claude-sonnet-5")]
+    ClaudeSonnet5,
+    /// Claude Fable 5.1 through the private Responses-compatible broker.
+    #[serde(rename = "claude-fable-5-1")]
+    ClaudeFable51,
+    /// Claude Opus 5.5 through the private Responses-compatible broker.
+    #[serde(rename = "claude-opus-5-5")]
+    ClaudeOpus55,
     /// Z.ai GLM-5.3 served by Cloudflare Workers AI.
     #[serde(rename = "glm-5.3")]
     Glm53,
@@ -178,13 +187,26 @@ pub enum Model {
 
 impl Model {
     /// Supported model catalog in picker order.
-    pub const ALL: [Self; 3] = [Self::Astra, Self::Sol, Self::Luna];
+    pub const ALL: [Self; 5] = [
+        Self::Astra,
+        Self::Sol,
+        Self::Luna,
+        Self::ClaudeFable51,
+        Self::ClaudeOpus55,
+    ];
 
     /// Default reasoning effort from the pinned Codex model catalog.
     #[must_use]
     pub const fn default_thinking(self) -> Thinking {
         match self {
-            Self::Astra | Self::Sol | Self::Glm53 | Self::Kimi | Self::Mimo => Thinking::Low,
+            Self::Astra
+            | Self::Sol
+            | Self::ClaudeSonnet5
+            | Self::ClaudeFable51
+            | Self::ClaudeOpus55
+            | Self::Glm53
+            | Self::Kimi
+            | Self::Mimo => Thinking::Low,
             Self::Luna => Thinking::Medium,
         }
     }
@@ -195,6 +217,9 @@ impl Model {
             Self::Sol => "gpt-6.1-sol",
             Self::Luna => "gpt-6-luna",
             Self::Astra => "gpt-6-astra",
+            Self::ClaudeSonnet5 => "claude-sonnet-5",
+            Self::ClaudeFable51 => "claude-fable-5-1",
+            Self::ClaudeOpus55 => "claude-opus-5-5",
             Self::Glm53 => "@cf/zai-org/glm-5.3",
             Self::Kimi => "kimi-k3",
             Self::Mimo => "mimo-v2.6-pro",
@@ -206,7 +231,11 @@ impl Model {
     pub const fn supports_thinking(self, thinking: Thinking) -> bool {
         match self {
             Self::Kimi => matches!(thinking, Thinking::Low | Thinking::High),
-            Self::Glm53 | Self::Mimo => {
+            Self::ClaudeSonnet5
+            | Self::ClaudeFable51
+            | Self::ClaudeOpus55
+            | Self::Glm53
+            | Self::Mimo => {
                 matches!(thinking, Thinking::Low | Thinking::Medium | Thinking::High)
             }
             Self::Luna => true,
@@ -220,7 +249,13 @@ impl Model {
         !matches!(
             (self, mode),
             (
-                Self::Astra | Self::Glm53 | Self::Kimi | Self::Mimo,
+                Self::Astra
+                    | Self::ClaudeSonnet5
+                    | Self::ClaudeFable51
+                    | Self::ClaudeOpus55
+                    | Self::Glm53
+                    | Self::Kimi
+                    | Self::Mimo,
                 ReasoningMode::Pro
             )
         )
@@ -252,11 +287,14 @@ impl FromStr for Model {
             "gpt-6.1-sol" | "sol" => Ok(Self::Sol),
             "gpt-6-luna" | "luna" => Ok(Self::Luna),
             "gpt-6-astra" | "astra" => Ok(Self::Astra),
+            "claude-sonnet-5" => Ok(Self::ClaudeSonnet5),
+            "claude-fable-5-1" => Ok(Self::ClaudeFable51),
+            "claude-opus-5-5" => Ok(Self::ClaudeOpus55),
             "@cf/zai-org/glm-5.3" | "glm-5.3" | "glm53" => Ok(Self::Glm53),
             "kimi-k3" | "kimi" => Ok(Self::Kimi),
             "mimo-v2.6-pro" | "mimo" => Ok(Self::Mimo),
             _ => Err(format!(
-                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
+                "invalid model {value:?}; expected gpt-6-astra, gpt-6.1-sol, gpt-6-luna, claude-fable-5-1, claude-opus-5-5, @cf/zai-org/glm-5.3, kimi-k3, or mimo-v2.6-pro"
             )),
         }
     }

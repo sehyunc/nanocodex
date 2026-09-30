@@ -167,12 +167,15 @@ const BrowserAgentTerminal = memo(function BrowserAgentTerminal({
   }, [onConversationActivity]);
   const updateModel = useCallback(async (model: Model) => {
     if (!agent || conversationStarted) return;
-    const thinking = settings.thinking === "none" && ["gpt-6-astra", "gpt-6.1-sol"].includes(model)
+    const thinking = model?.startsWith("claude-") && !["low", "medium", "high"].includes(settings.thinking)
+      ? "low"
+      : ["gpt-6-astra", "gpt-6.1-sol"].includes(model) && settings.thinking === "none"
       ? model === "gpt-6-astra" ? "high" : "low"
       : settings.thinking;
+    if (model?.startsWith("claude-") && settings.fastMode) await agent.session.setFastMode(false);
     if (thinking !== settings.thinking) await agent.session.setThinking(thinking);
     await agent.session.setModel(model);
-    setSettings((current) => ({ ...current, model, thinking }));
+    setSettings((current) => ({ ...current, model, thinking, fastMode: model?.startsWith("claude-") ? false : current.fastMode }));
   }, [agent, conversationStarted, settings.thinking]);
   const updateThinking = useCallback(async (thinking: Thinking) => {
     if (!agent || (["gpt-6-astra", "gpt-6.1-sol"].includes(settings.model) && thinking === "none")) return;
@@ -332,7 +335,6 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
     <PhoneCallsPanel key={`${accountId}:${agentId}`} parentAgentId={agentId} enabled={Boolean(accountId) && mode !== "hidden"} />
     <AgentTerminalView
       agent={startupReady ? agent : undefined}
-      initialDraft={initialDraft}
       agentError={stateQuery.error?.message}
       inactiveMessage={({ agentError, agentStatus }) => inactiveTerminalMessage({
         agentError,
@@ -359,7 +361,12 @@ export const ManagedAgentTerminal = memo(function ManagedAgentTerminal({
             onFastMode={(fastMode) => updateManagedSettings({ fastMode })}
             onModel={(model) => updateManagedSettings({
               model,
-              ...(settings.thinking === "none" && ["gpt-6-astra", "gpt-6.1-sol"].includes(model)
+              ...(model?.startsWith("claude-") ? {
+                fastMode: false,
+                ...(settings.thinking === "none" || settings.thinking === "xhigh" || settings.thinking === "max"
+                  ? { thinking: "low" as const } : {}),
+              } : {}),
+              ...(["gpt-6-astra", "gpt-6.1-sol"].includes(model) && settings.thinking === "none"
                 ? { thinking: model === "gpt-6-astra" ? "high" : "low" }
                 : {}),
             })}

@@ -455,6 +455,7 @@ export interface Env extends
   NANOCODEX: Fetcher;
   NANOCODEX_REALTIME?: Fetcher;
   NANOCODEX_SESSION_MODEL_EGRESS?: Fetcher;
+  CLIPROXY_CANARY_AGENT_ID?: string;
   NANOCODEX_X?: Fetcher;
   NANOCODEX_HISTORY: R2Bucket;
   NANOCODEX_WORKSPACES: R2Bucket;
@@ -9237,7 +9238,7 @@ export class DurableAgentSession extends DurableComputerObject {
       native: {
         parentIsNative: parentSessionId => !this.#threadRoute()
           && (parentSessionId === rootRoutingSessionId()
-            ? ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna"].includes(this.#settings().model)
+            ? ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5"].includes(this.#settings().model)
             : readChildRoute(parentSessionId)?.route === null),
         authorize: (parentSessionId, hostContextRef) => {
           assertRuntimeOwned();
@@ -11326,6 +11327,8 @@ export class DurableAgentSession extends DurableComputerObject {
         }),
       },
       this.#configuration().chatgpt_account_id,
+      this.#session()?.session_id === this.env.CLIPROXY_CANARY_AGENT_ID ? this.#session()?.session_id : undefined,
+      this.#settings().model,
     );
   }
 

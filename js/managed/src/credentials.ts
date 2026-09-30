@@ -7,7 +7,8 @@ import {
 } from "./account-auth";
 import { fetchResponseWithDeadline } from "./deadline";
 
-type CredentialEnv = AccountAuthEnv & { NANOCODEX: Fetcher };
+type CredentialEnv = AccountAuthEnv & { NANOCODEX?: Fetcher };
+type OwnerCredentialEnv = CredentialEnv & { NANOCODEX_OWNER_ID?: string };
 
 const DEFAULT_OWNERSHIP_IO_TIMEOUT_MS = 10_000;
 const CREDENTIAL_BIND_ATTEMPTS = 3;
@@ -26,7 +27,7 @@ const ROUTES = new Map<string, ReadonlySet<string>>([
 
 export async function routeCredentialRequest(
   request: Request,
-  env: CredentialEnv,
+  env: OwnerCredentialEnv,
   url: URL,
 ): Promise<Response | undefined> {
   const sshIdentity = url.pathname.match(/^\/v1\/credentials\/ssh\/([A-Za-z0-9][A-Za-z0-9._-]{0,63})$/)?.[1];
@@ -37,6 +38,12 @@ export async function routeCredentialRequest(
   const vaultKind = vaultMatch?.[1] as VaultKind | undefined;
   const vaultId = vaultMatch?.[2];
   const methods = (originId ? new Set(["PUT"]) : undefined) ?? ROUTES.get(url.pathname)
+    ?? (url.pathname === "/v1/credentials/claude/import" && env.NANOCODEX_OWNER_ID
+      ? new Set(["PUT"]) : undefined)
+    ?? (url.pathname === "/v1/credentials/claude/status" && env.NANOCODEX_OWNER_ID
+      ? new Set(["GET"]) : undefined)
+    ?? (url.pathname === "/v1/credentials/chatgpt/import" && env.NANOCODEX_OWNER_ID
+      ? new Set(["PUT"]) : undefined)
     ?? (sshIdentity ? new Set(["PUT", "DELETE"]) : undefined)
     ?? (vaultKind ? new Set(vaultId ? ["DELETE"] : ["POST"]) : undefined);
   if (!methods) return undefined;
@@ -54,6 +61,7 @@ export async function routeCredentialRequest(
     && principal.capabilities.includes("agents:write") && principal.capabilities.includes("tools:use")))) {
     return json({ error: "unauthorized" }, 401);
   }
+  if (!env.NANOCODEX) return json({ error: "credential_broker_unavailable" }, 503);
   if (request.method === "PUT" && (url.pathname === "/v1/credentials/openai" || sshIdentity)
     && !request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     return json({ error: "invalid_content_type" }, 415);
@@ -65,6 +73,43 @@ export async function routeCredentialRequest(
   if (request.method !== "GET") {
     const originFailure = requireSameOriginMutation(request, url, principal);
     if (originFailure) return originFailure;
+  }
+
+  if (url.pathname === "/v1/credentials/claude/import" || url.pathname === "/v1/credentials/claude/status") {
+    if (principal.kind !== "account_session" || principal.userId !== env.NANOCODEX_OWNER_ID) {
+      return json({ error: "unauthorized" }, 401);
+    }
+    if (request.method === "PUT" && !isJsonContentType(request.headers.get("content-type"))) {
+      return json({ error: "invalid_content_type" }, 415);
+    }
+    let body: string | undefined;
+    if (request.method === "PUT") {
+      try { body = await readBoundedText(request, 16_384); }
+      catch { return json({ error: "body_too_large" }, 413); }
+    }
+    return env.NANOCODEX.fetch(
+      `https://broker.internal/users/${encodeURIComponent(principal.userId)}/credentials/claude/${request.method === "PUT" ? "import" : "status"}`,
+      { method: request.method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body }) },
+    );
+  }
+
+  if (url.pathname === "/v1/credentials/chatgpt/import") {
+    if (principal.kind !== "account_session" || principal.userId !== env.NANOCODEX_OWNER_ID) {
+      return json({ error: "unauthorized" }, 401);
+    }
+    if (!isJsonContentType(request.headers.get("content-type"))) {
+      return json({ error: "invalid_content_type" }, 415);
+    }
+    let body: string;
+    try {
+      body = await readBoundedText(request, 64 * 1024);
+    } catch {
+      return json({ error: "body_too_large" }, 413);
+    }
+    return env.NANOCODEX.fetch(
+      `https://broker.internal/users/${encodeURIComponent(principal.userId)}/credentials/chatgpt`,
+      { method: "PUT", headers: { "content-type": "application/json" }, body },
+    );
   }
 
   let vaultBody: string | undefined;

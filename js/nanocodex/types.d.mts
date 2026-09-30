@@ -1,6 +1,6 @@
 export type Thinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningMode = "standard" | "pro";
-export type Model = "gpt-6.1-sol" | "gpt-6-luna" | "gpt-6-astra" | "@cf/zai-org/glm-5.3" | "kimi-k3" | "mimo-v2.6-pro";
+export type Model = "gpt-6.1-sol" | "gpt-6-luna" | "claude-sonnet-5" | "claude-fable-5-1" | "claude-opus-5-5" | "gpt-6-astra" | "@cf/zai-org/glm-5.3" | "kimi-k3" | "mimo-v2.6-pro";
 
 export type PromptItem =
   | { type: "text"; text: string }

@@ -1,0 +1,17 @@
+host: "127.0.0.1"
+port: 8317
+auth-dir: "/tmp/nanocodex-cliproxy-auth"
+api-keys: []
+debug: false
+disable-claude-cloak-mode: true
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: true
+codex-api-key:
+  - api-key: "nanocodex-loopback"
+    base-url: "http://127.0.0.1:8080/backend-api/codex"
+    disable-codex-cloaking: true
+    headers:
+      Authorization: "$X-Nanocodex-Provider-Authorization"
+      ChatGPT-Account-ID: "$X-Nanocodex-Provider-Account"

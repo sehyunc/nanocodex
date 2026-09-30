@@ -29,7 +29,7 @@ const TURN_STATE_READ_TIMEOUT_MS = 2_000;
 const ALLOWED_OPTIONS = new Set(["apiKey", "baseUrl", "fetch", "toolsTransport", "requestOrigin"]);
 const CREATE_SETTINGS = new Set(["model", "thinking", "reasoningMode", "fastMode"]);
 const SETTINGS_PATCH = CREATE_SETTINGS;
-const MODELS = new Set(["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"]);
+const MODELS = new Set(["gpt-6.1-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"]);
 const THINKING = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
 const REASONING_MODES = new Set(["standard", "pro"]);
 const eventEncoder = new TextEncoder();
@@ -152,6 +152,10 @@ function managedCreateOptions(options) {
   }
   if (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(settings.model) && ((settings.thinking !== undefined && !(settings.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(settings.thinking)) || settings.reasoningMode === "pro")) {
     throw new TypeError(`${settings.model === "@cf/zai-org/glm-5.3" ? "GLM-5.3" : settings.model} requires a supported thinking effort and standard reasoning mode`);
+  }
+  if (settings.model?.startsWith("claude-") && (!["low", "medium", "high"].includes(settings.thinking)
+    || settings.reasoningMode !== "standard" || settings.fastMode)) {
+    throw new TypeError("Claude requires low, medium, or high thinking and standard mode");
   }
   if (["gpt-6-astra", "gpt-6.1-sol"].includes(settings.model) && settings.thinking === "none") {
     throw new TypeError("GPT-6 Astra and GPT-6.1 Sol require low, medium, high, xhigh, or max thinking");
@@ -432,6 +436,10 @@ function managedSettingsPatch(patch) {
   if (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(patch.model) && ((patch.thinking !== undefined && !(patch.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(patch.thinking)) || patch.reasoningMode === "pro")) {
     throw new TypeError(`${patch.model === "@cf/zai-org/glm-5.3" ? "GLM-5.3" : patch.model} requires a supported thinking effort and standard reasoning mode`);
   }
+  if (patch.model?.startsWith("claude-") && ((patch.thinking !== undefined && !["low", "medium", "high"].includes(patch.thinking))
+    || patch.reasoningMode === "pro" || patch.fastMode === true)) {
+    throw new TypeError("Claude requires low, medium, or high thinking and standard mode");
+  }
   if (["gpt-6-astra", "gpt-6.1-sol"].includes(patch.model) && patch.thinking === "none") {
     throw new TypeError("GPT-6 Astra and GPT-6.1 Sol require low, medium, high, xhigh, or max thinking");
   }
@@ -451,6 +459,8 @@ function managedSettings(value) {
     || !MODELS.has(value.model) || !THINKING.has(value.thinking)
     || !REASONING_MODES.has(value.reasoning_mode) || typeof value.fast_mode !== "boolean"
     || (["@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"].includes(value.model) && (!(value.model === "kimi-k3" ? ["low", "high"] : ["low", "medium", "high"]).includes(value.thinking) || value.reasoning_mode === "pro"))
+    || (value.model?.startsWith("claude-") && (!["low", "medium", "high"].includes(value.thinking)
+      || value.reasoning_mode !== "standard" || value.fast_mode))
     || (["gpt-6-astra", "gpt-6.1-sol"].includes(value.model) && value.thinking === "none")
     || (value.model === "gpt-6-astra" && value.reasoning_mode === "pro")
   ) {

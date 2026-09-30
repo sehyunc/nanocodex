@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer, request } from "node:http";
+import { connect } from "node:net";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { startRelay } from "./relay.mjs";
 
 const path = "/backend-api/codex/realtime/calls";
+const RESPONSES_PATH_FOR_TEST = "/backend-api/codex/responses";
 
 async function fixture(t, handler) {
   const upstream = createServer(handler);
@@ -120,6 +123,99 @@ test("Responses POST streams SSE and cancels the provider on disconnect", { time
   assert.equal(chunk.toString(), "data: first\n\n");
   outgoing.destroy();
   await upstreamClosed;
+});
+
+test("canary Responses POST passes broker credential only to loopback CLIProxyAPI", { timeout: 5_000 }, async (t) => {
+  let directCalls = 0;
+  const direct = createServer((_incoming, response) => { directCalls++; response.writeHead(500).end(); });
+  const cliProxy = createServer((incoming, response) => {
+    assert.equal(incoming.url, "/v1/responses");
+    assert.equal(incoming.headers.authorization, "Bearer nanocodex-loopback");
+    assert.equal(incoming.headers["x-nanocodex-provider-authorization"], "Bearer fixture");
+    assert.equal(incoming.headers["x-nanocodex-provider-account"], "account-fixture");
+    assert.equal(incoming.headers["chatgpt-account-id"], undefined);
+    incoming.resume();
+    incoming.on("end", () => response.writeHead(200, { "content-type": "text/event-stream" }).end("data: ok\n\n"));
+  });
+  for (const server of [direct, cliProxy]) {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+  }
+  const relay = startRelay({ host: "127.0.0.1", port: 0,
+    upstreamOrigin: `http://127.0.0.1:${direct.address().port}`,
+    cliProxyOrigin: `http://127.0.0.1:${cliProxy.address().port}` });
+  await once(relay, "listening");
+  t.after(() => { for (const server of [relay, cliProxy, direct]) { server.closeAllConnections(); server.close(); } });
+  const outgoing = request(`http://127.0.0.1:${relay.address().port}${RESPONSES_PATH_FOR_TEST}`, {
+    method: "POST", headers: { authorization: "Bearer fixture", "chatgpt-account-id": "account-fixture",
+      "x-nanocodex-cliproxy-canary": "v1", "content-type": "application/json" },
+  });
+  outgoing.end('{"stream":true}');
+  const [response] = await once(outgoing, "response");
+  let body = "";
+  for await (const chunk of response) body += chunk;
+  assert.equal(response.statusCode, 200);
+  assert.equal(body, "data: ok\n\n");
+  assert.equal(directCalls, 0);
+});
+
+test("Claude Responses route never forwards the ChatGPT credential to CLIProxyAPI", { timeout: 5_000 }, async (t) => {
+  const direct = createServer();
+  const cliProxy = createServer((incoming, response) => {
+    assert.equal(incoming.url, "/v1/responses");
+    assert.equal(incoming.headers.authorization, "Bearer nanocodex-loopback");
+    assert.equal(incoming.headers["x-nanocodex-provider-authorization"], undefined);
+    assert.equal(incoming.headers["x-nanocodex-provider-account"], undefined);
+    assert.equal(incoming.headers["chatgpt-account-id"], undefined);
+    incoming.resume();
+    incoming.on("end", () => response.writeHead(200).end("ok"));
+  });
+  for (const server of [direct, cliProxy]) {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+  }
+  const relay = startRelay({ host: "127.0.0.1", port: 0,
+    upstreamOrigin: `http://127.0.0.1:${direct.address().port}`,
+    cliProxyOrigin: `http://127.0.0.1:${cliProxy.address().port}` });
+  await once(relay, "listening");
+  t.after(() => { for (const server of [relay, cliProxy, direct]) { server.closeAllConnections(); server.close(); } });
+  const outgoing = request(`http://127.0.0.1:${relay.address().port}${RESPONSES_PATH_FOR_TEST}`, {
+    method: "POST", headers: { authorization: "Bearer chatgpt-secret", "chatgpt-account-id": "account-fixture",
+      "x-nanocodex-cliproxy-canary": "v1", "x-nanocodex-cliproxy-provider": "claude" },
+  });
+  outgoing.end('{"model":"claude-sonnet-5"}');
+  const [response] = await once(outgoing, "response");
+  for await (const _chunk of response) { /* Drain. */ }
+  assert.equal(response.statusCode, 200);
+});
+
+test("canary Responses WebSocket upgrades through loopback CLIProxyAPI", { timeout: 5_000 }, async (t) => {
+  const direct = createServer();
+  const cliProxy = createServer();
+  cliProxy.on("upgrade", (incoming, socket) => {
+    assert.equal(incoming.url, "/v1/responses");
+    assert.equal(incoming.headers.authorization, "Bearer nanocodex-loopback");
+    assert.equal(incoming.headers["x-nanocodex-provider-authorization"], "Bearer fixture");
+    assert.equal(incoming.headers["x-nanocodex-provider-account"], "account-fixture");
+    const accept = createHash("sha1").update(incoming.headers["sec-websocket-key"]
+      + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    socket.end(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+  });
+  for (const server of [direct, cliProxy]) {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+  }
+  const relay = startRelay({ host: "127.0.0.1", port: 0,
+    upstreamOrigin: `http://127.0.0.1:${direct.address().port}`,
+    cliProxyOrigin: `http://127.0.0.1:${cliProxy.address().port}` });
+  await once(relay, "listening");
+  t.after(() => { for (const server of [relay, cliProxy, direct]) { server.closeAllConnections(); server.close(); } });
+  const socket = connect(relay.address().port, "127.0.0.1");
+  await once(socket, "connect");
+  socket.write(`GET ${RESPONSES_PATH_FOR_TEST} HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nAuthorization: Bearer fixture\r\nChatGPT-Account-ID: account-fixture\r\nX-Nanocodex-CLIProxy-Canary: v1\r\n\r\n`);
+  const [chunk] = await once(socket, "data");
+  assert.match(chunk.toString(), /^HTTP\/1\.1 101 Switching Protocols/);
+  socket.destroy();
 });
 
 test("Responses relay rejects alternate methods and paths", async (t) => {

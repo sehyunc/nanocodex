@@ -1,4 +1,4 @@
-export const AGENT_MODELS: readonly ["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"];
+export const AGENT_MODELS: readonly ["gpt-6.1-sol", "gpt-6-luna", "claude-sonnet-5", "claude-fable-5-1", "claude-opus-5-5", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro"];
 export const AGENT_THINKING: readonly ["none", "low", "medium", "high", "xhigh", "max"];
 export const AGENT_REASONING_MODES: readonly ["standard", "pro"];
 export type ManagedAgentSettings = Readonly<{ model: typeof AGENT_MODELS[number]; thinking: typeof AGENT_THINKING[number]; reasoning_mode: typeof AGENT_REASONING_MODES[number]; fast_mode: boolean }>;

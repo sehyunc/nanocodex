@@ -109,11 +109,22 @@ struct TokenRates {
     output: u64,
 }
 
+// A subscription login has no per-token API charge to estimate here.
+const SUBSCRIPTION_UNPRICED: TokenRates = TokenRates {
+    input: 0,
+    cached_input: 0,
+    cache_write_input: 0,
+    output: 0,
+};
+
 impl TokenRates {
     const fn for_model(model: Model, service_tier: ServiceTier, input_tokens: u64) -> Self {
         let fast = !matches!(service_tier, ServiceTier::Standard);
         let long = input_tokens > LONG_CONTEXT_THRESHOLD;
         match (model, fast, long) {
+            (Model::ClaudeSonnet5 | Model::ClaudeFable51 | Model::ClaudeOpus55, _, _) => {
+                SUBSCRIPTION_UNPRICED
+            }
             (Model::Glm53, _, _) => GLM53_STANDARD,
             (Model::Kimi, _, _) => KIMI_STANDARD,
             (Model::Mimo, _, _) => MIMO_STANDARD,
@@ -161,7 +172,16 @@ impl ServiceTier {
     #[must_use]
     pub const fn for_model(model: Model, fast_mode: bool) -> Self {
         match (model, fast_mode) {
-            (Model::Glm53 | Model::Kimi | Model::Mimo, _) | (_, false) => Self::Standard,
+            (
+                Model::ClaudeSonnet5
+                | Model::ClaudeFable51
+                | Model::ClaudeOpus55
+                | Model::Glm53
+                | Model::Kimi
+                | Model::Mimo,
+                _,
+            )
+            | (_, false) => Self::Standard,
             (Model::Sol | Model::Luna | Model::Astra, true) => Self::Fast,
         }
     }
