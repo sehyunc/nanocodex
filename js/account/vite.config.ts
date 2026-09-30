@@ -15,6 +15,10 @@ import { isManagedRoutePath } from "./worker/managedProxy.ts";
 import { isConnectApiBrowserRoutePath } from "./worker/connectApiProxy.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+const wranglerConfigPath = process.env.NANOCODEX_WRANGLER_CONFIG ?? "wrangler.jsonc";
+const ownerOnlyDeployment = wranglerConfigPath === "wrangler.self-hosted.jsonc"
+  || wranglerConfigPath === "wrangler.bootstrap.jsonc";
+const outputWorkerName = ownerOnlyDeployment ? "nanocodex_v2" : "nanocodex";
 const repositoryRevision = execFileSync("git", ["rev-parse", "HEAD"], {
   cwd: repositoryRoot,
   encoding: "utf8",
@@ -93,9 +97,9 @@ function deploymentBuildAttestation(): Plugin {
     name: "nanocodex-deployment-build-attestation",
     apply: "build" as const,
     async closeBundle() {
-      const config = await readFile(new URL("./wrangler.jsonc", import.meta.url));
+      const config = await readFile(new URL(wranglerConfigPath, import.meta.url));
       await writeFile(
-        new URL("./dist/nanocodex/build-attestation.json", import.meta.url),
+        new URL(`./dist/${outputWorkerName}/build-attestation.json`, import.meta.url),
         `${JSON.stringify({
           revision: repositoryRevision,
           wranglerConfigSha256: createHash("sha256").update(config).digest("hex"),
@@ -110,11 +114,13 @@ export default defineConfig({
   // detected shim also contains `env`. The browser has no environment access;
   // make that empty boundary explicit instead of letting a partial shim crash.
   define: {
+    "__NANOCODEX_OWNER_ONLY__": JSON.stringify(ownerOnlyDeployment),
     "process.env": "{}",
   },
   plugins: [
     nanocodex({
-      chatGpt: { credentialBrokerWorker: "nanocodex-egress" },
+      chatGpt: { credentialBrokerWorker: ownerOnlyDeployment
+        ? "nanocodex-v2-egress" : "nanocodex-egress" },
       devApplications: [{
         headers: {
           "content-security-policy": "frame-ancestors 'self' https://nanocodex.localhost https://*.nanocodex.localhost http://nanocodex.localhost:* http://*.nanocodex.localhost:*",
@@ -124,6 +130,7 @@ export default defineConfig({
       }],
       oauthRelay: true,
       cloudflare: {
+        configPath: wranglerConfigPath,
         inspectorPort: 0,
         auxiliaryWorkers: [
           { configPath: "../x-api/wrangler.jsonc", devOnly: true },

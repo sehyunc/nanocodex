@@ -1,5 +1,6 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "globalEnv": ["NANOCODEX_WRANGLER_CONFIG", "NANOCODEX_WORKER_OUTPUT"],
   "tasks": {
     "build": {
       "dependsOn": ["^build"],

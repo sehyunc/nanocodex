@@ -7,10 +7,10 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "rm -rf dist && wrangler deploy --dry-run --outdir dist --config wrangler.jsonc",
+    "build": "rm -rf dist && wrangler deploy --dry-run --outdir dist --config \"${NANOCODEX_WRANGLER_CONFIG:-wrangler.jsonc}\"",
     "check": "npm run typecheck && npm test && npm run build",
     "predeploy": "npm run prepare:code-evaluator",
-    "deploy": "node ../../scripts/cloudflare/managed-crm.mjs deploy",
+    "deploy": "if [ -n \"$NANOCODEX_WRANGLER_CONFIG\" ]; then wrangler deploy --env=\"\" --config \"$NANOCODEX_WRANGLER_CONFIG\"; else node ../../scripts/cloudflare/managed-crm.mjs deploy; fi",
     "prebuild": "npm run prepare:code-evaluator",
     "prepare:code-evaluator": "node scripts/prepare-code-evaluator.mjs && node scripts/prepare-hand-image.mjs && node scripts/prepare-just-bash-lazy.mjs",
     "test": "vitest run && npm run test:hosted-tools && npm run test:apps && npm run test:rpc-lifecycle && npm run test:discovery-cache && npm run test:routing && npm run test:todo-mail && npm run test:done && npm run test:meetings && npm run test:recovery && npm run test:model-pause && npm run test:tool-timing && npm run test:hand-reconnect && npm run test:hand-owner-restart && npm run test:hand-leased-recovery && npm run test:hand-communication && npm run test:hand-discovery && npm run test:claude-managed && npm run test:hand-catalog-scaling && npm run test:hand-preparation && npm run test:code-mode-warm",
