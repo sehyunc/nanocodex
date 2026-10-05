@@ -330,3 +330,37 @@ test("actual WASM cancelOnAdmission never issues a queued successor Messages req
     assert.equal(requests.length, 2);
   } finally { await shutdown(agent); }
 });
+
+test('Claude reconstructs the same durable owner while its previous host remains in the isolate', { timeout: 30_000 }, async t => {
+  const { CLOUDFLARE_SESSION_RESERVATION, prepareCloudflareAgentSession, commitCloudflareAgentSession, releaseAgentSession } = await import('../internal.mjs');
+  const Claude = await sdk('browser');
+  const { endpoint } = await fixture(t, () => sse(text('RECONSTRUCTED')));
+  const database = sqlite(':memory:');
+  const sessionId = 'claude-owner-reconstruction';
+  const reservations = [];
+  const agents = [];
+  t.after(async () => {
+    for (const agent of agents.reverse()) await agent.session.shutdown().catch(() => {});
+    for (const reservation of reservations) releaseAgentSession(reservation);
+    database.close();
+  });
+  const create = async () => {
+    const reservation = prepareCloudflareAgentSession(sessionId, 'synthetic-durable-object');
+    reservations.push(reservation);
+    const agent = await Claude.create({
+      [CLOUDFLARE_SESSION_RESERVATION]: reservation,
+      endpoint, model: 'fixture-model', durability: database.store, durabilityId: sessionId,
+      module: await readFile(new URL('../pkg-web/nanocodex_bg.wasm', import.meta.url)),
+      auth: { headers: () => ({ 'x-api-key': 'synthetic-only' }) },
+    });
+    agents.push(agent);
+    commitCloudflareAgentSession(reservation);
+    return agent;
+  };
+  const first = await create();
+  assert.equal((await run(first, 'First turn', 'owner-first')).finalMessage, 'RECONSTRUCTED');
+  const replacement = await create();
+  assert.equal((await run(replacement, 'Second turn', 'owner-second')).finalMessage, 'RECONSTRUCTED');
+  await first.session.shutdown().catch(() => {});
+  assert.equal((await run(replacement, 'After old owner cleanup', 'owner-third')).finalMessage, 'RECONSTRUCTED');
+});
