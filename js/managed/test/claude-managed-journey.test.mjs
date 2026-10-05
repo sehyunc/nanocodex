@@ -316,6 +316,11 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
       }
       assert.ok(names.includes('Bash'));assert.ok(names.includes('Write'));assert.ok(names.includes('Read'));
       if(prompt.includes('Write durable proof')){writes++;return sse({type:'tool_use',id:`write-${calls}`,name:'Write',input:{file_path:'/brain/proof.txt',content:'NATIVE_CLAUDE_DURABLE_PROOF'}},'tool_use',`message-${calls}`);}
+      if(prompt.includes('Verify retained native proof')) {
+        assert.match(encodedHistory,/NATIVE_CLAUDE_DURABLE_PROOF/);
+        assert.match(encodedHistory,/CLAUDE_TOOL_DONE_2/);
+        return sse({type:'text',text:'CLAUDE_TOOL_DONE_RETAINED_NATIVE_PROOF'},'end_turn',`message-${calls}`);
+      }
       if(prompt.includes('Read durable proof')){
         assert.ok(JSON.stringify(body.messages).includes(summaries?'NATIVE_SUMMARY':'CLAUDE_TOOL_DONE_2'),'prior native history/summary persisted');
         return sse({type:'tool_use',id:`read-${calls}`,name:'Read',input:{file_path:'/brain/proof.txt'}},'tool_use',`message-${calls}`);
@@ -420,7 +425,20 @@ test('Managed native Claude and mixed-family public delegation, account gates, c
     await turn(agent,'Run Bash durable proof','journey-bash');
     const history=await call(`/v1/agents/${agent}/events/history?after=0&limit=256`);assert.match(JSON.stringify(history),/Write|Read|Bash/);
     await call(`/v1/agents/${agent}/durability`,'POST',undefined,409);
-    await call(`/v1/agents/${agent}/forks`,'POST',undefined,409,{'idempotency-key':'claude-fork-denial'});
+    const forked=await call(`/v1/agents/${agent}/forks`,'POST',{at:'journey-write'},201,{'idempotency-key':'claude-native-historical-fork'});
+    assert.notEqual(forked.agent_id,agent);
+    assert.equal(forked.parent_agent_id,agent);
+    assert.ok(!JSON.stringify(forked).includes('checkpoint'),'public fork response does not expose native checkpoint');
+    assert.equal((await call(`/v1/agents/${agent}/forks`,'POST',{at:'journey-write'},201,{'idempotency-key':'claude-native-historical-fork'})).agent_id,forked.agent_id);
+    await call(`/v1/agents/${agent}/forks`,'POST',{at:'journey-read'},409,{'idempotency-key':'claude-native-historical-fork'});
+    await mf.dispose(); mf=new Miniflare(options);
+    const forkRequestStart=upstream.length;
+    await turn(forked.agent_id,'Verify retained native proof','journey-cold-fork-read');
+    const forkRequest=upstream.slice(forkRequestStart).find(row=>row.wire);
+    assert.ok(forkRequest,'cold historical child sends a real native Messages request');
+    assert.match(forkRequest.wire,/Write durable proof/);
+    assert.doesNotMatch(forkRequest.wire,/Run Bash durable proof/);
+    assert.equal(writes,1,'cold native fork reuses prior effect transcript without redispatching Write');
     await call(`/v1/agents/${agent}/compact`,'POST');
     assert.equal(summaries,1);
     await mf.dispose(); mf=new Miniflare(options);
