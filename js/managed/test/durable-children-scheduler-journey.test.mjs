@@ -69,10 +69,18 @@ export class FixtureModel extends DurableObject {
       const call=(name,id,args)=>[{type:'function_call',name,call_id:id,arguments:JSON.stringify(args)}];
       const say=text=>[{type:'message',role:'assistant',content:[{type:'output_text',text}]}];
       let output;
-      if(child){
+      if(child && users.includes('RESUME_RETAINED_CHILD')) {
+        const current=input.slice(input.findLastIndex(item=>item.role==='user')+1);
+        output=current.some(item=>item.call_id==='background-resubmit'&&item.type==='function_call_output')?say('BACKGROUND_CHILD_RESUMED'):call('submit_result','background-resubmit',{output:'BACKGROUND_CHILD_RESUMED'});
+      } else if(child){
         if(!results.some(item=>item.call_id==='background-proof'))output=call('exec_command','background-proof',{cmd:"printf 'BACKGROUND_EFFECT\\n' >> /brain/background-proof.txt",workdir:'/brain'});
         else if(!results.some(item=>item.call_id==='background-submit'))output=call('submit_result','background-submit',{output:'BACKGROUND_CHILD_OK'});
         else output=say('BACKGROUND_CHILD_OK');
+      } else if(users.includes('RESUME_BACKGROUND_CHILD')) {
+        const current=input.slice(input.findLastIndex(item=>item.role==='user')+1);
+        const sent=current.find(item=>item.call_id==='resume-send'&&item.type==='function_call_output');
+        const waited=current.find(item=>item.call_id==='resume-wait'&&item.type==='function_call_output');
+        output=waited?say(waited.output):sent?call('wait_agent','resume-wait',{agent_ids:[1],timeout_ms:10000}):call('send_agent_message','resume-send',{agent_id:1,message:'RESUME_RETAINED_CHILD: submit BACKGROUND_CHILD_RESUMED.',purpose:'delegate',priority:'deferred'});
       } else if(users.includes('INSPECT_BACKGROUND_CHILD')) {
         const result=results.find(item=>item.call_id==='inspect-children');
         output=result?say(result.output):call('list_agents','inspect-children',{include_completed:true,include_self:false});
@@ -85,7 +93,7 @@ export class FixtureModel extends DurableObject {
 export default {fetch(request,env){const path=new URL(request.url).pathname;if(path.startsWith('/model/'))return env.MODEL.getByName('provider').fetch(new Request('https://fixture.internal/'+path.slice(7),request));return env.NANOCODEX_SESSIONS.getByName('scheduler').fetch(request);}};
 `;
 
-test('production managed alarm cold-reopens a background child after root terminal, then stops completed-child recovery', { timeout: 120_000 }, async () => {
+test('production managed recovery retains idle child routes for later messages', { timeout: 120_000 }, async () => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const output = fileURLToPath(new URL('../../../output/durable-children-scheduler/', import.meta.url)) + crypto.randomUUID();
   await mkdir(output, { recursive: true });
@@ -249,7 +257,23 @@ test('production managed alarm cold-reopens a background child after root termin
     assert.equal(settled.session.effects.filter(row => row.call_id === 'background-proof').length, 1);
     assert.equal((await call('/__proof')).text, 'BACKGROUND_EFFECT\n');
     trace.push({ completed_children_do_not_poll: settled });
-    console.log(JSON.stringify({ evidence: output, root: 'completed before SIGKILL', child: 'alarm cold reopen / BACKGROUND_CHILD_OK', childId, effects: 1, terminalRootReinferences: 0, completedChildRecovery: false }));
+
+    await call('/turns', 'POST', { id: 'resume-turn', input: 'RESUME_BACKGROUND_CHILD: send a new assignment to retained child 1.' });
+    await poll(async () => (await inspect()).session.turns.find(row => row.id === 'resume-turn')?.state === 'completed');
+    const resumedTurn = await call('/turns/resume-turn');
+    const resumedChild = JSON.parse(resumedTurn.terminal.final_message).agents[0];
+    assert.equal(resumedChild.agent_id, childId);
+    assert.deepEqual(resumedChild.status, {state:'completed',output:'BACKGROUND_CHILD_RESUMED'});
+    trace.push({ retained_child_resumed: resumedChild });
+    await kill();
+    await start();
+    await call('/turns', 'POST', { id: 'resume-cold-turn', input: 'RESUME_BACKGROUND_CHILD: send another assignment after process restart.' });
+    await poll(async () => (await inspect()).session.turns.find(row => row.id === 'resume-cold-turn')?.state === 'completed');
+    const coldResult = await call('/turns/resume-cold-turn');
+    assert.deepEqual(JSON.parse(coldResult.terminal.final_message).agents[0].status, {state:'completed',output:'BACKGROUND_CHILD_RESUMED'});
+    assert.equal((await call('/__proof')).text, 'BACKGROUND_EFFECT\n');
+    trace.push({ retained_child_cold_resume: coldResult });
+    console.log(JSON.stringify({ evidence: output, root: 'completed before SIGKILL', child: 'alarm cold reopen / BACKGROUND_CHILD_OK', childId, effects: 1, terminalRootReinferences: 0, completedChildRecovery: false, retainedChildMessagesAfterRestart: 2 }));
   } finally {
     if (processHandle) await kill();
     await logWrites;

@@ -10598,10 +10598,9 @@ export class DurableAgentSession extends DurableComputerObject {
         preserveRootTransport: !this.#threadRoute(),
         subagentLifecycle: (event: unknown) => {
           applyManagedSubagentLifecycle(this.ctx.storage, bindings, event);
-          if ((event as { type: string }).type === "release") {
-            this.ctx.storage.sql.exec("DELETE FROM managed_child_route_recipes WHERE session_id = ?",
-              (event as { sessionId: string }).sessionId);
-          }
+          // Release revokes live authority, not the durable child's route recipe.
+          // A later bind must restore current authority before readChildRoute can
+          // use that recipe. Session deletion removes the retained metadata.
           if ((event as { type: string }).type === "bind") {
             // Bind precedes child inference; commit a durable wake before the
             // foreground turn can complete or its client disconnects.
