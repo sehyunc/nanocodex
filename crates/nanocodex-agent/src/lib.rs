@@ -16,6 +16,7 @@ mod replay;
 pub use replay::ReplaySafety;
 mod harness;
 mod reasoning;
+mod service_tier_serde;
 pub use harness::{ClaudeModel, HarnessFamily, HarnessModel};
 #[cfg(feature = "openai")]
 mod model;

@@ -79,6 +79,8 @@ pub(super) struct Cursor {
     // The retry budget belongs to the admitted turn, including durable replay.
     #[serde(default)]
     pub(super) context_recovery_attempted: bool,
+    #[serde(default)]
+    pub(super) output_continuations: u32,
 }
 impl Cursor {
     pub(super) fn effect<'a>(&'a self, state: &'a State, step: &str) -> Option<Effect<'a>> {
@@ -342,6 +344,7 @@ impl State {
             model_step_offset: 1,
             model_receipt_start: Some(0),
             context_recovery_attempted: false,
+            output_continuations: 0,
         };
         // Task state snapshots and receipts must advance in the same order.
         #[cfg(all(feature = "tools", not(target_family = "wasm")))]
@@ -494,7 +497,15 @@ impl State {
                 result = self.call_tool(id, name, input, handler, events, cursor) => result?,
                 () = cancel.cancelled() => unknown(),
             }
-        } else if self.code_only && name != "exec" && name != "wait" {
+        } else if self.code_only
+            && name != "exec"
+            && name != "wait"
+            && cursor
+                .template
+                .tools
+                .iter()
+                .any(|tool| matches!(tool, ClaudeToolSpec::Client(tool) if tool.name == name))
+        {
             ContentBlock::tool_result_content(
                 id,
                 ToolResultContent::Text(format!(
@@ -505,9 +516,10 @@ impl State {
         } else {
             ContentBlock::tool_result_content(
                 id,
-                ToolResultContent::Text(format!(
-                    "Tool {name} is not available in the recovered host; no handler was invoked."
-                )),
+                ToolResultContent::Text(
+                    "Tool is not available in the admitted catalog or current host; no handler was invoked. Use an available tool."
+                        .into(),
+                ),
                 true,
             )
         };

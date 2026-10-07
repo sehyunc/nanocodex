@@ -107,6 +107,12 @@ prompts also await readiness; shutdown or dropping the last handle cancels
 unfinished startup recovery. A successful foreground turn waits for its
 foreground children, while failed or cancelled turns stop them before settlement.
 
+An unfinished Claude turn keeps the tool catalog it was admitted with across
+reopening. A client call outside that catalog receives a paired `is_error`
+result without invoking a handler, so the model can continue with an available
+tool. Attaching a handler when reopening cannot authorize that call. Malformed
+responses and calls to deferred tools before discovery still fail validation.
+
 `CheckpointBranch` supports explicit host-requested history branches. Opening it
 acquires the source through `StateStore` and refuses pending operations. Select a
 retained operation with `before`, validate the provider checkpoint (Claude hosts

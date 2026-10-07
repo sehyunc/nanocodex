@@ -39,7 +39,7 @@ where
                 self.thinking,
                 self.config.supports_reasoning_effort_updates(self.model),
             ),
-            self.fast_mode,
+            self.service_tier,
         );
         let mut model = self.model;
         let mut replay_safety = crate::ReplaySafety::Safe;
@@ -59,7 +59,7 @@ where
                         self.thinking,
                         self.config.supports_reasoning_effort_updates(self.model),
                     ),
-                    self.fast_mode,
+                    self.service_tier,
                 )
                 .native_request(&self.config)
                 .map_err(NanocodexError::ExecutionPayload)?;
@@ -88,7 +88,7 @@ where
         }
         let thinking = self.thinking;
         let reasoning_mode = self.config.reasoning_mode;
-        let fast_mode = self.fast_mode;
+        let service_tier = self.service_tier;
         let request_history = conversation.managed.generation_request();
         let previous_response_id = request_history.previous_response_id();
         let started_at = Instant::now();
@@ -204,11 +204,11 @@ where
         span.record("otel.status_code", "OK");
         span.record("duration_ns", duration_ns);
         if let Some(usage) = &response.usage {
-            record_usage(&span, usage, model, fast_mode);
+            record_usage(&span, usage, model, service_tier);
         }
         self.stats.model_duration_ns += duration_ns;
         if let Some(usage) = &response.usage {
-            self.stats.usage.add(usage, model, fast_mode);
+            self.stats.usage.add(usage, model, service_tier);
         }
         self.stats.last_response_id = transport_continuation_valid.then(|| response.id.clone());
         self.events.emit(
@@ -543,7 +543,12 @@ pub(super) fn compaction_span(
     )
 }
 
-pub(super) fn record_usage(span: &tracing::Span, usage: &Usage, model: Model, fast_mode: bool) {
+pub(super) fn record_usage(
+    span: &tracing::Span,
+    usage: &Usage,
+    model: Model,
+    service_tier: ServiceTier,
+) {
     let cached_input_tokens = usage
         .input_tokens_details
         .as_ref()
@@ -562,7 +567,7 @@ pub(super) fn record_usage(span: &tracing::Span, usage: &Usage, model: Model, fa
     span.record("output_tokens", usage.output_tokens);
     span.record("reasoning_output_tokens", reasoning_output_tokens);
     span.record("total_tokens", usage.total_tokens);
-    let estimate = estimate_for_model(usage, model, ServiceTier::for_model(model, fast_mode));
+    let estimate = estimate_for_model(usage, model, service_tier);
     let amount = estimate.amount().decimal();
     span.record("cost.usd", amount.as_str());
     span.record("cost.service_tier", estimate.service_tier().as_str());

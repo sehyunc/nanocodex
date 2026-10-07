@@ -18,7 +18,7 @@ use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
-    NanocodexError, Result,
+    NanocodexError, Result, ServiceTier,
     session::{CommittedSession, SessionSnapshot},
     usage::TurnUsage,
 };
@@ -738,7 +738,11 @@ struct StandaloneCompactionInput {
     base_checkpoint: Option<StandaloneCompactionBase>,
     model: &'static str,
     effort: &'static str,
-    fast_mode: bool,
+    #[serde(
+        flatten,
+        serialize_with = "crate::service_tier_serde::serialize_admission"
+    )]
+    service_tier: ServiceTier,
     workspace: Option<String>,
 }
 
@@ -905,7 +909,7 @@ impl Execution {
         base_checkpoint: Option<&CommittedSession>,
         model: nanocodex_oai_api::Model,
         effort: nanocodex_oai_api::Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         workspace: Option<&str>,
     ) -> Result<(Option<String>, Option<String>, AdmittedExecution)> {
         let Some(policy) = &self.policy else {
@@ -928,7 +932,7 @@ impl Execution {
             base_checkpoint,
             model: model.as_str(),
             effort: effort.as_str(),
-            fast_mode,
+            service_tier,
             workspace: workspace.map(str::to_owned),
         };
         let input_json = encode(&input)?;

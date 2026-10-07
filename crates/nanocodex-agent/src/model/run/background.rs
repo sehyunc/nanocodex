@@ -125,7 +125,7 @@ where
                 compaction::trigger(),
                 self.model,
                 self.thinking,
-                self.fast_mode,
+                self.service_tier,
             )
             .with_independent_connection();
         self.events.emit(
@@ -278,7 +278,7 @@ where
         self.stats.model_duration_ns += output.duration_ns;
         self.stats.compaction_duration_ns += output.duration_ns;
         if let Some(usage) = &output.usage {
-            self.stats.usage.add(usage, self.model, self.fast_mode);
+            self.stats.usage.add(usage, self.model, self.service_tier);
         }
         self.events.emit(
             AgentEventKind::ModelCompactionCompleted,

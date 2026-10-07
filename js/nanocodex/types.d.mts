@@ -318,7 +318,7 @@ export type EstimatedUsdCost = Readonly<{
   cached_input_usd: string;
   cache_write_input_usd: string;
   output_usd: string;
-  service_tier: "standard" | "priority" | "fast";
+  service_tier: "standard" | "priority" | "fast" | "ultrafast";
 }>;
 
 export type CostStatus =
