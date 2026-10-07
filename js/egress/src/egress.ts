@@ -2812,8 +2812,22 @@ async function handleClaudeMessages(
         && (name !== "retry-after" || /^\d{1,6}$/.test(value))) headers.set(name, value);
     }
     if (!response.ok) {
-      await cancelResponseBody(response);
-      return Response.json({ error: { type: "api_error", message: `Claude request rejected (HTTP ${response.status}).` } },
+      let rejection: unknown;
+      try { rejection = JSON.parse(await readBoundedText(response, 64 * 1024)); }
+      catch { rejection = undefined; }
+      const diagnostic = modelRejectionDiagnostic(rejection);
+      const retryAfter = headers.get("retry-after");
+      const rateLimited = response.status === 429
+        || ["rate_limit_error", "rate_limit_exceeded", "usage_limit_reached",
+          "usage_limit_exceeded", "insufficient_quota"].includes(diagnostic.code);
+      const type = rateLimited
+        ? (diagnostic.code === "upstream_rejected" ? "rate_limit_error" : diagnostic.code)
+        : (diagnostic.code === "upstream_rejected" ? "api_error" : diagnostic.code);
+      const retryNotice = retryAfter ? ` Retry after ${retryAfter} seconds.` : "";
+      const message = rateLimited
+        ? `Claude subscription limit reached.${retryNotice}`
+        : `Claude request rejected (HTTP ${response.status}).`;
+      return Response.json({ error: { type, message } },
         { status: REDIRECT_STATUS.has(response.status) ? 502 : response.status, headers });
     }
     return new Response(privateClaudeStream(response.body, secrets), { status: response.status, headers });
@@ -3464,7 +3478,7 @@ function json(body: unknown, status: number): Response {
 const MODEL_REJECTION_CODES = new Set([
   "context_length_exceeded", "invalid_request_error", "invalid_value", "invalid_image",
   "invalid_encrypted_content", "invalid_api_key", "authentication_error",
-  "permission_denied", "model_not_found", "rate_limit_exceeded",
+  "permission_denied", "model_not_found", "rate_limit_error", "rate_limit_exceeded",
   "usage_limit_reached", "usage_limit_exceeded", "insufficient_quota",
   "server_error", "internal_server_error", "overloaded_error",
   "server_is_overloaded", "slow_down", "websocket_connection_limit_reached",

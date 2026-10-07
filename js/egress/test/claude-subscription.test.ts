@@ -310,4 +310,13 @@ describe('real workerd broker and Rust WASM Claude account journeys', () => {
     expect(await trace('reflection')).toEqual({exchange:1,profile:1,messages:1});
     console.info('CLAUDE_JOURNEY',{journey:'streamed-private-reflection',denied:true});
   });
+  it('reports a bounded Claude subscription limit without provider text',async()=>{
+    const user='claude-rate-limit'; await login(user,'rate-limit');
+    const result=await privateModel.fetch(messages(user));
+    expect(result.status).toBe(429);
+    expect(result.headers.get('retry-after')).toBe('3600');
+    expect(await result.json()).toEqual({error:{type:'rate_limit_error',
+      message:'Claude subscription limit reached. Retry after 3600 seconds.'}});
+    expect(await trace('rate-limit')).toEqual({exchange:1,profile:1,messages:1});
+  });
 });
