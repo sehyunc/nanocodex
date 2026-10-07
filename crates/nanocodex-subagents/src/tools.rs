@@ -493,6 +493,10 @@ async fn start_agent_with_host_context(
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Native fork routing and durable spawn receipts share this dispatch boundary"
+)]
 async fn start_child(
     parent: &AgentHandle,
     registry: &Arc<Registry>,
