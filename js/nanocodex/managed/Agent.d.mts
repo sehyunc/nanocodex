@@ -73,7 +73,7 @@ export type Options = Readonly<{
 }>;
 
 export type CreateSettings = Readonly<{
-  model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5";
+  model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-fable-5-1";
   thinking: Thinking;
   reasoningMode: ReasoningMode;
   fastMode: boolean;
@@ -165,7 +165,7 @@ export type State = Readonly<{
   latest_event_cursor: string;
   stream_error: string | null;
   settings: Readonly<{
-    model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5";
+    model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-fable-5-1";
     thinking: Thinking;
     reasoning_mode: ReasoningMode;
     fast_mode: boolean;

@@ -118,3 +118,19 @@ test("webhook verification accepts authentic deliveries and rejects tampering, s
   await assert.rejects(Agent.verifyWebhook(signed(), "wrong-secret-".repeat(4)));
   await assert.rejects(Agent.verifyWebhook(signed(body, "1"), secret));
 });
+
+test("Fable creation and settings preserve the native model on the wire", async () => {
+  const requests = [];
+  const settings = { model: "claude-fable-5-1", thinking: "medium", reasoningMode: "standard", fastMode: false };
+  const wireSettings = { model: settings.model, thinking: settings.thinking, reasoning_mode: "standard", fast_mode: false };
+  const agent = await Agent.create({ baseUrl: "https://managed.example", settings, fetch: async (url, init) => {
+    const request = new Request(url, init);
+    requests.push({ method: request.method, body: await request.json() });
+    return Response.json(new URL(request.url).pathname.endsWith("/settings") ? { settings: wireSettings } : { agent_id: id });
+  } });
+  assert.deepEqual(requests[0].body.settings, wireSettings);
+  assert.deepEqual(await agent.settings.update(settings), settings);
+  assert.deepEqual(requests[1].body, wireSettings);
+  await assert.rejects(Agent.create({ baseUrl: "https://managed.example", settings: { ...settings, fastMode: true } }), TypeError);
+  assert.equal(requests.length, 2);
+});
