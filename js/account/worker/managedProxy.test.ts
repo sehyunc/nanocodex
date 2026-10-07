@@ -185,6 +185,16 @@ test("agent lifecycle timings correlate across Workers without touching response
   }
 });
 
+test("account forwarding admits managed agent definitions and crew seats", () => {
+  const id = "11111111-1111-4111-8111-111111111111";
+  for (const path of [
+    "/v1/agent-definitions",
+    "/v1/agent-definitions/remora-fox-v1",
+    "/v1/environment-templates/remora",
+    `/v1/agents/${id}/crew-seat`,
+  ]) assert.equal(isManagedRoutePath(path), true, path);
+});
+
 
 test("inference lifecycle observation failures preserve the backend response", async () => {
   const id = "11111111-1111-4111-8111-111111111111";

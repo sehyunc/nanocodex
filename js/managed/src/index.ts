@@ -72,6 +72,7 @@ import { accountToolsEnabled, normalizeToolNames, parseConfiguration, type Agent
 import { createHash } from "node:crypto";
 import { ThreadShareLinks, type SharePermission } from "./thread-share-links";
 import { threadSharingTools, redactSharedLinkTokens } from "./thread-sharing-tool";
+import { crewMessagePrompt, crewMessageTool, type CrewMessage } from "./crew-message-tool";
 import { initializeTurnInputs, inputChunks, lazyTurnInput, readTurnInput, storeTurnInput } from "./managed-turn-input";
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { ArchiveMaintenance } from "./archive-maintenance";
@@ -353,6 +354,8 @@ import {
   isOrganizationCapabilities,
   isUserId,
   listAgents,
+  resolveCrewSeats,
+  setCrewSeat,
   recordAgentActivity,
   recordAgentCronPresence,
   requireSameOriginMutation,
@@ -2029,6 +2032,7 @@ async function managedFetchRoute(
           last_user_message_at: summary.presentation?.lastUserMessageAt ?? (summary.turnCount > 0 ? summary.updatedAt : 0),
           presentation: summary.presentation ?? { revision: 0, status: "idle", activeTurnIds: [], updatedAt: 0, done: false, doneAt: null },
           ...(principal.connectGrant ? {} : { may_have_scheduled_jobs: summary.mayHaveScheduledJobs }),
+          ...(summary.crewSeat ? { crew_seat: summary.crewSeat } : {}),
         }])),
       });
     }
@@ -2768,6 +2772,28 @@ async function managedFetchRoute(
       ...(routedTurnId === undefined ? {} : { turn_id: routedTurnId }),
     });
     const stub = env.NANOCODEX_SESSIONS.getByName(agentId, durablePlacementOptions(clientIngressColo));
+    if (resource === "crew-seat") {
+      if (url.search !== "") return json({ error: "invalid_request" }, { status: 400 });
+      if (request.method !== "PUT") return json({ error: "method_not_allowed" }, { status: 405 });
+      if (principal.connectGrant || !principal.capabilities.includes("agents:write")) {
+        return json({ error: "forbidden" }, { status: 403 });
+      }
+      const originFailure = requireSameOriginMutation(request, url, principal);
+      if (originFailure) return originFailure;
+      let input: Readonly<{ crew_id: string; seat_name: string; role: string; coordinator_agent_id?: string }>;
+      try {
+        input = await request.json<typeof input>();
+      } catch {
+        return json({ error: "invalid_json" }, { status: 400 });
+      }
+      try {
+        return json(await setCrewSeat(env, principal.userId, agentId, input));
+      } catch (error) {
+        const status = typeof error === "object" && error !== null && "status" in error
+          && typeof error.status === "number" ? error.status : 503;
+        return json({ error: error instanceof Error ? error.message : "crew_seat_update_failed" }, { status });
+      }
+    }
     if (resource === "share-links" || /^share-links\/[^/]+$/.test(resource)) {
       if (url.search)
         return json({ error: "invalid_request" }, { status: 400 });
@@ -10906,6 +10932,52 @@ export class DurableAgentSession extends DurableComputerObject {
         request: (request, principal) => managedFetch(request, this.env, this.ctx, principal,
           this.#routingOrigin().clientIngressColo),
       })),
+      ...(multiplayer ? [] : [crewMessageTool({
+        sessionId: session.session_id,
+        ownerId: session.owner_id,
+        authorizationEpoch: session.authorization_epoch,
+        authorization: context => {
+          const current = this.#session();
+          const authorization = this.#authorizationForToolContext(context);
+          if (!current || this.#deleting || this.#deleted || this.#durabilityExported || !authorization
+            || authorization.connectGrant !== undefined || current.owner_id !== session.owner_id
+            || current.authorization_epoch !== session.authorization_epoch) return undefined;
+          return { kind: "account_session", userId: current.owner_id,
+            organizationId: current.organization_id, teamId: current.team_id,
+            authorizationEpoch: current.authorization_epoch, role: "writer",
+            subjectId: `user:${current.owner_id}`, credentialId: `crew-message:${context.callId}`,
+            capabilities: authorization.capabilities };
+        },
+        resolve: (sourceAgentId, targetSeatName) => resolveCrewSeats(
+          this.env, session.owner_id, sourceAgentId, targetSeatName,
+        ),
+        messageId: async context => idempotentAgentId(
+          session.owner_id,
+          `crew-message:${await hashText(JSON.stringify([session.session_id, context.turnId, context.callId]))}`,
+        ),
+        deliver: async (message: CrewMessage, principal, context) => {
+          const target = new URL(`/v1/agents/${message.target.agent_id}/turns`, session.public_origin);
+          let response: Response;
+          try {
+            response = await managedFetch(new Request(target, {
+              method: "POST",
+              headers: { "content-type": "application/json", origin: target.origin,
+                "idempotency-key": `crew-message:${message.message_id}` },
+              body: JSON.stringify({ id: message.message_id, input: crewMessagePrompt(message) }),
+              signal: context.signal,
+            }), this.env, this.ctx, principal, this.#routingOrigin().clientIngressColo);
+          } catch (error) {
+            throw new Error("Crew message delivery outcome is unknown. Retry the same tool call.", { cause: error });
+          }
+          if (!response.ok) {
+            await response.body?.cancel();
+            if (response.status >= 500) throw new Error(`Crew message delivery outcome is unknown (HTTP ${response.status}). Retry the same tool call.`);
+            throw new Error(`Crew message delivery failed (HTTP ${response.status})`);
+          }
+          const receipt = await response.json<Record<string, unknown>>().catch(() => ({}));
+          return { turn_id: message.message_id, ...receipt };
+        },
+      })]),
       ...(multiplayer ? [] : workspacePushTools({
         sessionId: session.session_id, ownerId: session.owner_id,
         authorizationEpoch: session.authorization_epoch, origin: session.public_origin,

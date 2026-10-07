@@ -578,6 +578,15 @@ export type AgentSummary = Readonly<{
   turnCount: number;
   mayHaveScheduledJobs: boolean;
   presentation?: AgentPresentation;
+  crewSeat?: CrewSeatSummary;
+}>;
+
+export type CrewSeatSummary = Readonly<{
+  agent_id: string;
+  crew_id: string;
+  seat_name: string;
+  role: string;
+  coordinator_agent_id?: string;
 }>;
 
 type AgentRegistryRow = Readonly<{
@@ -589,6 +598,10 @@ type AgentRegistryRow = Readonly<{
   deleted_at: number | null;
   cron_candidate: number | null;
   presentation: string | null;
+  crew_id: string | null;
+  seat_name: string | null;
+  seat_role: string | null;
+  coordinator_agent_id: string | null;
 }>;
 
 export async function routeAccountRequest(
@@ -1246,6 +1259,45 @@ export async function listAgents(env: AccountAuthEnv, userId: string): Promise<A
   const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/agents");
   if (!response.ok) throw new Error("agent listing failed");
   return response.json<AgentSummary[]>();
+}
+
+export async function resolveCrewSeats(
+  env: AccountAuthEnv,
+  userId: string,
+  sourceAgentId: string,
+  targetSeatName: string,
+): Promise<Readonly<{ source: CrewSeatSummary; target: CrewSeatSummary }>> {
+  const query = new URLSearchParams({ source_agent_id: sourceAgentId, seat_name: targetSeatName });
+  const response = await env.NANOCODEX_USERS.getByName(
+    userId,
+    durablePlacementOptions(env.trustedClientIngressColo),
+  ).fetch(`https://user.internal/crew-seats/resolve?${query}`);
+  if (!response.ok) {
+    const failure: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    throw Object.assign(new Error(failure.error ?? "crew_seat_resolution_failed"), { status: response.status });
+  }
+  return response.json<Readonly<{ source: CrewSeatSummary; target: CrewSeatSummary }>>();
+}
+
+export async function setCrewSeat(
+  env: AccountAuthEnv,
+  userId: string,
+  agentId: string,
+  input: Readonly<{ crew_id: string; seat_name: string; role: string; coordinator_agent_id?: string }>,
+): Promise<CrewSeatSummary> {
+  const response = await env.NANOCODEX_USERS.getByName(
+    userId,
+    durablePlacementOptions(env.trustedClientIngressColo),
+  ).fetch(`https://user.internal/agents/${agentId}/crew-seat`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const failure: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    throw Object.assign(new Error(failure.error ?? "crew_seat_update_failed"), { status: response.status });
+  }
+  return response.json<CrewSeatSummary>();
 }
 
 /** Internal service helpers. These do not authenticate; invoke only after the admin tool gate. */
@@ -2196,6 +2248,13 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     if (!columns.has("cron_candidate")) {
       ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN cron_candidate INTEGER CHECK (cron_candidate IN (0, 1))");
     }
+    if (!columns.has("crew_id")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN crew_id TEXT");
+    if (!columns.has("seat_name")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN seat_name TEXT");
+    if (!columns.has("seat_role")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN seat_role TEXT");
+    if (!columns.has("coordinator_agent_id")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN coordinator_agent_id TEXT");
+    ctx.storage.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_active_crew_seat
+      ON agent_registry (crew_id, seat_name COLLATE NOCASE)
+      WHERE deleted_at IS NULL AND crew_id IS NOT NULL AND seat_name IS NOT NULL`);
   }
 
   async alarm(): Promise<void> {
@@ -2419,7 +2478,8 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         || [...url.searchParams.keys()].some(key => !["limit", "after"].includes(key) || url.searchParams.getAll(key).length !== 1))
         return json({ error: "invalid_admin_page" }, { status: 400 });
       const rows = this.ctx.storage.sql.exec<AgentRegistryRow>(
-        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
          FROM agent_registry WHERE deleted_at IS NULL AND id > ? ORDER BY id LIMIT ?`, after ?? "", limit + 1,
       ).toArray();
       return json({ data: rows.slice(0, limit).map(agentSummary), next_cursor: rows.length > limit ? rows[limit - 1]!.id : null });
@@ -2427,7 +2487,8 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     if (url.pathname === "/agents") {
       if (request.method === "GET") {
         return json(this.ctx.storage.sql.exec<AgentRegistryRow>(
-          `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation
+          `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                  crew_id, seat_name, seat_role, coordinator_agent_id
            FROM agent_registry
            WHERE deleted_at IS NULL
            ORDER BY created_at, id`,
@@ -2463,6 +2524,72 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         }
         return new Response(null, { status: 204 });
       }
+    }
+    if (url.pathname === "/crew-seats/resolve" && request.method === "GET") {
+      const sourceAgentId = url.searchParams.get("source_agent_id") ?? "";
+      const seatName = url.searchParams.get("seat_name") ?? "";
+      if (!isUuid(sourceAgentId) || !/^[A-Za-z][A-Za-z0-9 _-]{0,63}$/.test(seatName)
+        || [...url.searchParams.keys()].some(key => !["source_agent_id", "seat_name"].includes(key))) {
+        return json({ error: "invalid_crew_seat_query" }, { status: 400 });
+      }
+      const source = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry WHERE id = ? AND deleted_at IS NULL`, sourceAgentId,
+      ).toArray()[0];
+      if (!source?.crew_id || !source.seat_name || !source.seat_role) {
+        return json({ error: "source_crew_seat_not_found" }, { status: 404 });
+      }
+      const target = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry
+         WHERE crew_id = ? AND seat_name = ? COLLATE NOCASE AND deleted_at IS NULL`, source.crew_id, seatName,
+      ).toArray()[0];
+      if (!target?.seat_name || !target.seat_role) return json({ error: "target_crew_seat_not_found" }, { status: 404 });
+      return json({ source: crewSeatSummary(source), target: crewSeatSummary(target) });
+    }
+    const crewSeatMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/crew-seat$/);
+    if (crewSeatMatch && request.method === "PUT") {
+      const value = await request.json<unknown>();
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return json({ error: "invalid_crew_seat" }, { status: 400 });
+      }
+      const body = value as Record<string, unknown>;
+      const crewId = typeof body.crew_id === "string" ? body.crew_id.trim() : "";
+      const seatName = typeof body.seat_name === "string" ? body.seat_name.trim() : "";
+      const role = typeof body.role === "string" ? body.role.trim() : "";
+      const coordinatorAgentId = body.coordinator_agent_id;
+      if (Object.keys(body).some(key => !["crew_id", "seat_name", "role", "coordinator_agent_id"].includes(key))
+        || !/^[A-Za-z0-9_-]{1,64}$/.test(crewId)
+        || !/^[A-Za-z][A-Za-z0-9 _-]{0,63}$/.test(seatName)
+        || role.length === 0 || role.length > 512
+        || (coordinatorAgentId !== undefined && !isUuid(coordinatorAgentId))) {
+        return json({ error: "invalid_crew_seat" }, { status: 400 });
+      }
+      const agentId = crewSeatMatch[1]!;
+      if (!this.ctx.storage.sql.exec("SELECT id FROM agent_registry WHERE id = ? AND deleted_at IS NULL", agentId).toArray().length) {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      if (typeof coordinatorAgentId === "string"
+        && !this.ctx.storage.sql.exec("SELECT id FROM agent_registry WHERE id = ? AND deleted_at IS NULL", coordinatorAgentId).toArray().length) {
+        return json({ error: "coordinator_not_found" }, { status: 404 });
+      }
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_registry SET crew_id = ?, seat_name = ?, seat_role = ?, coordinator_agent_id = ?, updated_at = ?
+           WHERE id = ? AND deleted_at IS NULL`,
+          crewId, seatName, role, typeof coordinatorAgentId === "string" ? coordinatorAgentId : null, Date.now(), agentId,
+        );
+      } catch {
+        return json({ error: "crew_seat_conflict" }, { status: 409 });
+      }
+      const row = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry WHERE id = ?`, agentId,
+      ).toArray()[0]!;
+      return json(crewSeatSummary(row));
     }
     const cronMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/cron-presence$/);
     if (cronMatch && request.method === "POST") {
@@ -2560,7 +2687,18 @@ function agentSummary(row: AgentRegistryRow): AgentSummary {
     turnCount: row.turn_count,
     mayHaveScheduledJobs: row.cron_candidate !== 0,
     ...(row.presentation ? { presentation: { done: false, doneAt: null, ...JSON.parse(row.presentation) } as AgentPresentation } : {}),
+    ...(row.crew_id && row.seat_name && row.seat_role ? { crewSeat: crewSeatSummary(row) } : {}),
 
+  };
+}
+
+function crewSeatSummary(row: AgentRegistryRow): CrewSeatSummary {
+  return {
+    agent_id: row.id,
+    crew_id: row.crew_id!,
+    seat_name: row.seat_name!,
+    role: row.seat_role!,
+    ...(row.coordinator_agent_id ? { coordinator_agent_id: row.coordinator_agent_id } : {}),
   };
 }
 
