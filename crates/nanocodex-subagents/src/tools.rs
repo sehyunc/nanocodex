@@ -448,6 +448,29 @@ pub async fn start_agent_with(
     .await
 }
 
+/// Starts a native conversation fork in the existing task tree. The provider
+/// owns the safe fork boundary and preserves its model; mixed-family routing
+/// and model overrides do not apply. Output stays on the child until retrieved.
+pub async fn start_fork_agent(
+    parent: &AgentHandle,
+    registry: &Arc<Registry>,
+    session_id: &str,
+    task: AgentTask,
+) -> AgentToolResult<AgentStartReport> {
+    let host_context = registry.host_context_for_session(session_id).await;
+    start_child(
+        parent,
+        registry,
+        session_id,
+        task,
+        SpawnOptions::new(),
+        host_context,
+        true,
+        None,
+    )
+    .await
+}
+
 async fn start_agent_with_host_context(
     parent: &AgentHandle,
     registry: &Arc<Registry>,
@@ -457,6 +480,32 @@ async fn start_agent_with_host_context(
     host_context: Option<Arc<str>>,
     call: Option<(String, Value)>,
 ) -> AgentToolResult<AgentStartReport> {
+    start_child(
+        parent,
+        registry,
+        session_id,
+        task,
+        options,
+        host_context,
+        false,
+        call,
+    )
+    .await
+}
+
+async fn start_child(
+    parent: &AgentHandle,
+    registry: &Arc<Registry>,
+    session_id: &str,
+    task: AgentTask,
+    options: SpawnOptions,
+    host_context: Option<Arc<str>>,
+    fork: bool,
+    call: Option<(String, Value)>,
+) -> AgentToolResult<AgentStartReport> {
+    if fork && parent.session_id() != session_id {
+        return Err("child caller identity must match its native parent handle".into());
+    }
     let _spawn = registry.spawn_lock.lock().await;
     if let Some((key, input)) = &call
         && let Some(report) = registry.replay_spawn(session_id, key, input).await?
@@ -479,7 +528,7 @@ async fn start_agent_with_host_context(
         Some(host_context) => Some(host_context),
         None => registry.host_context_for_session(session_id).await,
     };
-    let router = registry.spawn_router();
+    let router = if fork { None } else { registry.spawn_router() };
     let route = if let Some(router) = &router {
         let route = router
             .resolve_spawn(session_id, &role, &task, options, host_context.as_deref())
@@ -489,14 +538,18 @@ async fn start_agent_with_host_context(
     } else {
         None
     };
-    let (child, events) = parent
-        .spawn_with_host_context(
-            route
-                .as_ref()
-                .map_or(options, |route| route.options(options)),
-            host_context.as_ref().map(Arc::clone),
-        )
-        .await?;
+    let (child, events) = if fork {
+        parent.fork().await?
+    } else {
+        parent
+            .spawn_with_host_context(
+                route
+                    .as_ref()
+                    .map_or(options, |route| route.options(options)),
+                host_context.as_ref().map(Arc::clone),
+            )
+            .await?
+    };
     if let (Some(router), Some(route)) = (&router, &route)
         && let Err(error) = router.bind(
             session_id,
@@ -1341,10 +1394,10 @@ mod strict_spawn_tests {
             ] }
         });
         assert!(validator.is_valid(&valid));
-        assert!(
-            !validator.is_valid(&json!({ "role": "audit", "task": "check", "model": null,
-            "thinking": null, "output_contract": [] }))
-        );
+        assert!(!validator.is_valid(
+            &json!({ "role": "audit", "task": "check", "harness": null, "model": null,
+            "thinking": null, "output_contract": [] })
+        ));
         let mut misplaced = valid;
         misplaced["required"] = json!(["summary"]);
         assert!(!validator.is_valid(&misplaced));

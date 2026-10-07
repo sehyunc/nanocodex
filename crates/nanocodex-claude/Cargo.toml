@@ -22,10 +22,10 @@ sha2.workspace = true
 regex.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 url.workspace = true
-nanocodex-claude-tools = { path = "../nanocodex-claude-tools", version = "0.6.6", default-features = false, optional = true }
+nanocodex-claude-tools = { path = "../nanocodex-claude-tools", version = "0.6.7", default-features = false, optional = true }
 futures-util.workspace = true
 nanocodex-oai-tools = { workspace = true, optional = true }
-nanocodex-agent = { path = "../nanocodex-agent", version = "0.6.6", default-features = false }
+nanocodex-agent = { path = "../nanocodex-agent", version = "0.6.7", default-features = false }
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 web-time.workspace = true
 uuid.workspace = true
@@ -33,6 +33,9 @@ reqwest = { workspace = true, features = ["stream", "gzip", "brotli", "deflate",
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }

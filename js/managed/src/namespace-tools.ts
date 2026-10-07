@@ -1,3 +1,4 @@
+import { BACKGROUND_BROWSER_INSTRUCTIONS } from "./execution-preferences";
 import type { ToolMap } from "nanocodex";
 import { observeHandCall } from "./hand-call-observation";
 import { CUA_JS_NAME, CUA_RESET_NAME } from "nanocodex-computer/contract";
@@ -53,7 +54,9 @@ type MountedHand = Readonly<{
   preview?: RoutedTool;
   cua?: RoutedTool;
   cuaReset?: RoutedTool;
+  cuaBackend?: "upstream" | "native_screen";
   screen?: RoutedTool;
+  computerDeferred?: boolean;
 }>;
 
 type CellBinding = Readonly<{
@@ -132,7 +135,8 @@ export type NamespaceCaptureFilter = (machine: NamespaceMachine) => boolean;
 
 export type NamespaceExecutionRuntime = Readonly<{
   tools: ToolMap;
-  capture(context: ToolContext, filter?: NamespaceCaptureFilter): void;
+  capture(context: ToolContext, filter?: NamespaceCaptureFilter, extend?: boolean, deferComputer?: boolean): void;
+  hasRoute(context: ToolContext, workdir: string, computer?: boolean): boolean;
 }>;
 
 /**
@@ -148,6 +152,7 @@ export function createNamespaceExecutionRuntime(
   authorizationKey: (context: ToolContext) => string = () => "account",
   processStorage?: NamespaceProcessStorage,
   threadId?: string,
+  recoverProcessTool?: (binding: DurableProcessBinding, context: ToolContext) => RoutedTool | undefined,
 ): NamespaceExecutionRuntime {
   const correlation = (context: ToolContext) => ({ thread_id: threadId, session_id: context.sessionId,
     turn_id: context.turnId, parent_call_id: context.parentCallId });
@@ -159,8 +164,36 @@ export function createNamespaceExecutionRuntime(
   }) satisfies MountedHand;
   const cells = new Map<string, AuthorizedCellBinding>();
   const sessions = new Map<number, ProcessBinding>();
+  // Discovery selects a backend once for this exact captured Hand. Never retry
+  // a failed probe or retarget an action after publication changes.
+  const dynamicComputers = new WeakMap<MountedHand, Promise<MountedHand>>();
+  const discoverDynamicComputer = async (hand: MountedHand, context: ToolContext): Promise<MountedHand> => {
+    const result = await hand.cua!.handler({}, context);
+    context.signal.throwIfAborted();
+    const payload = isToolResult(result) ? result.structuredResult ?? result.output : result;
+    const decoded = typeof payload === "string" ? JSON.parse(payload) : payload;
+    const content = decoded?.content;
+    const receipt = Array.isArray(content)
+      ? JSON.parse(content.find((item: { type?: string; text?: string }) => item.type === "text")?.text ?? "null") : decoded;
+    if (receipt?.status === "preparing") {
+      if (!hand.screen) throw new Error(`Computer components for ${hand.root} are preparing; discover in a new Code Mode cell`);
+      return Object.freeze({ ...hand, ...nativeScreenCua(hand.screen), cuaBackend: "native_screen" });
+    }
+    if (receipt?.status !== "ready" || !Array.isArray(receipt.definitions))
+      throw new Error("Invalid dynamic CUA discovery receipt");
+    const providerTool = (name: string, gateway: RoutedTool): RoutedTool => {
+      const definition = receipt.definitions.find((entry: { name?: string }) => entry.name === name);
+      if (!definition || typeof definition.description !== "string" || !definition.parameters)
+        throw new Error(`Dynamic CUA provider has no ${name} contract`);
+      return Object.freeze({ definition, handler: gateway.handler });
+    };
+    return Object.freeze({ ...hand,
+      cua: withNativeRecording(providerTool("js", hand.cua!), hand.screen),
+      cuaReset: providerTool("js_reset", hand.cuaReset!),
+    });
+  };
 
-  const cell = (context: ToolContext, filter?: NamespaceCaptureFilter): AuthorizedCellBinding => {
+  const cell = (context: ToolContext, filter?: NamespaceCaptureFilter, extend = false, deferComputer = false): AuthorizedCellBinding => {
     // Direct tools have an empty parentCallId. Pin those to their own call,
     // while nested Code Mode tools keep sharing their parent's captured lease.
     const key = `${context.sessionId}\u0000${context.parentCallId || context.callId}`;
@@ -168,10 +201,10 @@ export function createNamespaceExecutionRuntime(
     const authority = authorizationKey(context);
     if (retained !== undefined) {
       if (retained.authorizationKey !== authority) throw new Error("namespace cell belongs to another authorization");
-      return retained;
+      if (!extend) return retained;
     }
     const created = Object.freeze({
-      ...createCellBinding(brain, machines(context).filter(filter ?? (() => true)), resolveMachineTool, context, key, resolveScreenTool),
+      ...createCellBinding(brain, machines(context).filter(filter ?? (() => true)), resolveMachineTool, context, key, resolveScreenTool, retained, deferComputer),
       authorizationKey: authority,
     });
     cells.set(key, created);
@@ -215,12 +248,26 @@ export function createNamespaceExecutionRuntime(
       observeHandCall("namespace.route", name, routeStarted, "unavailable", context.callId, correlation(context));
       throw error;
     }
-    const hand = binding.hands.get(route.mount.mountId);
+    let hand = binding.hands.get(route.mount.mountId);
+    const providerInput = without(value, "workdir");
+    if (hand?.cua?.definition?.description?.startsWith("NANOCODEX_DYNAMIC_CUA_V1.")) {
+      let pending = dynamicComputers.get(hand);
+      if (!pending) {
+        if (name !== CUA_JS_NAME || Object.keys(providerInput).length !== 0)
+          throw new Error("Discover this Hand with only workdir before sending dynamic CUA input");
+        context.signal.throwIfAborted();
+        pending = discoverDynamicComputer(hand, context);
+        dynamicComputers.set(hand, pending);
+      }
+      hand = await pending;
+      // Recheck the captured cell's authority after the remote discovery await.
+      cell(context);
+    }
     if (!hand?.cua || !hand.cuaReset) {
       observeHandCall("namespace.invoke", name, routeStarted, "unavailable", context.callId, correlation(context));
-      throw new Error(`namespace mount ${route.mount.root} has no CUA runtime or controllable native screen. Use environment to find a CUA-capable Hand.`);
+      if (route.mount.root === DEFAULT_CWD) throw new Error("/brain has no desktop. Use an explicit Hand workdir for CUA.");
+      throw new Error(`CUA is unavailable for ${route.mount.root} in this cell's captured routes. No action was dispatched. A screen publisher may be disconnected or reconnecting; discover this same workdir in a new Code Mode cell before sending input. Use environment to inspect current Hand availability.`);
     }
-    const providerInput = without(value, "workdir");
     // JS with only a workdir discovers the actual provider API without executing
     // anything. Reset with only a workdir still invokes the provider's empty reset.
     if (name === CUA_JS_NAME && Object.keys(providerInput).length === 0) {
@@ -233,10 +280,12 @@ export function createNamespaceExecutionRuntime(
         }
         return { ...definition, name: toolName };
       });
+      observeHandCall("namespace.invoke", name, routeStarted, "ok", context.callId, correlation(context));
       return { workdir: hand.root, machine_id: hand.machineId,
-        tools: [CUA_JS_NAME, CUA_RESET_NAME], definitions,
+        backend: hand.cuaBackend, tools: [CUA_JS_NAME, CUA_RESET_NAME], definitions,
+        browser_interaction: BACKGROUND_BROWSER_INSTRUCTIONS,
         browser_selection: "For providers exposing cua.createBrowserTab, browser display names are not necessarily accepted identifiers. OpenAI's provider accepts lowercase family aliases (for example 'brave', not 'Brave Browser') or exact discovered browser IDs. Reuse an ID from current provider state; when browser/profile selection is ambiguous, inspect the provider's browser inventory first and match the requested instance. Do not guess IDs or silently retry a browser action with a different target.",
-        native_app_recovery: "For native macOS providers exposing cua.getApp, app selection may launch only in the background. If its initial observation stalls, follow any required js_reset, then use supported CUA and an observed app launcher (for example its item in Finder) to open the intended app normally before selecting it again. After a transient menu or window closes, cgWindowNotFound can mean the bound window is gone; select the same app again and inspect fresh state. Do not replay input actions, modify permissions, or switch automation backends to recover.",
+        native_app_recovery: "For native macOS providers exposing cua.getApp, app selection may launch only in the background. If its initial observation stalls, follow any required js_reset, then use supported CUA and an observed app launcher only when foreground interaction with that app is authorized. Do not use this recovery to take over the user's browser when background tab APIs are unavailable. After a transient menu or window closes, cgWindowNotFound can mean the bound window is gone; select the same app again and inspect fresh state. Do not replay input actions, modify permissions, or switch automation backends to recover.",
         routing: "Add the Hand workdir to each provider call. Nanocodex consumes workdir for routing and forwards all other arguments unchanged. Calls dispatch immediately; use the provider’s contract and errors to handle concurrent JS and reset calls." };
     }
     const tool = name === CUA_JS_NAME ? hand.cua : hand.cuaReset;
@@ -262,7 +311,7 @@ export function createNamespaceExecutionRuntime(
 
   const tools: ToolMap = {
     [CUA_JS_NAME]: {
-      description: "Use a Hand's CUA provider. Set workdir on every call, just like exec_command. First call with only {workdir} to read that Hand's exact descriptions and schemas without executing an action; then add those provider arguments alongside workdir. OpenAI CUA is preferred when attached; VM, Cloudflare, and native Hands can fall back to their controllable screen action contract. Nanocodex strips only workdir before forwarding. Calls dispatch immediately; follow the provider’s contract for concurrent calls. /brain has no desktop.",
+      description: "Use a Hand's CUA provider. Set workdir on every call, just like exec_command. First call with only {workdir} to read that Hand's exact descriptions and schemas without executing an action; then add those provider arguments alongside workdir. OpenAI Sky/CUA is preferred when attached. For browser work use its browser API and agent-owned background tabs/tab groups; preserve the user’s foreground focus. Use native browser-window input only when the browser API cannot handle the task. VM, Cloudflare, and native Hands can fall back to their controllable screen action contract. Nanocodex strips only workdir before forwarding. Calls dispatch immediately; follow the provider’s contract for concurrent calls. /brain has no desktop.",
       parameters: computerParameters,
       supportsParallelToolCalls: true,
       handler: (input, context) => computerCall(CUA_JS_NAME, input, context),
@@ -373,7 +422,7 @@ export function createNamespaceExecutionRuntime(
         // Recheck mount authority and immutable provider identity on every
         // durable poll. A matching path/machine ID alone cannot retarget it.
         const writeStdin = durable === undefined ? retained?.writeStdin
-          : resolveMachineTool(durable.machineId, "write_stdin", context);
+          : recoverProcessTool?.(durable, context) ?? resolveMachineTool(durable.machineId, "write_stdin", context);
         if (writeStdin === undefined || (durable !== undefined
           && writeStdin.processSessionKey !== durable.processSessionKey)) {
           throw new Error("unknown or stale namespace process session");
@@ -434,7 +483,14 @@ export function createNamespaceExecutionRuntime(
   };
   return Object.freeze({
     tools,
-    capture: (context: ToolContext, filter?: NamespaceCaptureFilter) => { void cell(context, filter); },
+    capture: (context: ToolContext, filter?: NamespaceCaptureFilter, extend = false, deferComputer = false) => { void cell(context, filter, extend, deferComputer); },
+    hasRoute: (context, workdir, computer = false) => {
+      const retained = cells.get(`${context.sessionId}\u0000${context.parentCallId || context.callId}`);
+      if (!retained || retained.authorizationKey !== authorizationKey(context)) return false;
+      const cwd = canonicalCwd(retained, workdir);
+      return [...retained.hands.values()].some(hand => (!computer || !hand.computerDeferred)
+        && (cwd === hand.root || cwd.startsWith(`${hand.root}/`)));
+    },
   });
 }
 
@@ -460,22 +516,46 @@ function createCellBinding(
   context: ToolContext,
   key: string,
   resolveScreenTool: ScreenToolResolver,
+  retained?: CellBinding,
+  deferComputer = false,
 ): CellBinding {
-  const hands: MountedHand[] = [brain];
-  const roots = new Set([brain.root]);
-  const aliases = new Map<string, string>();
+  // Completing discovery adds routes; it never replaces a handle already pinned
+  // by this cell, even if its publisher has reconnected in the meantime.
+  const hands: MountedHand[] = retained ? [...retained.hands.values()] : [brain];
+  const roots = new Set(hands.map(hand => hand.root));
+  const pinned = new Set(hands.map(hand => hand.machineId));
+  const aliases = new Map(retained?.aliases);
   const keyHash = stableHash(key);
-  for (const machine of sourceMachines) {
-    const root = machine.root ?? machineMountRoot(machine.id);
-    if (roots.has(root)) throw new Error(`duplicate namespace mount root ${root}`);
-    roots.add(root);
-    const screen = resolveScreenTool(machine.id, context);
-    const upstreamCua = resolveMachineTool(machine.id, CUA_JS_NAME, context);
-    const upstreamReset = resolveMachineTool(machine.id, CUA_RESET_NAME, context);
+  const captureComputer = (machineId: string): Pick<MountedHand, "cua" | "cuaReset" | "cuaBackend" | "screen" | "computerDeferred"> => {
+    if (deferComputer) return { computerDeferred: true };
+    const screen = resolveScreenTool(machineId, context);
+    const upstreamCua = resolveMachineTool(machineId, CUA_JS_NAME, context);
+    const upstreamReset = resolveMachineTool(machineId, CUA_RESET_NAME, context);
     const upstream = upstreamCua !== undefined && upstreamReset !== undefined
       ? { cua: upstreamCua, cuaReset: upstreamReset } : undefined;
     const fallback = upstream === undefined && screen !== undefined
       ? nativeScreenCua(screen) : undefined;
+    return {
+      cua: upstream ? withNativeRecording(upstream.cua, screen) : fallback?.cua,
+      cuaReset: upstream?.cuaReset ?? fallback?.cuaReset,
+      cuaBackend: upstream ? "upstream" : fallback ? "native_screen" : undefined,
+      screen,
+      computerDeferred: false,
+    };
+  };
+  for (const machine of sourceMachines) {
+    if (pinned.has(machine.id)) {
+      const index = hands.findIndex(hand => hand.machineId === machine.id);
+      // Only the initial computer capture was deferred. Preserve all shell and
+      // process handles, and never refresh a captured (even unavailable) CUA pair.
+      if (!deferComputer && hands[index].computerDeferred) {
+        hands[index] = Object.freeze({ ...hands[index], ...captureComputer(machine.id) });
+      }
+      continue;
+    }
+    const root = machine.root ?? machineMountRoot(machine.id);
+    if (roots.has(root) || aliases.has(root)) throw new Error(`duplicate namespace mount root ${root}`);
+    roots.add(root);
     hands.push(Object.freeze({
       mountId: `mount:user:${machine.id}`,
       machineId: machine.id,
@@ -484,9 +564,7 @@ function createCellBinding(
       exec: resolveMachineTool(machine.id, "exec_command", context),
       writeStdin: resolveMachineTool(machine.id, "write_stdin", context),
       preview: resolveMachineTool(machine.id, "preview", context),
-      cua: upstream ? withNativeRecording(upstream.cua, screen) : fallback?.cua,
-      cuaReset: upstream?.cuaReset ?? fallback?.cuaReset,
-      screen,
+      ...captureComputer(machine.id),
     }));
   }
   const manifest = createNamespaceManifest({
@@ -501,6 +579,7 @@ function createCellBinding(
     })),
   });
   for (const machine of sourceMachines) {
+    if (pinned.has(machine.id)) continue;
     const root = machine.root ?? machineMountRoot(machine.id);
     for (const alias of machine.aliases ?? []) {
       if (alias === root) continue;

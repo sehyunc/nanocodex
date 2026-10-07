@@ -197,7 +197,7 @@ struct InboxView: View {
     @State private var mainSurface: MainSurface = (ProcessInfo.processInfo.arguments.contains("--demo")
         && !ProcessInfo.processInfo.arguments.contains("--todo-ui-fixture")) ? .chat : .todo
     @State private var newThreadInputFocused = false
-    private enum MainSurface: Hashable { case todo, chat, crm, meetings, apps }
+    private enum MainSurface: Hashable { case todo, chat, crm, meetings, memories, apps }
     @State private var selectedGeneratedApp: String?
     @State private var showCreateApp = false
     @State private var showConversations = false
@@ -237,6 +237,9 @@ struct InboxView: View {
                         MeetingsHomeView(model: model) { showMeeting = true }
                     } else if model.connected && mainSurface == .crm {
                         CRMView(model: model)
+                    } else if model.connected && mainSurface == .memories {
+                        MemoriesView(model: model)
+                            .id(model.vaultIntakeAccount)
                     } else if model.connected && mainSurface == .apps {
                         GeneratedAppsView(model: model, selection: $selectedGeneratedApp, create: { showCreateApp = true }, openChat: { selectMainSurface(.chat); model.openThread() })
                     } else { inbox }
@@ -448,6 +451,7 @@ struct InboxView: View {
             mainNavigationButton(.chat, title: "Chat", symbol: "bubble.left", identifier: "main-tab-chat")
             mainNavigationButton(.crm, title: "CRM", symbol: "person.2", identifier: "main-tab-crm")
             mainNavigationButton(.meetings, title: "Meetings", symbol: "text.bubble", identifier: "main-tab-meetings")
+            mainNavigationButton(.memories, title: "Memories", symbol: "folder", identifier: "main-tab-memories")
             if !model.isDemo || !model.generatedApps.isEmpty {
                 Menu {
                     ForEach(model.generatedApps) { app in
@@ -1237,12 +1241,14 @@ private struct AgentComposerView: View {
     @State private var showFiles = false
     @State private var showAttachmentMenu = false
     @State private var attachmentAction: AttachmentAction?
+    @State private var attachmentMenuTarget: InboxModel.AttachmentTarget?
     @State private var selectedPhotos: [PhotosPickerItem] = []
+    @State private var photosFilter: PHPickerFilter = .any(of: [.images, .videos])
     @State private var photoTarget: InboxModel.AttachmentTarget?
     @State private var fileTarget: InboxModel.AttachmentTarget?
     @State private var pickerError: String?
     @State private var queueContentHeight: CGFloat = 64
-    private enum AttachmentAction { case camera, photos, files, context }
+    private enum AttachmentAction { case camera, photos, videos, files, recentPhotos([NSItemProvider]) }
     #if os(iOS)
     @State private var showCamera = false
     @State private var cameraTarget: InboxModel.AttachmentTarget?
@@ -1378,16 +1384,15 @@ private struct AgentComposerView: View {
                 Text(error).font(.caption).foregroundStyle(Ink.muted).frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16).padding(.vertical, 8).accessibilityIdentifier("attachment-error")
             }
-            if card?.model.hasPrefix("claude-") == true {
-                Text("Claude supports text messages only. Attachments and voice are not available.")
-                    .font(.caption).foregroundStyle(Ink.muted).padding(.horizontal, 16).padding(.vertical, 8)
-                    .accessibilityIdentifier("claude-text-only")
-            }
             if !attachments.isEmpty {
                 composerText.frame(minHeight: 52, alignment: .topLeading).padding(.horizontal, 12)
             }
             HStack(alignment: .bottom, spacing: 2) {
-                Button { focused = false; showAttachmentMenu = true } label: {
+                Button {
+                    focused = false
+                    attachmentMenuTarget = model.captureAttachmentTarget()
+                    showAttachmentMenu = true
+                } label: {
                     Image(systemName: "plus").frame(width: 44, height: 44).contentShape(Rectangle())
                 }.accessibilityLabel("Add attachments").accessibilityIdentifier("add-attachments")
                     .disabled(!model.focusedSupportsRichInput)
@@ -1443,29 +1448,14 @@ private struct AgentComposerView: View {
                 focused = false
             }
             .sheet(isPresented: $showAttachmentMenu, onDismiss: openSelectedAttachmentAction) {
-                NavigationStack {
-                    List {
-                        Section {
-                            attachmentOption("Photos & Videos", icon: "photo.on.rectangle", action: .photos, identifier: "choose-photos")
-                            attachmentOption("Camera", icon: "camera", action: .camera, identifier: "choose-camera")
-                            attachmentOption("Files", icon: "folder", action: .files, identifier: "choose-files")
-                        }
-                        Section {
-                            attachmentOption("Context from other apps", icon: "tray.full", action: .context, identifier: "choose-context")
-                        }
-                    }
-                    .navigationTitle("Add to conversation")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") { showAttachmentMenu = false }
-                        }
-                    }
-                }
-                .tint(Ink.accent)
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-                .presentationCornerRadius(30)
+                AttachmentLibrarySheet(
+                    isPreparing: model.preparingAttachments,
+                    onCamera: { chooseAttachmentAction(.camera) },
+                    onPhotos: { chooseAttachmentAction(.photos) },
+                    onFiles: { chooseAttachmentAction(.files) },
+                    onVideos: { chooseAttachmentAction(.videos) },
+                    onRecentPhotos: { chooseAttachmentAction(.recentPhotos($0)) }
+                )
             }
             .sheet(isPresented: $showExpandedEditor) {
                 ExpandedAgentComposer(
@@ -1497,7 +1487,7 @@ private struct AgentComposerView: View {
                 Button("Cancel", role: .cancel) {}
             } message: { Text("Enable Camera in Settings to take a photo for your message.") }
             #endif
-            .photosPicker(isPresented: $showPhotos, selection: $selectedPhotos, maxSelectionCount: nil, matching: .any(of: [.images, .videos]), preferredItemEncoding: .current)
+            .photosPicker(isPresented: $showPhotos, selection: $selectedPhotos, maxSelectionCount: nil, matching: photosFilter, preferredItemEncoding: .current)
             .task(id: showPhotos ? [] : selectedPhotos) {
                 // Selection can arrive in several updates. Keep the picker binding
                 // intact until dismissal, then import the complete batch once.
@@ -1539,37 +1529,36 @@ private struct AgentComposerView: View {
                     }
     }
 
-    private func attachmentOption(_ title: String, icon: String, action: AttachmentAction, identifier: String) -> some View {
-        Button {
-            attachmentAction = action
-            showAttachmentMenu = false
-        } label: {
-            Label(title, systemImage: icon).frame(minHeight: 32)
-        }
-        .disabled(model.preparingAttachments)
-        .accessibilityIdentifier(identifier)
+    private func chooseAttachmentAction(_ action: AttachmentAction) {
+        attachmentAction = action
+        showAttachmentMenu = false
     }
 
     private func openSelectedAttachmentAction() {
+        let target = attachmentMenuTarget
+        attachmentMenuTarget = nil
         guard let action = attachmentAction else { return }
         attachmentAction = nil
         switch action {
         case .camera:
-            Task { await openCamera() }
-        case .photos:
-            guard let target = model.captureAttachmentTarget() else { return }
+            guard let target else { return }
+            Task { await openCamera(target: target) }
+        case .photos, .videos:
+            photosFilter = if case .videos = action { .videos } else { .any(of: [.images, .videos]) }
+            guard let target else { return }
             photoTarget = target; selectedPhotos = []; pickerError = nil; showPhotos = true
         case .files:
-            guard let target = model.captureAttachmentTarget() else { return }
+            guard let target else { return }
             fileTarget = target; pickerError = nil; showFiles = true
-        case .context:
-            model.showContext = true
+        case .recentPhotos(let providers):
+            guard let target else { return }
+            pickerError = nil
+            model.importAttachmentProviders(providers, target: target)
         }
     }
 
     #if os(iOS)
-    @MainActor private func openCamera() async {
-        guard let target = model.captureAttachmentTarget() else { return }
+    @MainActor private func openCamera(target: InboxModel.AttachmentTarget) async {
         pickerError = nil
         guard UIImagePickerController.isSourceTypeAvailable(.camera) else {
             pickerError = "Camera is unavailable on this device. Choose Photos or Files instead."
@@ -3859,6 +3848,12 @@ private struct VaultIntakeCard: View {
                 .font(.headline)
             if verificationSubmitted { Text("Browser verification is pending.") } else if let receipt {
                 Text(receipt.name).font(.subheadline)
+                if let totp = receipt.totp {
+                    Text(totp.issuer + " · " + totp.account).font(.subheadline)
+                    Text(totp.origin).font(.caption)
+                    Text("\(totp.algorithm) · \(totp.digits) digits · \(totp.period) seconds")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 if !intake.name.isEmpty { Text(intake.name).font(.subheadline) }
                 if let origin = intake.origin { Text(origin).font(.caption).textSelection(.enabled) }
@@ -3897,6 +3892,9 @@ private struct VaultLoginSheet: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var name = ""
     @State private var values: [String: String] = [:]
+    @State private var totpMethod = "uri"
+    @State private var totpAlgorithm = "SHA1"
+    @State private var totpDigits = "6"
     @State private var account = UUID()
     @State private var submission: Task<Void, Never>?
     @State private var saving = false
@@ -3905,6 +3903,12 @@ private struct VaultLoginSheet: View {
 
     private var fields: [(key: String, label: String, secure: Bool, max: Int)] {
         switch intake.kind {
+        case "totp":
+            let origin = [(key: "origin", label: "Website (https://example.com)", secure: false, max: 2048)]
+            return origin + (totpMethod == "uri"
+                ? [("otpauth_uri", "otpauth:// setup URI", true, 4096)]
+                : [("issuer", "Issuer", false, 256), ("account", "Account", false, 256),
+                   ("seed", "Setup key (Base32)", true, 208), ("period", "Period in seconds (15–120)", false, 3)])
         case "api_key": return [("api_key", "API key", true, 8192)]
         case "card": return [("card_number", "Card number", true, 32), ("expiry_month", "Expiry month", false, 2), ("expiry_year", "Expiry year", false, 4), ("cvv", "Security code", true, 4), ("billing_zip", "Billing postal code", false, 32)]
         case "address": return [("address_line_1", "Address", false, 256), ("address_line_2", "Address line 2 (optional)", false, 256), ("city", "City", false, 120), ("state", "State", false, 120), ("zip", "Postal code", false, 32), ("country", "Country", false, 120)]
@@ -3913,7 +3917,15 @@ private struct VaultLoginSheet: View {
         }
     }
     private var valid: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.utf8.count <= 120
+        if intake.kind == "totp" {
+            let origin = values["origin"] ?? ""
+            guard VaultIntake.parse(.object(["type": .string("vault_intake"), "status": .string("input_required"),
+                "kind": .string("login"), "origin": .string(origin)]))?.origin == origin else { return false }
+            if totpMethod == "seed" {
+                guard let period = Int(values["period"] ?? ""), (15...120).contains(period) else { return false }
+            }
+        }
+        return !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && name.utf8.count <= 120
             && fields.allSatisfy { field in
                 let value = values[field.key] ?? ""
                 return (field.key == "address_line_2" || !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) && value.utf8.count <= field.max
@@ -3925,6 +3937,21 @@ private struct VaultLoginSheet: View {
             Form {
                 Section {
                     TextField("Name", text: $name).accessibilityIdentifier("vault-intake-name")
+                    if intake.kind == "totp" {
+                        Picker("Setup method", selection: $totpMethod) {
+                            Text("Setup URI").tag("uri")
+                            Text("Setup key").tag("seed")
+                        }.accessibilityIdentifier("vault-intake-totp-method")
+                        .onChange(of: totpMethod) { _, _ in
+                            values["seed"] = nil; values["otpauth_uri"] = nil
+                        }
+                        if totpMethod == "seed" {
+                            Picker("Algorithm", selection: $totpAlgorithm) {
+                                Text("SHA1").tag("SHA1"); Text("SHA256").tag("SHA256"); Text("SHA512").tag("SHA512")
+                            }
+                            Picker("Digits", selection: $totpDigits) { Text("6").tag("6"); Text("8").tag("8") }
+                        }
+                    }
                     ForEach(fields, id: \.key) { field in
                         let binding = Binding<String>(get: { values[field.key] ?? "" }, set: { values[field.key] = $0 })
                         Group {
@@ -3935,7 +3962,7 @@ private struct VaultLoginSheet: View {
                         .privacySensitive().accessibilityIdentifier("vault-intake-" + field.key)
                     }
                 } footer: {
-                    Text("Credentials are sent directly to your encrypted Vault, never as a chat message.")
+                    Text(intake.kind == "totp" ? "The setup key goes directly to your encrypted Vault. Codes can be used only at this website and stay out of chat." : "Credentials are sent directly to your encrypted Vault, never as a chat message.")
                 }
                 if let origin = intake.origin {
                     Section("Website (optional)") { Text(origin).font(.subheadline) }
@@ -3947,7 +3974,11 @@ private struct VaultLoginSheet: View {
                         submission = Task { @MainActor in
                             defer { clear(); saving = false }
                             do {
-                                var payload = values.filter { !$0.value.isEmpty }
+                                let activeKeys = Set(fields.map(\.key))
+                                var payload = values.filter { activeKeys.contains($0.key) && !$0.value.isEmpty }
+                                if intake.kind == "totp", totpMethod == "seed" {
+                                    payload["algorithm"] = totpAlgorithm; payload["digits"] = totpDigits
+                                }
                                 payload["name"] = name.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if let origin = intake.origin { payload["browser_origin"] = origin }
                                 let receipt = try await model.saveVaultItem(kind: intake.kind, values: payload, account: account)
@@ -3981,6 +4012,7 @@ private struct VaultLoginSheet: View {
         .task {
             account = model.vaultIntakeAccount
             name = intake.name
+            if intake.kind == "totp" { values["period"] = "30" }
         }
         .onDisappear { submission?.cancel(); clear() }
         .onChange(of: model.vaultIntakeAccount) { _, _ in submission?.cancel(); clear(); dismiss() }

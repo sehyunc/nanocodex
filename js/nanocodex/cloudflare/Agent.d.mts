@@ -142,8 +142,8 @@ export declare namespace createEphemeral {
 }
 
 /** Reads a correlated receipt without acquiring or restoring the agent. */
-export function steerReceipt(owner: DurableObjectOwner, operationId: string, messageId: string): Readonly<{
+export function steerReceipt(owner: DurableObjectOwner, operationId: string, messageId: string): Promise<Readonly<{
   input_key: string; index: number; withdrawn: boolean;
-}> | null;
+}> | null>;
 /** Fingerprint of the exact browser Prompt serialization retained by Rust. */
 export function steerInputKey(input: import("../types.mjs").PromptInput): Promise<string>;

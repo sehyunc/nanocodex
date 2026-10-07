@@ -79,6 +79,15 @@ where
             .prepare_request_policy(self.continuation_policy());
 
         if !resumed {
+            let history_len = session.conversation.managed.history().len();
+            if let Some(update) = session.conversation.reasoning.sampling_update(
+                self.model,
+                self.thinking,
+                self.config.supports_reasoning_effort_updates(self.model),
+                history_len,
+            ) {
+                session.conversation.append([update]);
+            }
             self.retain_execution(&session, ExecutionPhase::Compact)
                 .await?;
         }
@@ -95,6 +104,11 @@ where
                 active_context_tokens,
                 auto_compact_token_limit,
                 &session.factory,
+                session.conversation.reasoning.request_effort(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                ),
             );
             tokio::pin!(compaction);
             tokio::select! {
@@ -552,6 +566,15 @@ where
         };
 
         if !resumed {
+            let history_len = session.conversation.managed.history().len();
+            if let Some(update) = session.conversation.reasoning.sampling_update(
+                self.model,
+                self.thinking,
+                self.config.supports_reasoning_effort_updates(self.model),
+                history_len,
+            ) {
+                session.conversation.append([update]);
+            }
             self.retain_execution(&session, phase).await?;
         }
         match phase {
@@ -572,8 +595,13 @@ where
                 }
             }
             ExecutionPhase::Warmup => {
+                let request_effort = session.conversation.reasoning.request_effort(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                );
                 let warmup = {
-                    let warmup = self.perform_warmup(&session.factory);
+                    let warmup = self.perform_warmup(&session.factory, request_effort);
                     tokio::pin!(warmup);
                     tokio::select! {
                         biased;
@@ -587,6 +615,16 @@ where
                 };
                 match warmup {
                     Ok(outcome) => {
+                        if outcome.baseline_established {
+                            // Only completed warmup may establish a baseline without
+                            // an authored configuration item. Failed/skipped warmup
+                            // leaves sampling responsible for the initial update.
+                            session.conversation.reasoning.pin(
+                                self.model,
+                                self.thinking,
+                                self.config.supports_reasoning_effort_updates(self.model),
+                            );
+                        }
                         session
                             .conversation
                             .observe_server_reasoning(outcome.server_reasoning_included);
@@ -622,10 +660,6 @@ where
                 ));
             }
         }
-        if phase != ExecutionPhase::Generate {
-            self.retain_execution(&session, ExecutionPhase::Generate)
-                .await?;
-        }
 
         let outcome = {
             let task = self.drive_session(
@@ -648,11 +682,12 @@ where
         }
     }
 
-    pub(super) const fn continuation_policy(&self) -> ContinuationPolicy {
+    pub(super) fn continuation_policy(&self) -> ContinuationPolicy {
         ContinuationPolicy {
             model: self.model,
             thinking: self.thinking,
             fast_mode: self.fast_mode,
+            reasoning_effort_updates: self.config.supports_reasoning_effort_updates(self.model),
         }
     }
 
@@ -814,9 +849,27 @@ where
                 self.drain_steers(&mut session.conversation, &mut pending_steers, call_index)
                     .await?;
             }
-            // The restored batch can contain a completed foreground receipt.
-            // Replay it before advancing; the initial boundary was already saved.
+            // Advancing a recovered first batch would retire effects awaiting replay.
+            if first_batch && resumed {
+                // Legacy Generate continuations have no reasoning sidecar. Preserve
+                // their exact request and effects, then retain its baseline in memory.
+                session.conversation.reasoning.pin(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                );
+            }
             if !first_batch {
+                let history_len = session.conversation.managed.history().len();
+                let update = session.conversation.reasoning.sampling_update(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                    history_len,
+                );
+                if let Some(update) = update {
+                    session.conversation.append([update]);
+                }
                 self.retain_execution(session, ExecutionPhase::Generate)
                     .await?;
             }
@@ -847,6 +900,7 @@ where
                 usage,
                 ..
             } = response;
+            let previous_history = session.conversation.shared_history();
             session
                 .conversation
                 .managed
@@ -860,6 +914,10 @@ where
                 .map_err(|_| NanocodexError::MalformedResponse {
                     detail: "completed turn did not have a response ID",
                 })?;
+            session.conversation.reasoning.reconcile_history_repair(
+                previous_history.iter(),
+                session.conversation.managed.history(),
+            );
             can_drain_steers = true;
 
             if code_calls.is_empty() {

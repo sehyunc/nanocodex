@@ -12,6 +12,11 @@ extend-exclude = [
     "js/account/worker-configuration.d.ts",
 ]
 
+# Preserve the intentionally misspelled model-identity prompt fixture.
+[type.mjs]
+extend-glob = ["*.mjs"]
+extend-ignore-re = ['MODEL_IDENTITY_PROBE: hich model r u']
+
 # Xcode object identifiers are hexadecimal, not prose.
 [type.pbxproj]
 extend-glob = ["*.pbxproj"]
@@ -54,6 +59,11 @@ extend-ignore-re = ['\bwaymote-streamd\b', '\bgrantUniveralAccess\b', '\bitms-be
 mappin = "mappin"
 
 [default.extend-words]
+# Twilio uses PN as the exact phone-number SID prefix.
+PN = "PN"
+# Laso is the provider name used by the card integration.
+Laso = "Laso"
+laso = "laso"
 # PDF's FlateDecode compression filter is a protocol identifier.
 Flate = "Flate"
 # Mesa's OpenGL-over-Vulkan driver.
@@ -61,6 +71,9 @@ zink = "zink"
 Zink = "Zink"
 # The Rust and Swift voice transcript parsers recognize this legacy XML tag.
 soruce = "soruce"
+# Provider brand name, not a spelling error.
+LASO = "LASO"
+
 ratatui = "ratatui"
 serde = "serde"
 wasm = "wasm"

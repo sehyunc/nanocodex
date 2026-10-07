@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, once } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createServer } from 'node:net';
 import { mkdtemp, mkdir, rm, realpath, chmod, writeFile, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -54,6 +55,7 @@ test('policy shim identifies its own host and exposes no auth/model/thread APIs'
   assert.equal(policyReply(rpc(1, 'initialize'), true).result.userAgent, 'nanocodex-cua-policy-host/1');
   for (const method of ['account/read', 'thread/start', 'model/list']) assert.equal(policyReply(rpc(1, method), true).error.code, -32601);
   assert.equal(policyReply(rpc(1, 'config/read'), false).result.config.computer_use.default_app_access, 'deny');
+  assert.deepEqual(policyReply(rpc(1, 'getAuthStatus', {includeToken:true}), true).result, {authMethod:null,authToken:null,requiresOpenaiAuth:false});
   assert.equal(policyReply(rpc(1, 'configRequirements/read'), true).result.requirements.computerUse.allowLockedComputerUse, false);
 });
 test('blanket app consent excludes audio, data forms, unknown connectors and no active JS', () => {
@@ -103,8 +105,9 @@ test('upstream initialization/results/errors/notifications preserved and provide
   assert.deepEqual(returned, [result, notification]);
   assert.equal(f.invocations[0].settings.env.CODEX_TOKEN, undefined);
   assert.equal(f.invocations[0].settings.env.NODE_OPTIONS, undefined);
-  assert.equal(f.invocations[0].settings.env.CODEX_CLI_PATH, undefined);
-  assert.equal(f.invocations[0].settings.env.CODEX_HOME, undefined);
+  assert.equal(f.invocations[0].settings.env.CODEX_CLI_PATH, '/synthetic/policy');
+  assert.equal(path.dirname(f.invocations[0].settings.env.SKY_CUA_SERVICE_NATIVE_PIPE_PATH), f.invocations[0].settings.env.CODEX_HOME);
+  assert.ok(f.invocations[0].settings.env.CODEX_HOME.startsWith(f.state + path.sep));
 });
 test('EOF reports uncertainty and removes private session state without replay', async t => {
   const f = await fixture(t), replies = [];
@@ -145,7 +148,7 @@ test('host SIGKILL reaps detached provider even if provider ignores stdin EOF', 
   // Parallel native builds can delay synthetic Node startup beyond one second.
   // Bound the fixture wait independently of the owned-process cleanup assertion.
   const startupDeadline = Date.now() + 5000;
-  while (Date.now() < startupDeadline) { try { providerPid = Number(await readFile(pidFile, 'utf8')); break; } catch {} await pause(10); }
+  while (Date.now() < startupDeadline) { try { providerPid = Number(await readFile(pidFile, 'utf8')); if (Number.isSafeInteger(providerPid) && providerPid > 1) break; } catch {} await pause(10); }
   assert.ok(providerPid, 'synthetic provider did not start');
   harness.kill('SIGKILL'); await once(harness, 'exit'); await pause(300);
   let alive = true; try { process.kill(providerPid, 0); } catch { alive = false; }
@@ -163,22 +166,37 @@ test('provider stdout EOF closes pending requests even if its process remains al
   assert.match(replies[0].error.message, /uncertain/);
 });
 
-test('native owner watchdog reaps TERM-ignoring helper descendants after leader exit', async t => {
-  const directory = await root(t), app = path.join(directory, 'Fake.app');
-  const helper = path.join(app, 'Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService');
-  await mkdir(path.dirname(helper), { recursive: true });
-  const grandchildCode = "require('node:fs').writeFileSync(process.env.HOME + '/grandchild', String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
-  await writeFile(helper, `#!${process.execPath}\nconst { spawn } = require('node:child_process'); require('node:fs').writeFileSync(process.env.HOME + '/leader', String(process.pid)); spawn(process.execPath, ['-e', ${JSON.stringify(grandchildCode)}], { stdio: 'ignore' }); setInterval(() => {}, 1000);\n`, { mode: 0o700 });
-  const worker = spawn(process.execPath, [fileURLToPath(hostUrl), '--native-worker'], { env: { HOME: directory, NANOCODEX_CUA_NATIVE_APP: app, NANOCODEX_CUA_POLICY_HOST: '/synthetic/policy' }, stdio: ['pipe', 'ignore', 'pipe'] });
-  let leader, grandchild;
-  t.after(() => { worker.kill('SIGKILL'); if (leader) { try { process.kill(-leader, 'SIGKILL'); } catch {} } if (grandchild) { try { process.kill(grandchild, 'SIGKILL'); } catch {} } });
+async function nativeAppFixture(t, grandchildren = false) {
+  const directory = await root(t), app = path.join(directory, 'Synthetic.app');
+  const bundle = path.join(app, 'Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app');
+  const executable = path.join(bundle, 'Contents/MacOS/SkyComputerUseService');
+  await mkdir(path.dirname(executable), { recursive: true });
+  await writeFile(path.join(bundle, 'Contents/Info.plist'), `<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>SkyComputerUseService</string><key>CFBundleIdentifier</key><string>dev.nanocodex.fixture.CUALease</string><key>CFBundleName</key><string>Nanocodex CUA Lease Fixture</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/></dict></plist>`);
+  const run = promisify(execFile);
+  await run('/usr/bin/clang', ['-framework', 'AppKit', fileURLToPath(new URL('./fixtures/cua-app-lease.m', import.meta.url)), '-o', executable]);
+  await run('/usr/bin/codesign', ['--force', '--sign', '-', bundle]);
+  if (grandchildren) await writeFile(path.join(directory, 'with-grandchild'), 'synthetic');
+  const environment = { ...process.env, NANOCODEX_CUA_FIXTURE_DIRECTORY: directory, NANOCODEX_CUA_NATIVE_APP: app, NANOCODEX_CUA_POLICY_HOST: '/synthetic/policy', SKY_CUA_SERVICE_NATIVE_PIPE_PATH: path.join(directory, 'sky.sock') };
+  return { directory, environment };
+}
+
+test('cancelled native app launch reaps TERM-ignoring descendants', { skip: process.platform !== 'darwin', timeout: 15000 }, async t => {
+  const { directory, environment } = await nativeAppFixture(t, true);
+  const worker = spawn(process.execPath, [fileURLToPath(hostUrl), '--native-worker'], { env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(worker, 'exit');
+  worker.stdin.end();
+  let helper, grandchild;
+  t.after(() => { worker.stdin.end(); });
   for (let n = 0; n < 500; n++) {
-    try { leader = Number(await readFile(path.join(directory, 'leader'), 'utf8')); grandchild = Number(await readFile(path.join(directory, 'grandchild'), 'utf8')); break; } catch {} await pause(10);
+    try { helper = Number(await readFile(path.join(directory, 'helper'), 'utf8')); grandchild = Number(await readFile(path.join(directory, 'grandchild'), 'utf8')); if (helper > 1 && grandchild > 1) break; } catch {} await pause(10);
   }
-  assert.ok(leader && grandchild, 'synthetic helper descendants did not start');
-  worker.stdin.end(); await once(worker, 'exit'); await pause(1700);
-  let alive = true; try { process.kill(grandchild, 0); } catch { alive = false; }
-  assert.equal(alive, false, 'helper leader exit terminates watchdog before descendant SIGKILL escalation');
+  assert.ok(helper && grandchild, 'LaunchServices app and descendant did not start');
+  await exited;
+  for (const pid of [helper, grandchild]) {
+    let alive = true; try { process.kill(pid, 0); } catch { alive = false; }
+    assert.equal(alive, false, 'app lease failed to reap owned process ' + pid);
+  }
+  console.log(JSON.stringify({ journey: 'LaunchServices cancellation during launch', helper, grandchild, outcome: 'both reaped' }));
 });
 
 test('policy wire accepts missing jsonrpc only in explicitly non-MCP framing mode', () => {
@@ -193,21 +211,18 @@ test('policy wire accepts missing jsonrpc only in explicitly non-MCP framing mod
   policy.write(JSON.stringify({ ...request, jsonrpc: '1.0' }) + '\n'); assert.equal(policyFailures, 1);
 });
 
-test('SIGKILL of native worker owner closes lease and reaps synthetic native helper', async t => {
-  const directory = await root(t), app = path.join(directory, 'Lease.app');
-  const helper = path.join(app, 'Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService');
-  await mkdir(path.dirname(helper), { recursive: true });
-  await writeFile(helper, `#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.HOME + '/helper', String(process.pid)); setInterval(() => {}, 1000);\n`, { mode: 0o700 });
-  const workerEnv = { HOME: directory, NANOCODEX_CUA_NATIVE_APP: app, NANOCODEX_CUA_POLICY_HOST: '/synthetic/policy' };
-  const ownerCode = `const { spawn } = require('node:child_process'); spawn(process.execPath, [${JSON.stringify(fileURLToPath(hostUrl))}, '--native-worker'], { env: ${JSON.stringify(workerEnv)}, detached: true, stdio: ['pipe', 'ignore', 'ignore'] }); setInterval(() => {}, 1000);`;
+test('SIGKILL of native worker owner closes lease and reaps its app', { skip: process.platform !== 'darwin', timeout: 15000 }, async t => {
+  const { directory, environment } = await nativeAppFixture(t);
+  const ownerCode = `const { spawn } = require('node:child_process'); spawn(process.execPath, [${JSON.stringify(fileURLToPath(hostUrl))}, '--native-worker'], { env: ${JSON.stringify(environment)}, detached: true, stdio: ['pipe', 'ignore', 'ignore'] }); setInterval(() => {}, 1000);`;
   const owner = spawn(process.execPath, ['-e', ownerCode], { stdio: ['ignore', 'ignore', 'ignore'] });
-  let helperPid;
-  t.after(() => { owner.kill('SIGKILL'); if (helperPid) { try { process.kill(-helperPid, 'SIGKILL'); } catch {} } });
-  for (let n = 0; n < 500; n++) { try { helperPid = Number(await readFile(path.join(directory, 'helper'), 'utf8')); break; } catch {} await pause(10); }
-  assert.ok(helperPid, 'synthetic native helper did not start');
-  owner.kill('SIGKILL'); await once(owner, 'exit'); await pause(1800);
-  let alive = true; try { process.kill(helperPid, 0); } catch { alive = false; }
-  assert.equal(alive, false, 'native worker failed to observe killed owner EOF');
+  let helper;
+  t.after(() => { owner.kill('SIGKILL'); });
+  for (let n = 0; n < 500; n++) { try { helper = Number(await readFile(path.join(directory, 'helper'), 'utf8')); if (helper > 1) break; } catch {} await pause(10); }
+  assert.ok(helper, 'LaunchServices app did not start');
+  owner.kill('SIGKILL'); await once(owner, 'exit'); await pause(2200);
+  let alive = true; try { process.kill(helper, 0); } catch { alive = false; }
+  assert.equal(alive, false, 'native app lease failed to observe killed owner EOF');
+  console.log(JSON.stringify({ journey: 'LaunchServices owner SIGKILL', owner: owner.pid, helper, outcome: 'helper reaped' }));
 });
 
 test('stat-only policy rejects external ownership and permits explicitly superseded owner preferences', async () => {

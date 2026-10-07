@@ -1,4 +1,5 @@
 import { createCodeDiscovery } from "./code-discovery.mjs";
+import { createTurnLifecycle } from "./turn-lifecycle.mjs";
 import { createCodeTools } from "./code-tools.mjs";
 import { stringify, storeSnapshot, normalizeImage, normalizeAudio, generatedImageItems } from "./code-values.mjs";
 import { limitCodeOutput } from "./code-output.mjs";
@@ -57,6 +58,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   const toolByName = new Map();
   const subagentBindingsBySession = new Map();
   const subagentSessions = extras.subagentSessions;
+  const turnLifecycle = createTurnLifecycle((...args) => router.endTurn(...args));
 
   function addTools(configuration = {}) {
     const added = {};
@@ -82,6 +84,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   async function executeTool(name, encodedInput, sessionId = "default", callId = "tool", model = "unknown", turnId) {
+    turnLifecycle.call(sessionId, callId, turnId, subagentBindingsBySession.has(sessionId));
     let input;
     try {
       input = JSON.parse(encodedInput);
@@ -223,7 +226,8 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     return encodeToolOutput(receipt.output, receipt.success, receipt.structured_result, receipt.metadata);
   }
 
-  async function executeCode(source, sessionId = "default", parentCallId = "exec", model = "unknown", observer, cell, turnId) {
+  async function executeCode(source, sessionId = "default", parentCallId = "exec", model = "unknown", observer, cell, turnId, localDefinitions, executeLocalTool) {
+    turnLifecycle.call(sessionId, parentCallId, turnId, subagentBindingsBySession.has(sessionId));
     if (typeof model === "function" && observer === undefined) {
       observer = model;
       model = "unknown";
@@ -243,7 +247,40 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     let admission;
     try {
       admission = await router.admit(controller.signal);
+      if (localDefinitions && localDefinitions !== "[]") {
+        const configured = Object.fromEntries(JSON.parse(localDefinitions).map(definition => [definition.name, {
+          definition,
+          async handler(input, context) {
+            context.signal.throwIfAborted();
+            const pending = executeLocalTool(definition.name, JSON.stringify(input), context.callId);
+            const cancel = () => pending.cancel?.();
+            context.signal.addEventListener("abort", cancel, { once: true });
+            try {
+              if (context.signal.aborted) cancel();
+              const receipt = JSON.parse(await pending);
+              return toolResult(receipt.output, receipt.structured_result, {
+                success: receipt.success, metadata: receipt.metadata,
+                value: receipt.structured_result ?? receipt.output,
+              });
+            } finally {
+              context.signal.removeEventListener("abort", cancel);
+            }
+          },
+        }]));
+        const local = new ToolRouter([toolMapSource("rust-cell", configured)]).snapshot();
+        const application = admission;
+        admission = {
+          definitions: [...application.definitions, ...local.definitions],
+          tools: new Map([...application.tools, ...local.tools]),
+          invoke: (name, input, context) => (local.tools.has(name) ? local : application).invoke(name, input, context),
+          release() { local.release(); application.release(); },
+        };
+        if (new Set(admission.definitions.map(definition => normalizeIdentifier(definition.type === "tool_search" ? "tool_search" : definition.name))).size !== admission.definitions.length) {
+          throw new Error("Code Mode local tool names collide after normalization");
+        }
+      }
     } catch (error) {
+      admission?.release();
       activeExecutions.delete(execution);
       return JSON.stringify({
         output: `Script failed\nWall time ${wallTime(startedAt)} seconds\nOutput:\n${errorMessage(error)}`,
@@ -618,6 +655,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         await abortableEvaluation((async () => {
           try {
             await (extras.evaluate || evaluateNative)(source, {
+              sessionId,
               tools,
               ...createCodeDiscovery(availableDefinitions),
               toolDefinitions: availableDefinitions,
@@ -700,7 +738,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
     }
   }
 
-  function executeCodeObserved(source, sessionId = "default", parentCallId = "exec", model = "unknown", turnId) {
+  function executeCodeObserved(source, sessionId = "default", parentCallId = "exec", model = "unknown", turnId, localDefinitions, executeLocalTool) {
     return observeOperation(sessionId, parentCallId, (observation) => {
       const options = parseExec(source);
       const cell = {
@@ -716,7 +754,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
         if (cell.observation) cell.observation.push(encoded);
         else cell.updates.push(encoded);
         if (update.type === "nested_call_completed") cell.completedCalls.push(update.call);
-      }, cell, turnId).then((result) => {
+      }, cell, turnId, localDefinitions, executeLocalTool).then((result) => {
         const completed = JSON.parse(result);
         if (!completed.success && typeof completed.output === "string") {
           const failure = completed.output.split("Output:\n").slice(1).join("Output:\n") || completed.output;
@@ -873,6 +911,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   function releaseSession(sessionId) {
+    turnLifecycle.release(sessionId);
     cancel(sessionId);
     const binding = subagentBindingsBySession.get(sessionId);
     if (binding !== undefined) {
@@ -886,6 +925,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   function reset() {
+    turnLifecycle.reset();
     for (const execution of activeExecutions) {
       execution.controller.abort(new Error(CANCELLATION_MESSAGE));
     }
@@ -898,6 +938,7 @@ export function createCodeRuntime(toolConfiguration = {}, extras = {}) {
   }
 
   return Object.freeze({
+    observeEvent: turnLifecycle.observe,
     addTools,
     addProvider(provider, options = {}) {
       if (!provider || typeof provider.definitions !== "function" || typeof provider.resolve !== "function") {

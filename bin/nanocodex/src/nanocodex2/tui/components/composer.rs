@@ -65,6 +65,7 @@ pub(crate) enum ComposerEffect {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SettingsCommand {
     Bug(String),
+    CodeReview(crate::tui::review::Command),
     Btw(String),
     CloseBtw,
     Attach,
@@ -83,6 +84,9 @@ pub(crate) enum SettingsCommand {
 
 impl SettingsCommand {
     pub(super) fn parse(input: &str) -> Option<Self> {
+        if let Some(command) = crate::tui::review::parse(input) {
+            return Some(Self::CodeReview(command));
+        }
         let mut parts = input.split_whitespace();
         let command = parts.next()?;
         match command {
@@ -482,19 +486,20 @@ impl Composer {
                 effort,
             } => {
                 self.auto_routing = enabled;
-                self.routed_model = model.filter(|_| enabled);
-                self.routed_provider = if enabled {
+                self.routed_model = model;
+                self.routed_provider = if model.is_some() {
                     match provider.as_deref() {
                         Some("ChatGPT") => Some("ChatGPT"),
                         Some("Workers AI") => Some("Workers AI"),
                         Some("OpenRouter") => Some("OpenRouter"),
                         Some("Vercel") => Some("Vercel"),
+                        Some("Claude") => Some("Claude"),
                         _ => None,
                     }
                 } else {
                     None
                 };
-                self.routed_effort = effort.filter(|_| enabled && model.is_some());
+                self.routed_effort = effort.filter(|_| model.is_some());
                 ComposerUpdate::changed()
             }
             ComposerEvent::SetReasoningMode(mode) => {
@@ -839,11 +844,12 @@ impl Composer {
     }
 
     fn model_label(&self) -> String {
-        if !self.auto_routing {
-            return self.model.to_string();
-        }
         let Some(model) = self.routed_model else {
-            return "Auto · choosing…".to_owned();
+            return if self.auto_routing {
+                "Auto · choosing…".to_owned()
+            } else {
+                self.model.to_string()
+            };
         };
         let label = match model {
             Model::Oai(nanocodex::Model::Glm53) => "glm-5.3",
@@ -1121,6 +1127,14 @@ impl Composer {
 
     fn take_local_command(&mut self) -> Option<ComposerUpdate> {
         if !self.images.is_empty() {
+            if self.draft.split_whitespace().next() == Some("/review") {
+                return Some(ComposerUpdate::effect(
+                    ComposerEffect::Settings(SettingsCommand::Invalid(
+                        "Remove image attachments before running /review.".into(),
+                    )),
+                    false,
+                ));
+            }
             if self.draft.split_whitespace().next() == Some("/secure-input") {
                 return Some(ComposerUpdate::effect(
                     ComposerEffect::Settings(SettingsCommand::Invalid(

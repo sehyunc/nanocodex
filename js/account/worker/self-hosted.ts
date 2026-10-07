@@ -28,7 +28,8 @@ export default {
       });
     }
     if ((url.pathname === "/" || url.pathname === "/agent" || url.pathname.startsWith("/agent/")
-      || url.pathname === "/connect" || url.pathname === "/connect/vault")
+      || url.pathname === "/connect" || url.pathname === "/connect/vault"
+      || url.pathname === "/vault" || url.pathname === "/services/phone")
       && request.method === "GET") {
       const response = await env.NANOCODEX_BACKEND?.fetch(new Request(new URL("/v1/me", url), {
         headers: request.headers,

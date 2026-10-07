@@ -5,6 +5,8 @@
 mod agent;
 mod child_journal;
 pub use child_journal::ChildJournal;
+mod branch;
+pub use branch::{BranchTurn, CheckpointBranch};
 #[cfg(feature = "claude")]
 mod claude;
 #[cfg(not(target_family = "wasm"))]

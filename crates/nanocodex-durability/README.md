@@ -107,6 +107,17 @@ prompts also await readiness; shutdown or dropping the last handle cancels
 unfinished startup recovery. A successful foreground turn waits for its
 foreground children, while failed or cancelled turns stop them before settlement.
 
+`CheckpointBranch` supports explicit host-requested history branches. Opening it
+acquires the source through `StateStore` and refuses pending operations. Select a
+retained operation with `before`, validate the provider checkpoint (Claude hosts
+use `nanocodex_claude::rewind_checkpoint`). Use the reserved `branch_id` to
+prepare required host permission, planning and workspace state before `publish`
+makes the fresh UUID journal resumable. Publication checks the source owner and revision, preserves the original journal,
+and copies no queued work or effect receipts. Missing retained boundaries fail
+closed. File restoration and other external effects remain the host's separate
+responsibility; they are not transactional with publishing a conversation branch.
+
+
 Without `.durability(...)`, the same builder is an ordinary non-durable agent.
 An OpenAI-only consumer can stop at `OpenAi::instructions(...).build()`, and a
 tools-only consumer can stop at `Tools::builder().build()`. A caller that owns

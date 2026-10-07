@@ -6,8 +6,8 @@ use std::{
 };
 
 use nanocodex_agent::{
-    AgentEvents, BuilderBackend, Model, Nanocodex, NanocodexError, ReasoningMode, Thinking,
-    backend::BackendRuntime,
+    AgentEvents, BuilderBackend, Model, Nanocodex, NanocodexError, PromptRequest, ReasoningMode,
+    Thinking, Turn, backend::BackendRuntime, input::Prompt,
 };
 use tokio::sync::mpsc;
 use tower::{Layer, Service, ServiceExt};
@@ -19,7 +19,7 @@ use nanocodex_oai_tools::{
 };
 
 #[cfg(feature = "tools")]
-use crate::attachment::AttachmentSupervisor;
+use crate::attachment::{AttachmentSupervisor, ToolPreparation};
 use crate::{
     AgentReceipt, AgentSettings, AgentState, EventCursor, ManagedClient, ManagedError,
     ManagedEvent, ManagedEvents, ManagedModel, PromptInput, SteerWithdrawal, TurnAction, TurnView,
@@ -38,6 +38,35 @@ pub enum ManagedRequest {
     Create {
         /// Initial model and reasoning policy.
         settings: AgentSettings,
+    },
+    /// Creates an agent pinned to a connected ChatGPT account.
+    CreateWithChatgptAccount {
+        /// Explicit creation settings, or the account default.
+        settings: Option<AgentSettings>,
+        /// Connected account identifier.
+        account: String,
+    },
+    /// Creates an agent and admits its known first prompt in one request.
+    CreateAndPrompt {
+        /// Explicit creation settings, or the account default.
+        settings: Option<AgentSettings>,
+        /// Stable key for creation and admission, retained across retries.
+        idempotency_key: String,
+        /// Complete first input.
+        input: PromptInput,
+        /// Optional connected ChatGPT account pin.
+        chatgpt_account: Option<String>,
+    },
+    /// Creates and prompts using server-side catalog selection.
+    CreateAndPromptSelected {
+        /// Selection policy and explicit overrides.
+        selection: crate::InitialSettingsSelection,
+        /// Stable operation key.
+        idempotency_key: String,
+        /// First input.
+        input: PromptInput,
+        /// Optional ChatGPT account pin.
+        chatgpt_account: Option<String>,
     },
     /// Reads current durable agent state.
     State {
@@ -152,6 +181,23 @@ pub enum ManagedRequest {
 pub enum ManagedResponse {
     /// Receipt for a newly created managed agent.
     Created(AgentReceipt),
+    /// Combined creation/admission receipt and optional initial HTTP stream.
+    CreatedAndPrompted {
+        /// Durable identity and turn receipt.
+        receipt: crate::AgentRunReceipt,
+        /// Stream already opened by the combined POST for the HTTP transport.
+        events: Option<ManagedEvents>,
+    },
+    /// Combined admission with authoritative server-selected settings.
+    CreatedAndPromptedSelected {
+        /// Durable admission receipt.
+        receipt: crate::AgentRunReceipt,
+        /// Owned initial stream.
+        events: Option<ManagedEvents>,
+        /// Settings resolved before admission.
+        settings: AgentSettings,
+    },
+
     /// Current durable agent state.
     State(AgentState),
     /// Opened durable event stream.
@@ -225,6 +271,65 @@ impl Service<ManagedRequest> for ManagedService {
                 }
                 ManagedRequest::Create { settings } => {
                     create_managed(client, socket, transport, settings).await
+                }
+                ManagedRequest::CreateWithChatgptAccount { settings, account } => {
+                    let settings = match settings {
+                        Some(settings) => settings,
+                        None => client.default_settings().await?,
+                    };
+                    client
+                        .create_with_chatgpt_account(settings, &account)
+                        .await
+                        .map(ManagedResponse::Created)
+                }
+                ManagedRequest::CreateAndPrompt {
+                    settings,
+                    idempotency_key,
+                    input,
+                    chatgpt_account,
+                } => {
+                    let settings = match settings {
+                        Some(settings) => settings,
+                        None => client.default_settings().await?,
+                    };
+                    let (receipt, events, _) = client
+                        .create_run(
+                            Some(settings),
+                            None,
+                            &idempotency_key,
+                            &input,
+                            chatgpt_account.as_deref(),
+                            matches!(transport, ManagedTransport::Http),
+                        )
+                        .await?;
+                    Ok(ManagedResponse::CreatedAndPrompted {
+                        receipt,
+                        events: events.map(ManagedEvents::new),
+                    })
+                }
+                ManagedRequest::CreateAndPromptSelected {
+                    selection,
+                    idempotency_key,
+                    input,
+                    chatgpt_account,
+                } => {
+                    let (receipt, events, settings) = client
+                        .create_run(
+                            None,
+                            Some(selection),
+                            &idempotency_key,
+                            &input,
+                            chatgpt_account.as_deref(),
+                            matches!(transport, ManagedTransport::Http),
+                        )
+                        .await?;
+                    Ok(ManagedResponse::CreatedAndPromptedSelected {
+                        settings: settings.ok_or(ManagedError::InvalidResponse(
+                            "agent run omitted selected settings",
+                        ))?,
+                        receipt,
+                        events: events.map(ManagedEvents::new),
+                    })
                 }
                 ManagedRequest::State { agent_id } => {
                     client.state(&agent_id).await.map(ManagedResponse::State)
@@ -504,6 +609,8 @@ impl<S> BuilderBackend for Managed<S> {
         ManagedBuilder {
             managed: self,
             event_observer: None,
+            chatgpt_account: None,
+            selection: None,
             #[cfg(feature = "tools")]
             tools: None,
             #[cfg(feature = "tools")]
@@ -517,13 +624,22 @@ impl<S> BuilderBackend for Managed<S> {
 pub struct ManagedBuilder<S = ManagedService> {
     managed: Managed<S>,
     event_observer: Option<mpsc::UnboundedSender<ManagedEvent>>,
+    chatgpt_account: Option<String>,
+    selection: Option<crate::InitialSettingsSelection>,
     #[cfg(feature = "tools")]
-    tools: Option<Tools>,
+    tools: Option<ToolPreparation>,
     #[cfg(feature = "tools")]
     attachment_metadata: Option<AttachmentMetadata>,
 }
 
 impl<S> ManagedBuilder<S> {
+    /// Select defaults on the server for `build_with_prompt`; explicit settings take precedence.
+    #[must_use]
+    pub fn settings_selection(mut self, selection: crate::InitialSettingsSelection) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
     /// Replaces the managed Tower service while preserving create/open intent.
     #[must_use]
     pub fn service<T>(self, service: T) -> ManagedBuilder<T> {
@@ -533,6 +649,8 @@ impl<S> ManagedBuilder<S> {
                 operation: self.managed.operation,
             },
             event_observer: self.event_observer,
+            chatgpt_account: self.chatgpt_account,
+            selection: self.selection,
             #[cfg(feature = "tools")]
             tools: self.tools,
             #[cfg(feature = "tools")]
@@ -549,6 +667,8 @@ impl<S> ManagedBuilder<S> {
         let Self {
             managed,
             event_observer,
+            chatgpt_account,
+            selection,
             #[cfg(feature = "tools")]
             tools,
             #[cfg(feature = "tools")]
@@ -560,6 +680,8 @@ impl<S> ManagedBuilder<S> {
                 operation: managed.operation,
             },
             event_observer,
+            chatgpt_account,
+            selection,
             #[cfg(feature = "tools")]
             tools,
             #[cfg(feature = "tools")]
@@ -581,7 +703,24 @@ impl<S> ManagedBuilder<S> {
     #[cfg_attr(docsrs, doc(cfg(feature = "tools")))]
     #[must_use]
     pub fn tools(mut self, tools: Tools) -> Self {
-        self.tools = Some(tools);
+        self.tools = Some(ToolPreparation::Ready(tools));
+        self
+    }
+
+    /// Prepares an optional local tool recipe concurrently with admission.
+    ///
+    /// Preparation starts when building and never gates the first cloud request
+    /// or event stream. The completed recipe attaches in the background. Failed
+    /// admission, cancelled build, and disconnect cancel unfinished preparation.
+    /// Validate required configuration before supplying the future; handle any
+    /// optional discovery errors inside it. Use `tools` when recipe preparation must
+    /// finish before admission; attachment/catalog publication still happens in
+    /// the background.
+    #[cfg(feature = "tools")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "tools")))]
+    #[must_use]
+    pub fn tools_async(mut self, tools: impl Future<Output = Tools> + Send + 'static) -> Self {
+        self.tools = Some(ToolPreparation::Deferred(Box::pin(tools)));
         self
     }
 
@@ -592,6 +731,118 @@ impl<S> ManagedBuilder<S> {
     pub fn attachment_metadata(mut self, metadata: AttachmentMetadata) -> Self {
         self.attachment_metadata = Some(metadata);
         self
+    }
+
+    /// Pins creation to a connected ChatGPT account.
+    #[must_use]
+    pub fn chatgpt_account(mut self, account: impl Into<String>) -> Self {
+        self.chatgpt_account = Some(account.into());
+        self
+    }
+
+    /// Creates and starts the known first prompt in one request.
+    ///
+    /// HTTP recipes receive the receipt and events on the same POST; live
+    /// recipes reconnect their WebSocket from zero after admission. The first
+    /// turn is adopted locally, never submitted a second time. Reuse the same
+    /// key and prompt to recover an uncertain combined creation. Open recipes
+    /// are rejected.
+    ///
+    /// Local tools attach in the background once the server returns the agent
+    /// identity, just as ordinary build starts an asynchronous attachment.
+    /// The first prompt does not wait for optional local tool discovery.
+    ///
+    /// # Errors
+    /// Returns input, creation, attachment, stream, or lifecycle failures.
+    pub async fn build_with_prompt(
+        mut self,
+        prompt: impl Into<Prompt>,
+        idempotency_key: impl Into<String>,
+    ) -> nanocodex_agent::Result<(Nanocodex, AgentEvents, Turn)>
+    where
+        S: Service<ManagedRequest, Response = ManagedResponse> + Send + 'static,
+        S::Future: Send + 'static,
+        S::Error: std::error::Error + Send + Sync + 'static,
+    {
+        let settings = match &self.managed.operation {
+            ManagedOperation::Create(settings) => *settings,
+            _ => {
+                return Err(backend_error(ManagedError::Configuration(
+                    "build_with_prompt requires a create recipe".to_owned(),
+                )));
+            }
+        };
+        let prompt = prompt.into();
+        prompt
+            .validate()
+            .map_err(|error| NanocodexError::InvalidRequest(error.to_string()))?;
+        let selected = self.selection.filter(|_| settings.is_none());
+        let input = if selected.is_some() {
+            crate::driver::managed_prompt_for_selection(prompt.clone(), None)?
+        } else {
+            crate::driver::managed_prompt(prompt.clone(), settings.unwrap_or_default().model)?
+        };
+        let idempotency_key = idempotency_key.into();
+        crate::client::validate_idempotency_key(&idempotency_key).map_err(backend_error)?;
+        #[cfg(feature = "tools")]
+        {
+            self.tools = self.tools.map(ToolPreparation::start);
+        }
+        let request = if let Some(selection) = selected {
+            ManagedRequest::CreateAndPromptSelected {
+                selection,
+                idempotency_key: idempotency_key.clone(),
+                input: input.clone(),
+                chatgpt_account: self.chatgpt_account.take(),
+            }
+        } else {
+            ManagedRequest::CreateAndPrompt {
+                settings,
+                idempotency_key: idempotency_key.clone(),
+                input: input.clone(),
+                chatgpt_account: self.chatgpt_account.take(),
+            }
+        };
+        let response = call(&mut self.managed.service, request).await?;
+        let (receipt, events, model) = match response {
+            ManagedResponse::CreatedAndPrompted { receipt, events }
+                if self.selection.is_none() || settings.is_some() =>
+            {
+                (receipt, events, settings.unwrap_or_default().model)
+            }
+            ManagedResponse::CreatedAndPromptedSelected {
+                receipt,
+                events,
+                settings,
+            } => (receipt, events, settings.model),
+            _ => return Err(unexpected_response()),
+        };
+        let initial_turn = crate::driver::InitialTurn {
+            request_id: idempotency_key.clone(),
+            turn_id: receipt.turn.turn_id,
+            input,
+        };
+        let (agent, events) = self
+            .start(
+                receipt.agent_id,
+                receipt.session_id,
+                model,
+                EventCursor::parse("0").map_err(backend_error)?,
+                events,
+                Some(initial_turn),
+            )
+            .await?;
+        let turn = match agent
+            .prompt(PromptRequest::new(prompt).request_id(idempotency_key))
+            .await
+        {
+            Ok(turn) => turn,
+            Err(error) => {
+                let _ = agent.disconnect().await;
+                return Err(error);
+            }
+        };
+        Ok((agent, events, turn))
     }
 
     /// Creates or opens the managed agent and starts its owned lifecycle driver.
@@ -606,13 +857,32 @@ impl<S> ManagedBuilder<S> {
         S::Future: Send + 'static,
         S::Error: std::error::Error + Send + Sync + 'static,
     {
-        let (agent_id, expected_session_id, supplied_state) = match self.managed.operation {
+        if self.selection.is_some() {
+            return Err(backend_error(ManagedError::Configuration(
+                "settings_selection requires build_with_prompt".to_owned(),
+            )));
+        }
+        if self.chatgpt_account.is_some()
+            && !matches!(self.managed.operation, ManagedOperation::Create(_))
+        {
+            return Err(backend_error(ManagedError::Configuration(
+                "a builder ChatGPT account pin requires a create recipe".to_owned(),
+            )));
+        }
+        #[cfg(feature = "tools")]
+        {
+            self.tools = self.tools.map(ToolPreparation::start);
+        }
+        let (agent_id, expected_session_id, supplied_state) = match self.managed.operation.clone() {
             ManagedOperation::Create(settings) => {
-                let request = match settings {
-                    Some(settings) => ManagedRequest::Create {
-                        settings: settings.validate().map_err(backend_error)?,
+                let request = match self.chatgpt_account.take() {
+                    Some(account) => ManagedRequest::CreateWithChatgptAccount { settings, account },
+                    None => match settings {
+                        Some(settings) => ManagedRequest::Create {
+                            settings: settings.validate().map_err(backend_error)?,
+                        },
+                        None => ManagedRequest::CreateDefault,
                     },
-                    None => ManagedRequest::CreateDefault,
                 };
                 match call(&mut self.managed.service, request).await? {
                     ManagedResponse::Created(receipt) => (
@@ -680,8 +950,33 @@ impl<S> ManagedBuilder<S> {
             Err(error) => return Err(error),
         };
 
+        self.start(
+            agent_id,
+            state.session_id,
+            state.settings.model,
+            cursor,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn start(
+        mut self,
+        agent_id: String,
+        session_id: String,
+        model: crate::ManagedModel,
+        cursor: EventCursor,
+        initial_stream: Option<ManagedEvents>,
+        initial_turn: Option<crate::driver::InitialTurn>,
+    ) -> nanocodex_agent::Result<(Nanocodex, AgentEvents)>
+    where
+        S: Service<ManagedRequest, Response = ManagedResponse> + Send + 'static,
+        S::Future: Send + 'static,
+        S::Error: std::error::Error + Send + Sync + 'static,
+    {
         #[cfg(feature = "tools")]
-        let attachment = match self.tools {
+        let mut attachment = match self.tools {
             Some(tools) => {
                 let target = match call(
                     &mut self.managed.service,
@@ -703,25 +998,27 @@ impl<S> ManagedBuilder<S> {
             None => None,
         };
 
-        let stream_response = match call(
-            &mut self.managed.service,
-            ManagedRequest::Events {
-                agent_id: agent_id.clone(),
-                cursor,
-            },
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                #[cfg(feature = "tools")]
-                if let Some(attachment) = attachment.as_ref() {
-                    let _ = attachment.shutdown().await;
+        let stream_response = match initial_stream {
+            Some(stream) => ManagedResponse::Events(stream),
+            None => match call(
+                &mut self.managed.service,
+                ManagedRequest::Events {
+                    agent_id: agent_id.clone(),
+                    cursor,
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    #[cfg(feature = "tools")]
+                    if let Some(attachment) = attachment.take() {
+                        let _ = attachment.shutdown().await;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            },
         };
-
         let stream = match stream_response {
             ManagedResponse::Events(stream) => stream,
             _ => {
@@ -733,17 +1030,18 @@ impl<S> ManagedBuilder<S> {
             }
         };
 
-        let (runtime, events) =
-            BackendRuntime::with_agent_id(agent_id.clone(), state.session_id.clone());
+        let (runtime, events) = BackendRuntime::with_agent_id(agent_id.clone(), session_id);
         let (backend, commands, shutdown) = ManagedAgent::new();
         let driver = ManagedDriver::new(
             self.managed.service,
             agent_id,
+            model,
             stream,
             commands,
             runtime.events(),
             shutdown,
             self.event_observer,
+            initial_turn,
             #[cfg(feature = "tools")]
             attachment,
         );

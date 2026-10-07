@@ -12,7 +12,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use url::{Host, Url};
 use zeroize::Zeroize;
 
-use nanocodex_oai_api::{ReasoningMode, Thinking};
+use nanocodex_oai_api::{Model, ReasoningMode, Thinking};
 
 use crate::{
     AgentList, AgentReceipt, AgentSettings, AgentSettingsPatch, AgentSettingsResponse, AgentState,
@@ -101,6 +101,26 @@ impl fmt::Debug for ManagedClient {
 }
 
 impl ManagedClient {
+    /// Opaque namespace for local caches scoped to this service and login.
+    /// Credential rotation intentionally selects a new namespace. This digest
+    /// is an identifier only and must never be accepted as authorization.
+    pub fn local_cache_namespace(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+
+        let mut hash = Sha256::new();
+        hash.update(b"nanocodex.local-cache-namespace.v1\0");
+        for value in [self.base_url.as_str().as_bytes(), self.bearer.as_bytes()] {
+            hash.update((value.len() as u64).to_be_bytes());
+            hash.update(value);
+        }
+        use std::fmt::Write as _;
+        let mut namespace = String::with_capacity(64);
+        for byte in hash.finalize() {
+            let _ = write!(namespace, "{byte:02x}");
+        }
+        namespace
+    }
+
     /// Starts configuring a native managed client.
     ///
     /// # Errors
@@ -169,6 +189,58 @@ impl ManagedClient {
         Ok(self)
     }
 
+    /// Adds the client's native working directory as descriptive turn context.
+    /// This never creates a Hand, changes its root, or selects tool placement.
+    ///
+    /// # Errors
+    /// Returns a configuration error for a non-absolute, oversized, or invalid path.
+    pub fn with_native_cwd(mut self, cwd: &str) -> Result<Self, ManagedError> {
+        let bytes = cwd.as_bytes();
+        let unc = cwd.strip_prefix("\\\\").is_some_and(|path| {
+            let mut parts = path.split(['\\', '/']);
+            parts.next().is_some_and(|host| !host.is_empty())
+                && parts.next().is_some_and(|share| !share.is_empty())
+        });
+        let absolute = cwd.starts_with('/')
+            || (bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'/' | b'\\'))
+            || unc;
+        if !absolute || bytes.len() > 512 || cwd.chars().any(char::is_control) {
+            return Err(ManagedError::Configuration(
+                "invalid native working directory".to_owned(),
+            ));
+        }
+        let mut context: serde_json::Value = self
+            .request_origin
+            .as_ref()
+            .and_then(|value| serde_json::from_slice(value.as_bytes()).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        context["native_cwd"] = cwd.into();
+        // HTTP headers remain ASCII even when a project directory contains
+        // Unicode. JSON decoding restores the exact native path at the server.
+        let mut header = String::new();
+        for character in context.to_string().chars() {
+            if character.is_ascii() {
+                header.push(character);
+            } else {
+                for unit in character.encode_utf16(&mut [0; 2]) {
+                    header.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+        if header.len() > 2048 {
+            return Err(ManagedError::Configuration(
+                "request origin is too large".to_owned(),
+            ));
+        }
+        self.request_origin = Some(HeaderValue::from_str(&header).map_err(|_| {
+            ManagedError::Configuration("invalid request origin header".to_owned())
+        })?);
+        Ok(self)
+    }
+
     fn from_builder(mut builder: ManagedClientBuilder) -> Result<Self, ManagedError> {
         install_default_rustls_crypto_provider();
         validate_origin(&builder.origin)?;
@@ -219,6 +291,154 @@ impl ManagedClient {
     pub async fn create(&self) -> Result<AgentReceipt, ManagedError> {
         let receipt = self.json(Method::POST, "v1/agents", None, None).await?;
         validate_agent_receipt(receipt)
+    }
+
+    /// Creates an agent and admits its first prompt under one stable operation key.
+    /// Reconcile an uncertain outcome by repeating the same key and input.
+    ///
+    /// # Errors
+    /// Returns validation, transport, HTTP, or receipt-schema failures.
+    pub async fn create_and_prompt(
+        &self,
+        settings: AgentSettings,
+        idempotency_key: &str,
+        input: &PromptInput,
+        chatgpt_account: Option<&str>,
+    ) -> Result<crate::AgentRunReceipt, ManagedError> {
+        let (receipt, _, _) = self
+            .create_run(
+                Some(settings),
+                None,
+                idempotency_key,
+                input,
+                chatgpt_account,
+                false,
+            )
+            .await?;
+        Ok(receipt)
+    }
+
+    pub(crate) async fn create_run(
+        &self,
+        settings: Option<AgentSettings>,
+        selection: Option<crate::InitialSettingsSelection>,
+        idempotency_key: &str,
+        input: &PromptInput,
+        chatgpt_account: Option<&str>,
+        streaming: bool,
+    ) -> Result<
+        (
+            crate::AgentRunReceipt,
+            Option<ManagedEventStream>,
+            Option<AgentSettings>,
+        ),
+        ManagedError,
+    > {
+        let settings = settings.map(AgentSettings::validate).transpose()?;
+        validate_idempotency_key(idempotency_key)?;
+        let mut body = serde_json::json!({ "input": input });
+        if let Some(settings) = settings {
+            body["settings"] = serde_json::json!(settings);
+        } else {
+            body["settings_selection"] = serde_json::json!(selection.unwrap_or_default());
+        }
+        if let Some(account) = chatgpt_account {
+            if account.is_empty()
+                || account.len() > 256
+                || !account.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+                || settings.is_some_and(|settings| settings.model.oai().is_none())
+            {
+                return Err(ManagedError::Configuration(
+                    "invalid ChatGPT account pin".to_owned(),
+                ));
+            }
+            body["configuration"] = serde_json::json!({"chatgpt_account_id": account});
+        }
+        let body = serde_json::to_vec(&body)
+            .map_err(|_| ManagedError::InvalidResponse("failed to encode agent run"))?;
+        let url = self.url("v1/agent-runs")?;
+        let mut failure = None;
+        for attempt in 0..SUBMIT_ATTEMPTS {
+            let result = async {
+                let request = self
+                    .http
+                    .post(url.clone())
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("idempotency-key", idempotency_key)
+                    .header(
+                        "accept",
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    )
+                    .body(body.clone());
+                let response = self
+                    .send_with_access(request, &url)
+                    .await
+                    .map_err(ManagedError::Transport)?;
+                if !response.status().is_success() {
+                    return Err(response_error(response).await);
+                }
+                let selected_settings = if selection.is_some() {
+                    let settings: AgentSettings = response
+                        .headers()
+                        .get("x-nanocodex-settings")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| serde_json::from_str(value).ok())
+                        .ok_or(ManagedError::InvalidResponse(
+                            "agent run omitted selected settings",
+                        ))?;
+                    Some(settings.validate()?)
+                } else {
+                    None
+                };
+                let (receipt, events) = if streaming {
+                    let (receipt, events) =
+                        ManagedEventStream::from_run_response(self.clone(), response).await?;
+                    (receipt, Some(events))
+                } else {
+                    (
+                        decode_response::<crate::AgentRunReceipt>(response).await?,
+                        None,
+                    )
+                };
+                validate_id("agent", &receipt.agent_id)?;
+                validate_id("session", &receipt.session_id)?;
+                validate_id("turn", &receipt.turn.turn_id)?;
+                validate_idempotency_key(&receipt.turn_idempotency_key)?;
+                crate::sse::validate_numeric_cursor(&receipt.turn.accepted_cursor)?;
+                if receipt.turn.accepted_cursor == "0" || receipt.turn.input != *input {
+                    return Err(ManagedError::InvalidResponse(
+                        "agent run receipt differs from submitted input",
+                    ));
+                }
+                Ok((receipt, events, selected_settings))
+            }
+            .await;
+            match result {
+                Ok(result) => return Ok(result),
+                Err(error)
+                    if attempt + 1 < SUBMIT_ATTEMPTS
+                        && (matches!(&error, ManagedError::Transport(_))
+                            || matches!(
+                                &error,
+                                ManagedError::InvalidResponse(
+                                    "agent run disconnected before receipt"
+                                )
+                            )
+                            || matches!(&error, ManagedError::Http { status, .. } if status.is_server_error() || status.as_u16() == 429 || status.as_u16() == 408)) =>
+                {
+                    failure = Some(error);
+                    tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(failure.unwrap_or(ManagedError::InvalidResponse(
+            "agent run retry lost its failure",
+        )))
     }
 
     /// Forks a managed agent at the service's latest committed model boundary.
@@ -486,6 +706,55 @@ impl ManagedClient {
             ));
         }
         Ok(status)
+    }
+
+    /// Selects a manual model and effort before the first accepted message.
+    /// Gateway models retain a direct routing policy; native models clear routing.
+    /// Native reasoning mode and fast mode can then be set with `set_settings`.
+    ///
+    /// # Errors
+    /// Returns validation, transport, HTTP, or invalid receipt failures.
+    pub async fn set_manual_routing(
+        &self,
+        agent_id: &str,
+        model: impl Into<ManagedModel>,
+        thinking: Thinking,
+    ) -> Result<AutoRoutingStatus, ManagedError> {
+        validate_id("agent", agent_id)?;
+        let model = model.into();
+        AgentSettings {
+            model,
+            thinking,
+            reasoning_mode: ReasoningMode::Standard,
+            fast_mode: false,
+        }
+        .validate()?;
+        let body = serde_json::to_vec(&serde_json::json!({ "model": model, "thinking": thinking }))
+            .map_err(|_| ManagedError::InvalidResponse("failed to encode manual routing"))?;
+        let receipt: AutoRoutingStatus = self
+            .json(
+                Method::POST,
+                &format!("{}/routing", agent_path(agent_id)),
+                Some(&body),
+                None,
+            )
+            .await?;
+        let gateway = matches!(
+            model,
+            ManagedModel::Oai(Model::Glm53 | Model::Kimi | Model::Mimo)
+        );
+        if receipt.enabled != gateway
+            || !receipt.settings.is_valid()
+            || receipt.settings.reasoning_mode != ReasoningMode::Standard
+            || receipt.settings.fast_mode
+            || receipt.settings.model != model
+            || receipt.settings.thinking != thinking
+        {
+            return Err(ManagedError::InvalidResponse(
+                "invalid manual routing receipt",
+            ));
+        }
+        Ok(receipt)
     }
 
     /// Reads the actual retained provider/model without altering the thread.
@@ -1344,7 +1613,9 @@ impl ManagedClient {
         if let Some(origin) = &self.request_origin {
             request = request.header("x-nanocodex-client-context", origin.clone());
         }
-        let eligible = (url.path() == "/v1/agents" || url.path().starts_with("/v1/agents/"))
+        let eligible = (url.path() == "/v1/agent-runs"
+            || url.path() == "/v1/agents"
+            || url.path().starts_with("/v1/agents/"))
             && ![
                 "ws",
                 "events",

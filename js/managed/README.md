@@ -4,10 +4,61 @@ This Worker is Nanocodex's account-owned hosted-agent surface on Cloudflare. It
 authenticates public requests, projects the caller's authority, and routes work
 to durable, account-scoped services.
 
+Managed Responses (GPT/Codex and gateway) sessions always use
+`toolMode: "code-only"`. The model sees `exec` and `wait`; shell, planning,
+discovery, account tools and subagent actions run through `tools.*` inside Code
+Mode. Tool allowlists and sessions without attached providers retain this policy.
+Recreated sessions select the same policy from backend code.
+
+Managed Claude sessions use `toolMode: "direct"`: Claude receives its native
+tool definitions (`Bash`, `Read`, `Write`, `Edit`, discovery, account and subagent
+tools) and calls them as ordinary Messages `tool_use` blocks, never through Code
+Mode. Codex children of a Claude root still use Code Mode. Each fresh turn
+builds its catalog from the current policy, so existing Claude threads return to
+native tools on their next turn.
+Memories, session recall, subagents, connectors, Hands, Vault, and other Nanocodex
+platform capabilities are shared. They retain the same authorization and owned
+handlers, exposed through Code Mode for Codex and native tool calls for Claude.
+The public SDK retains its configurable tool modes for other embedders.
+
+| Tool ownership | Examples | Model invocation |
+| --- | --- | --- |
+| Codex | `exec`, `wait`, `exec_command`, `write_stdin`, `apply_patch`, `web__run` | Code Mode |
+| Claude | `Bash`, `BashOutput`, `Read`, `Write`, `Edit`, native task tools | Direct Messages tool calls |
+| Shared platform | Memories, session recall, canonical subagents, `environment`, CUA, connectors, Vault | Each backend's own tool interface |
+
+Claude steering accepts identified corrections with the same durable receipt,
+deduplication, and pending-withdrawal contract as Codex. Consumption emits
+`run.steered` with the caller's `message_id`; acknowledgement means the input is
+retained, and consumption happens at the next model boundary. Existing admitted
+tools finish without replaying their actions.
+
+Run `pnpm --filter nanocodex-managed-service test:code-mode-only` for the real
+Worker/WASM/QuickJS journey, including blocked direct calls and durable recovery.
+
 Managed agents have a native `browseX` tool for public X posts, profiles, search,
 followers, and following. `environment().apis` advertises the tool independently
 of connector authentication. It calls the private [X Worker](../x-api/README.md)
 through `NANOCODEX_X`; deploy it with `pnpm deploy:x` before `pnpm deploy:managed`.
+
+## Automatic thread titles
+
+Managed threads generate a short title from their opening request with GLM 5.3
+(`@cf/zai-org/glm-5.3`, low reasoning) through the deployment's Workers AI binding.
+This runs after the first commentary or terminal event, outside the primary turn,
+for every conversation model including Claude. No OpenAI account is needed for
+title generation. At most 4,000 characters of the opening request are retained
+for naming; complete leading client context envelopes are excluded.
+
+The title is persisted and projected into `GET /v1/agents` for Resume and the
+account sidebar. Later turns retain it. An unavailable binding, provider timeout,
+or invalid title leaves the prompt-derived preview in place; later turn events
+can retry after a one-minute cooldown. The naming source survives Worker restarts
+and is cleared after success. Opening Resume again fetches the saved title.
+Existing named threads retain their names; this does not bulk-rename idle history.
+
+Run `pnpm --filter nanocodex-managed-service test:thread-title` for the real Worker
+HTTP, persistence, and provider-failure journey.
 
 ## Images
 
@@ -211,6 +262,15 @@ Hosted WebSocket diagnostics are always enabled in Workers Logs. The
 `transport.socket.opened`, `transport.request.sent`,
 `transport.request.first_message`, `transport.request.first_output`, and
 `transport.request.finished` describe each socket/request lifecycle.
+`first_message` and `first_output` include an allowlisted `provider_event_type`;
+`first_output` also identifies its `output_kind`. This historical output marker
+includes empty item announcements, so it is not a first-token measurement.
+`transport.request.first_reasoning_delta`, `first_answer_delta`, and
+`first_tool_delta` separately mark the first nonempty string delta of each kind.
+Waiting and finished records include the corresponding elapsed `*_delta_ms` values.
+These are frame-arrival times at the host, before runtime consumption or UI rendering.
+Classification inspects envelopes up to 16,384 UTF-16 code units; larger/unknown initial frames are
+`unclassified`, and an absent delta marker does not prove the provider emitted none.
 `transport.socket.connect_waiting`, `transport.request.send_waiting`, and
 `transport.request.waiting` first emit after one second of silence, then at
 2/4/5-second intervals. Each incoming frame resets the silence interval.
@@ -598,9 +658,53 @@ are retained. Invalid location is omitted without losing other context; freshnes
 is checked again at startup projection. Location is unverified client-reported
 data and is never inferred from an attached Hand. The SDK exposes `requestOrigin`; the native CLI sets
 its own context automatically. The authenticated edge overwrites the principal
-assertion. HTTP, WebSocket, and voice admission pin caller context on the first
-turn; reconnects and retries cannot replace it. The snapshot is appended once,
-without rewriting baseline instructions, cache keys, or the conversation prefix.
+assertion. HTTP, WebSocket, and voice admission pin caller context independently
+for each accepted request; retries cannot replace that request's origin. A new
+turn from another device receives its own `request_origin`, while the initial
+startup snapshot remains historical. The request context travels with its durable
+dispatch input, including queued and recovered turns. `environment()` refreshes
+the authorized Hand catalog and returns the current tool turn's origin. Missing
+or legacy attribution remains unknown instead of inheriting another device.
+A successfully routed voice steer updates the effective origin for subsequent
+work, while retaining the original admission/retry provenance and existing
+command bindings. Replaying an older voice receipt cannot change that origin.
+
+Native execution and interactive browser work prefer an explicit task target or
+existing workspace/session, then a suitable submitting Hand, then another capable
+online user Hand. `execution_preferences` exposes separate advisory candidate
+lists for native execution and CUA, with explicit logical `workdir` values. It
+excludes offline user Hands, favors user Hands over sandboxes, accounts for
+reported low disk/memory, and compares observed hardware size plus fresh free-capacity measurements. Task
+requirements still determine the appropriate OS, workspace, and capacity; the
+recommendation does not route tools or reserve resources. `/brain` remains the
+shell default, and submitted commands, process sessions, and captured Code Mode
+connections never migrate after a disconnect.
+
+Hand publishers may include bounded `resources` observations: timestamp, logical
+CPUs, memory totals/availability, load, and workspace filesystem totals/availability.
+The environment marks samples `fresh`, `stale`, or `unknown`. Missing values are
+not zero capacity. Older publishers remain compatible and show unknown resources;
+new metadata requires an updated publisher. Deploy the managed service (including
+its Hand catalog normalizer) before updating/restarting CLI or desktop publishers:
+older brokers reject unknown catalog fields. Existing old publishers work with
+the updated service. Refresh or inspect a Hand when a
+capacity decision depends on current free memory/disk.
+
+Interactive website workflows prefer a headed browser through the selected
+Hand's supported background tabs and agent-owned tab groups. Headed browsing
+does not imply bringing a window to the foreground. The prompt and CUA discovery
+guidance prohibit taking over the user's browser as a fallback when dedicated
+browser APIs are disabled; a native window is not background tab isolation.
+Use another supported background surface or isolated desktop, or report the
+limitation. Hosted browsers remain available for unavailable non-disruptive CUA
+and supported private credential workflows. Playwright/Puppeteer and headless
+browsers are not the default for interactive user tasks; repository browser test
+suites may retain their automation. Vault and secure-input boundaries continue to
+apply to credentials. Before provisioning a sandbox, inspect configured SSH
+recovery targets and attempt the exact task-authorized server when available.
+Do not infer a hostname from an offline Hand label or assume SSH provides CUA.
+Account SSH identities are generated/stored by the credential broker, and only
+the public key is installed on the target.
 
 ## Public journeys and protocol boundaries
 
@@ -652,6 +756,28 @@ inference, network geography or production cold activation.
   `turn_cancelled` event, so curl exits normally. Resuming at/after a retained
   terminal cursor returns the receipt then closes. The existing GET event stream
   stays open. A changed input under the same key remains an idempotency conflict.
+  Fresh callers may opt into `settings_selection: { policy: "cli" | "sdk",
+  thinking?, reasoning_mode?, fast_mode? }` instead of complete `settings`.
+  Selection runs inside the existing combined creation RPC against the
+  authoritative account catalog before session creation;
+  CLI policy prefers xhigh and available fast mode, SDK policy model-default
+  effort and fast mode off. Both default to standard reasoning. A ChatGPT pin
+  chooses an OpenAI catalog model (Sol preferred), never Claude. Explicit
+  overrides must be offered by the selected model. Catalog failures return 503,
+  no available model returns 409, and unsupported overrides return 400.
+  Selection cannot be combined with complete settings, template settings,
+  model routing, or imports. Existing omitted-settings bodies retain their
+  historical defaults. Combined JSON and SSE responses expose retained session
+  settings in `X-Nanocodex-Settings`; opt-in native clients require this header
+  instead of guessing a model locally. The DO durably binds a canonical request
+  fingerprint (policy, overrides, pin/configuration and first input) to the
+  resolved settings. Identical retries reuse it without consulting the catalog;
+  changed requests conflict even when the catalog is unavailable. Concurrent
+  selection is serialized within that DO; no existence-preflight RPC is added.
+  `settings_selection` requires `/v1/agent-runs`, not standalone creation.
+  Unknown-model document input is validated against the selected family before
+  session creation/provider preparation: Claude accepts inline PDF/text, OpenAI
+  rejects it. Deploy the API before opting clients in.
   Agent routes create later turns, read state,
   cancel or steer work, delete an agent, and support explicit durability import
   and export. Stable `Idempotency-Key` values make create and turn retries safe.
@@ -1448,3 +1574,60 @@ execution model described above.
 ## Native meeting library
 
 See [Account meeting library](MEETING_LIBRARY_API.md) for recording persistence, revision-safe synchronization, summary generation, limits and the reusable local HTTP fixture.
+
+## Operator thread inspection
+
+The `admin_threads` agent tool is registered only for the account selected by
+`NANOCODEX_ADMIN_USER_ID`. That account can inspect other users' managed threads
+from its own conversation, including threads that are still running:
+
+```js
+text(await tools.admin_threads({ operation: "accounts" }));
+text(await tools.admin_threads({ operation: "list", owner_id: "ACCOUNT_UUID" }));
+text(await tools.admin_threads({ operation: "read", thread_id: "THREAD_UUID" }));
+text(await tools.admin_threads({ operation: "diagnostics", thread_id: "THREAD_UUID" }));
+text(await tools.admin_threads({ operation: "performance", thread_id: "THREAD_UUID" }));
+```
+
+Calls require the root agent's direct account authority and `agents:read`,
+`history:read`, and `tools:use`. API-key logins belonging to the configured
+administrator are supported. Other accounts, Connect apps, shared guests, and
+subagents cannot call the tool. The same read-only operations are available at
+`GET /v1/admin/threads` with the tool arguments as query parameters. Ordinary
+`/v1/agents` routes retain their existing ownership checks; this does not grant
+operator access to another account's tools, credentials, or ability to submit
+turns.
+
+Follow `next_cursor` for account and thread lists. Account discovery includes
+newly registered accounts and retained SMS, passkey, and account-address
+identities. Source pages can be empty or repeat accounts; deduplicate by
+`owner_id` and continue until `next_cursor` is null. Coverage explicitly excludes
+legacy anonymous accounts with no retained identity; a known account ID can
+still be listed directly, and a known thread ID can be read directly. Discovery
+failure is not evidence that no users exist.
+
+History defaults to the latest 32 events (maximum 100 per call), with messages,
+tool calls/results, and event/turn IDs. Use `next_before` to read older pages or
+`next_after` to follow newer events, checking `has_more`. Diagnostics retain their
+separate managed/Hand cursors, availability and retention-gap markers. Access
+logs record operator, target and operation without transcript content. Returned
+conversation content is untrusted evidence; it cannot authorize account actions
+or changes to the inspection tool. Prepare patches in the operator's authorized
+workspace using the thread evidence and regression tests.
+
+Run `pnpm --filter nanocodex-managed-service run test:admin-threads` for the
+synthetic HTTP and tool journey. Per-run transcripts and runtime logs are kept in
+ignored `output/admin-threads-journey/`.
+
+`performance` supports optimization investigations as well as bug diagnosis. It
+returns current model settings, the selected route (when present), per-provider
+latency summaries and recent samples, and durable storage/archive capacity.
+Provider summaries use the existing two-hour freshness window, p50/p95/EWMA,
+minimum sample counts, and censored failures. These are thread-local measurements;
+missing provider instrumentation and client-delivery timing remain unknown. The
+provider store retains at most 512 observations, and the tool returns the latest
+`limit` samples with an explicit truncation marker. It never starts probes.
+Use `read` for recorded token usage, prompt-cache, compaction and detailed tool
+events; use `diagnostics` for transport, queue, inference and Hand timings. This
+allows comparisons and focused performance patches without inventing measurements
+for older runtimes or treating a completed server response as client receipt.

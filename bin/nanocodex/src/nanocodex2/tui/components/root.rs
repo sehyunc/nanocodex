@@ -5,6 +5,7 @@
 
 use super::{
     actions::{Action, ActionAvailability, ActionsEffect, ActionsEvent, ActionsMenu},
+    code_review::{CodeReviewEffect, CodeReviewSelector},
     composer::{
         Composer, ComposerChromeTarget, ComposerDraft, ComposerEffect, ComposerEvent,
         SettingsCommand,
@@ -253,6 +254,7 @@ pub(crate) enum RootEvent {
 
 pub(crate) struct RestoredSessionProjection {
     transcript: Transcript,
+    subagents: SubagentTree,
     context_diagnostics: ContextDiagnostics,
     context_tokens: Option<u64>,
     recent_prompts: Vec<RecentPromptDraft>,
@@ -265,6 +267,7 @@ impl RestoredSessionProjection {
         records: impl IntoIterator<Item = Arc<TranscriptRecord>>,
     ) {
         for record in records {
+            self.subagents.observe_record(&record);
             if self.transcript.ignores_finished_run_event(&record) {
                 continue;
             }
@@ -274,6 +277,10 @@ impl RestoredSessionProjection {
             let observation = self.context_diagnostics.observe(&record);
             if observation.completed_tokens.is_some() {
                 self.context_tokens = observation.completed_tokens;
+            }
+            if let Some(r) = crate::tui::secure_input::request(&record) {
+                self.seen_vault_requests
+                    .insert(format!("private:{}:{}", r.agent(), r.id()));
             }
             if let Some((key, _)) = crate::tui::vault::request(&record) {
                 self.seen_vault_requests.insert(key);
@@ -302,6 +309,7 @@ pub(crate) enum SessionListKind {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RootEffect {
     AutoRoute,
+    Connectors(String),
     Reload,
     SetDone(bool),
     Bug(String),
@@ -310,7 +318,7 @@ pub(crate) enum RootEffect {
     Voice(crate::voice::Command),
     ShowAgentId,
     Vault(crate::tui::vault::Command),
-    SecureInput(Option<nanocodex_managed::NativeSecureInputRequest>),
+    SecureInput(Option<crate::tui::secure_input::Request>),
     Share(crate::tui::share::Command),
     ApproveVault(crate::tui::vault::Review),
     Submit(Submission),
@@ -356,6 +364,7 @@ pub(crate) enum RootEffect {
         text: String,
     },
     Copy(String),
+    CopyResponse(String),
     Handoff,
     Review {
         download_assets: bool,
@@ -385,6 +394,7 @@ enum Overlay {
     VoiceMenu(Node<super::voice_menu::VoiceMenu>),
     VoiceClone(String, bool, u16, bool),
     Actions(Node<ActionsMenu>),
+    CodeReview(Node<CodeReviewSelector>),
     ContextDiagnostics(Node<ContextDiagnosticsPanel>),
     Effort(Node<EffortSelector>),
     Model(Node<ModelSelector>),
@@ -453,6 +463,7 @@ pub(crate) struct RootNode {
     queue_edit: Option<QueueEdit>,
     selection: Selection,
     selection_auto_scroll: Option<SelectionAutoScroll>,
+    selection_press: Option<Position>,
     transcript_area: Rect,
     composer_area: Rect,
     composer_content_area: Rect,
@@ -475,6 +486,7 @@ pub(crate) struct RootNode {
     theme_mode: ThemeMode,
     preferred_reasoning_mode: ReasoningMode,
     subagents: SubagentTree,
+    pending_recent_prompts: bool,
     context_diagnostics: ContextDiagnostics,
     recent_prompts: Vec<RecentPromptDraft>,
     seen_vault_requests: std::collections::HashSet<String>,
@@ -495,6 +507,7 @@ impl RootNode {
             Overlay::VoiceClone(..) => "voice_clone",
             Overlay::AgentId(_) => "agent_id",
             Overlay::Actions(_) => "actions",
+            Overlay::CodeReview(_) => "review",
             Overlay::ContextDiagnostics(_) => "context",
             Overlay::Effort(_) => "effort",
             Overlay::Model(_) => "model",
@@ -511,6 +524,10 @@ impl RootNode {
             "execution":if self.has_active_turns() {"running"} else {"idle"},
             "ui_blocked":self.blocking_task.is_some() || self.key_confirmation.is_some() || self.queue_edit.is_some(),
             "questions":{"supported":false}})
+    }
+
+    pub(crate) fn subagent_overlay_open(&self) -> bool {
+        matches!(self.overlay, Some(Overlay::Subagents(_)))
     }
 
     pub(crate) fn new(workspace: &Path, thinking: ReasoningEffort) -> Self {
@@ -538,6 +555,7 @@ impl RootNode {
             queue_edit: None,
             selection: Selection::default(),
             selection_auto_scroll: None,
+            selection_press: None,
             transcript_area: Rect::default(),
             composer_area: Rect::default(),
             composer_content_area: Rect::default(),
@@ -560,6 +578,7 @@ impl RootNode {
             theme_mode: ThemeMode::Auto,
             preferred_reasoning_mode: ReasoningMode::Standard,
             subagents,
+            pending_recent_prompts: false,
             context_diagnostics: ContextDiagnostics::default(),
             recent_prompts: Vec::new(),
             seen_vault_requests: Default::default(),
@@ -608,9 +627,9 @@ impl RootNode {
             {
                 return ComponentUpdate::none();
             }
-            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Tab) && key.modifiers.is_empty() {
                 let draft = self.composer.component().draft().trim();
-                if matches!(draft, "/exit" | "/quit") {
+                if key.code == KeyCode::Enter && matches!(draft, "/exit" | "/quit") {
                     return ComponentUpdate {
                         effects: vec![RootEffect::Shutdown],
                         render: RenderRequest::None,
@@ -802,6 +821,7 @@ impl RootNode {
     ) -> RestoredSessionProjection {
         let mut projection = RestoredSessionProjection {
             transcript: Transcript::with_effort(thinking),
+            subagents: SubagentTree::new(thinking),
             context_diagnostics: ContextDiagnostics::default(),
             context_tokens: None,
             recent_prompts: Vec::new(),
@@ -824,6 +844,16 @@ impl RootNode {
             .set_effort(self.composer.component().effort());
         self.seen_vault_requests
             .extend(projection.seen_vault_requests);
+        projection.subagents.set_workspace(&self.workspace);
+        projection.subagents.preserve_view_from(&self.subagents);
+        self.subagents = projection.subagents;
+        let _ = self
+            .composer
+            .component_mut()
+            .update(ComposerEvent::ActiveSubagents {
+                count: self.subagents.active_count(),
+                now: Instant::now(),
+            });
         self.transcript = Node::new(projection.transcript);
         self.context_diagnostics = projection.context_diagnostics;
         self.recent_prompts = projection.recent_prompts;
@@ -844,6 +874,7 @@ impl RootNode {
         fast_mode: bool,
         mut projection: RestoredSessionProjection,
     ) {
+        self.pending_recent_prompts = false;
         let preserve_active_submission = !self.resuming_session
             && (self.has_active_turns()
                 || !self.queue.component().is_empty()
@@ -877,6 +908,16 @@ impl RootNode {
         projection.transcript.set_workspace(workspace);
         self.seen_vault_requests
             .extend(projection.seen_vault_requests);
+        projection.subagents.set_workspace(&self.workspace);
+        projection.subagents.preserve_view_from(&self.subagents);
+        self.subagents = projection.subagents;
+        let _ = self
+            .composer
+            .component_mut()
+            .update(ComposerEvent::ActiveSubagents {
+                count: self.subagents.active_count(),
+                now: Instant::now(),
+            });
         self.transcript = Node::new(projection.transcript);
         self.context_diagnostics = projection.context_diagnostics;
         self.recent_prompts = projection.recent_prompts;
@@ -895,6 +936,10 @@ impl RootNode {
 
     pub(crate) fn allows_pane_switch(&self) -> bool {
         self.overlay.is_none() && !self.composer.component().draft().starts_with('/')
+    }
+
+    pub(crate) const fn recent_prompts_loading(&self) -> bool {
+        self.pending_recent_prompts
     }
 
     pub(crate) const fn composer(&self) -> &Composer {
@@ -1184,6 +1229,7 @@ impl RootNode {
                 }
                 Overlay::VoiceMenu(menu) => menu.render(frame, area, theme),
                 Overlay::Actions(actions) => actions.render(frame, area, theme),
+                Overlay::CodeReview(selector) => selector.render(frame, area, theme),
                 Overlay::ContextDiagnostics(panel) => panel.render(frame, area, theme),
                 Overlay::Effort(selector) => selector.render(frame, area, theme),
                 Overlay::Model(selector) => selector.render(frame, area, theme),
@@ -1236,6 +1282,11 @@ impl RootNode {
         }
         if is_confirmation_key_repeat(&event) {
             return ComponentUpdate::none();
+        }
+        if self.pending_recent_prompts && (is_escape(&event) || is_control_c(&event)) {
+            self.pending_recent_prompts = false;
+            self.key_confirmation = None;
+            return self.resume_after_session_lookup();
         }
         if self.pending_session_list.is_some() && (is_escape(&event) || is_control_c(&event)) {
             return self.cancel_session_list();
@@ -1353,7 +1404,8 @@ impl RootNode {
                     && matches!(
                         self.composer.component().draft().split_whitespace().next(),
                         Some(
-                            "/share"
+                            "/copy"
+                                | "/share"
                                 | "/voice"
                                 | "/screen"
                                 | "/zoom"
@@ -1395,7 +1447,7 @@ impl RootNode {
             }
             return self.update_composer(ComposerEvent::Terminal(event), RenderRequest::Immediate);
         }
-        if !self.interactive || self.pending_session_list.is_some() {
+        if !self.interactive || self.pending_session_list.is_some() || self.pending_recent_prompts {
             return ComponentUpdate::none();
         }
         if self.queue_edit.is_some() {
@@ -1664,11 +1716,21 @@ impl RootNode {
             MouseEventKind::Down(MouseButton::Left) => {
                 let (surface, span) = self.selection_span_at(position)?;
                 self.selection.begin(surface, span);
+                self.selection_press = Some(position);
                 self.selection_auto_scroll = None;
                 Some(ComponentUpdate::render(RenderRequest::Immediate))
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 let surface = self.selection.surface()?;
+                // Terminals can report mouse motion within the pressed cell.
+                // Keep it a click until the pointer actually moves. An active
+                // drag stays a selection even if it returns to its first cell.
+                if self.selection.is_pending()
+                    && !self.selection.is_active()
+                    && self.selection_press == Some(position)
+                {
+                    return Some(ComponentUpdate::none());
+                }
                 let span = self.selection_span_on(surface, position)?;
                 self.selection.drag(span);
                 self.begin_selection_auto_scroll(surface, position);
@@ -1890,6 +1952,7 @@ impl RootNode {
                 self.update_voice_output(event)
             }
             Some(Overlay::Actions(_)) => self.update_actions(event),
+            Some(Overlay::CodeReview(_)) => self.update_code_review(event),
             Some(Overlay::ContextDiagnostics(_)) => self.update_context_diagnostics(event),
             Some(Overlay::Effort(_)) => self.update_effort(EffortEvent::Terminal { event, now }),
             Some(Overlay::Model(_)) => {
@@ -2108,9 +2171,9 @@ impl RootNode {
             fast_mode: self.composer.component().fast_mode(),
             fast_mode_available: self.composer.component().model().supports_fast_mode(),
             effort: self.thread == ThreadState::New
-                || self.composer.component().model().oai().is_some(),
+                || self.composer.component().model().supports_fast_mode(),
             voice_input: self.composer.component().model().oai().is_some(),
-            model: self.thread == ThreadState::New && !self.composer.component().auto_routing(),
+            model: self.thread == ThreadState::New,
             auto_route: self.thread == ThreadState::New
                 && !self.has_active_turns()
                 && !self.composer.component().auto_routing(),
@@ -2145,10 +2208,12 @@ impl RootNode {
         if self.side_pane {
             match update.effects.first() {
                 Some(ActionsEffect::Dismiss | ActionsEffect::Trigger(Action::Keybindings))
-                | Some(ActionsEffect::Trigger(Action::AgentId | Action::Zoom))
+                | Some(ActionsEffect::Trigger(Action::AgentId | Action::Zoom | Action::Copy))
                 | Some(ActionsEffect::Settings(
                     SettingsCommand::CloseBtw | SettingsCommand::Zoom,
                 )) => {}
+                Some(ActionsEffect::Submit(command))
+                    if command.split_whitespace().next() == Some("/copy") => {}
                 Some(_) => {
                     self.overlay = None;
                     self.notification = Some(Notification::plain("Use /btw for questions and /close to leave; other controls belong to the main thread".into(), Color::Yellow));
@@ -2160,6 +2225,10 @@ impl RootNode {
         match update.effects.into_iter().next() {
             Some(ActionsEffect::Dismiss) => self.overlay = None,
             Some(ActionsEffect::Submit(command)) => return self.submit_action_command(command),
+            Some(ActionsEffect::Trigger(Action::Copy)) => {
+                self.overlay = None;
+                return self.copy_response("");
+            }
             Some(ActionsEffect::Trigger(Action::Share)) => {
                 return self.submit_action_command("/share".to_owned());
             }
@@ -2190,6 +2259,9 @@ impl RootNode {
                 self.overlay = None;
                 return self
                     .apply_settings_command(SettingsCommand::Voice(crate::voice::Command::Toggle));
+            }
+            Some(ActionsEffect::Trigger(Action::Subagents)) => {
+                self.overlay = Some(Overlay::Subagents(SubagentOverlay::Tree));
             }
             Some(ActionsEffect::Trigger(Action::AgentId)) => {
                 self.overlay = None;
@@ -2270,12 +2342,7 @@ impl RootNode {
             }
             Some(ActionsEffect::Trigger(Action::Review)) => {
                 self.overlay = None;
-                return ComponentUpdate {
-                    effects: vec![RootEffect::Review {
-                        download_assets: false,
-                    }],
-                    render: RenderRequest::Immediate,
-                };
+                return self.apply_code_review(crate::tui::review::Command::Choose);
             }
             Some(ActionsEffect::Trigger(Action::Handoff)) => {
                 self.overlay = None;
@@ -2355,9 +2422,11 @@ impl RootNode {
     }
 
     fn open_effort(&mut self) -> ComponentUpdate<RootEffect> {
-        if self.thread != ThreadState::New && self.composer.component().model().oai().is_none() {
+        if self.thread != ThreadState::New
+            && !self.composer.component().model().supports_fast_mode()
+        {
             self.notification = Some(Notification::plain(
-                "Claude effort is fixed after the first prompt; start a new session".into(),
+                "This model’s effort is fixed after the first prompt; start a new session".into(),
                 Color::Red,
             ));
             return ComponentUpdate::render(RenderRequest::Immediate);
@@ -2374,9 +2443,6 @@ impl RootNode {
     }
 
     fn open_model(&mut self) -> ComponentUpdate<RootEffect> {
-        if self.composer.component().auto_routing() {
-            return self.routing_settings_locked();
-        }
         if self.thread != ThreadState::New {
             self.notification = Some(Notification::plain(
                 "The model can only be changed before the first prompt".to_owned(),
@@ -2522,17 +2588,14 @@ impl RootNode {
         update
     }
 
+    fn recent_prompt_lookup_status(&mut self) -> RenderRequest {
+        self.session_loading_status("Loading recent prompts… · Esc cancel")
+    }
+
     fn load_recent_prompts(&mut self) -> ComponentUpdate<RootEffect> {
         self.overlay = None;
-        self.interactive = false;
-        let _ = self
-            .composer
-            .component_mut()
-            .update(ComposerEvent::Activity {
-                active: true,
-                status: Some("Loading recent prompts…".to_owned()),
-                now: Instant::now(),
-            });
+        self.pending_recent_prompts = true;
+        let _ = self.recent_prompt_lookup_status();
         ComponentUpdate {
             effects: vec![RootEffect::LoadRecentPrompts(self.recent_prompts.clone())],
             render: RenderRequest::Immediate,
@@ -2544,11 +2607,14 @@ impl RootNode {
         session_id: String,
         prompts: Vec<RecentPrompt>,
     ) -> ComponentUpdate<RootEffect> {
-        self.restore_session_activity();
+        if !std::mem::take(&mut self.pending_recent_prompts) {
+            return ComponentUpdate::none();
+        }
+        let update = self.resume_after_session_lookup();
         self.overlay = Some(Overlay::RecentPrompts(Node::new(RecentPromptPicker::new(
             prompts, session_id,
         ))));
-        ComponentUpdate::render(RenderRequest::Immediate)
+        update
     }
 
     fn update_recent_prompt_picker(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
@@ -2576,8 +2642,11 @@ impl RootNode {
     }
 
     fn recent_prompt_load_failed(&mut self, message: String) -> ComponentUpdate<RootEffect> {
+        if !std::mem::take(&mut self.pending_recent_prompts) {
+            return ComponentUpdate::none();
+        }
         self.notification = Some(Notification::plain(message, Color::Red));
-        self.restore_session_activity()
+        self.resume_after_session_lookup()
     }
 
     fn sessions_loaded(
@@ -2829,9 +2898,11 @@ impl RootNode {
     }
 
     fn apply_effort(&mut self, effort: ReasoningEffort, pro: bool) -> ComponentUpdate<RootEffect> {
-        if self.thread != ThreadState::New && self.composer.component().model().oai().is_none() {
+        if self.thread != ThreadState::New
+            && !self.composer.component().model().supports_fast_mode()
+        {
             self.notification = Some(Notification::plain(
-                "Claude effort is fixed after the first prompt; start a new session".into(),
+                "This model’s effort is fixed after the first prompt; start a new session".into(),
                 Color::Red,
             ));
             return ComponentUpdate::render(RenderRequest::Immediate);
@@ -2922,9 +2993,6 @@ impl RootNode {
             ));
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
-        if self.composer.component().auto_routing() {
-            return self.routing_settings_locked();
-        }
         if self.thread != ThreadState::New {
             self.notification = Some(Notification::plain(
                 "The model can only be changed before the first prompt".to_owned(),
@@ -2932,7 +3000,7 @@ impl RootNode {
             ));
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
-        if model == self.composer.component().model() {
+        if model == self.composer.component().model() && !self.composer.component().auto_routing() {
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
         self.interactive = false;
@@ -3023,6 +3091,12 @@ impl RootNode {
     }
 
     fn finish_queue_edit(&mut self, save: bool) -> ComponentUpdate<RootEffect> {
+        // A local command typed into the queue editor must never become a
+        // future model prompt; leave the editor open so it can be corrected.
+        if save && self.composer.component().draft().split_whitespace().next() == Some("/copy") {
+            let argument = self.composer.component().draft().trim()["/copy".len()..].to_owned();
+            return self.copy_response(&argument);
+        }
         let Some(edit) = self.queue_edit.take() else {
             return ComponentUpdate::none();
         };
@@ -3086,6 +3160,37 @@ impl RootNode {
         update
     }
 
+    // Adapted from clabby/tact's /copy command (Apache-2.0).
+    fn copy_response(&mut self, argument: &str) -> ComponentUpdate<RootEffect> {
+        let argument = argument.trim();
+        let index = if argument.is_empty() {
+            Some(1)
+        } else if argument.bytes().all(|byte| byte.is_ascii_digit()) {
+            argument.parse::<usize>().ok().filter(|index| *index > 0)
+        } else {
+            None
+        };
+        let result = match index {
+            Some(index) => self
+                .transcript
+                .component()
+                .assistant_response(index)
+                .map(|text| RootEffect::CopyResponse(text.to_owned()))
+                .ok_or_else(|| format!("No completed assistant response at position {index}.")),
+            None => Err("Usage: /copy [N], where N is a positive integer (1 = latest).".to_owned()),
+        };
+        match result {
+            Ok(effect) => ComponentUpdate {
+                effects: vec![effect],
+                render: RenderRequest::Immediate,
+            },
+            Err(message) => {
+                self.notification = Some(Notification::plain(message, Color::Red));
+                ComponentUpdate::render(RenderRequest::Immediate)
+            }
+        }
+    }
+
     fn update_composer(
         &mut self,
         event: ComposerEvent,
@@ -3096,6 +3201,13 @@ impl RootNode {
             && let Some(ComposerEffect::Settings(command)) = &update.effect
         {
             return self.apply_settings_command(command.clone());
+        }
+        // Copy is a local control even while a turn is active. Intercept both
+        // submit and queue before changing thread state or delivering input.
+        if let Some(ComposerEffect::Submit(prompt) | ComposerEffect::Queue(prompt)) = &update.effect
+            && prompt.display_text().split_whitespace().next() == Some("/copy")
+        {
+            return self.copy_response(prompt.display_text().trim()["/copy".len()..].trim());
         }
         let delivered = matches!(
             &update.effect,
@@ -3128,12 +3240,24 @@ impl RootNode {
                             agent.clone(),
                         )
                         .ok()
+                        .map(crate::tui::secure_input::Request::Sudo)
                     }
                     _ => self.transcript.component().secure_input_request(&command),
                 };
                 vec![RootEffect::SecureInput(request)]
             }
             Some(ComposerEffect::Vault(command)) => {
+                if command == crate::tui::vault::Command::Latest
+                    && let Some(r @ crate::tui::secure_input::Request::Private(_)) = self
+                        .transcript
+                        .component()
+                        .secure_input_request(&crate::tui::secure_input::Command::Latest)
+                {
+                    return ComponentUpdate {
+                        effects: vec![RootEffect::SecureInput(Some(r))],
+                        render: RenderRequest::Immediate,
+                    };
+                }
                 let command = if command == crate::tui::vault::Command::Latest {
                     self.transcript
                         .component()
@@ -3145,6 +3269,11 @@ impl RootNode {
                 vec![RootEffect::Vault(command)]
             }
             Some(ComposerEffect::ShowAgentId) => vec![RootEffect::ShowAgentId],
+            Some(ComposerEffect::Submit(prompt))
+                if prompt.display_text().split_whitespace().next() == Some("/connectors") =>
+            {
+                vec![RootEffect::Connectors(prompt.display_text().to_owned())]
+            }
             // Goal controls are intercepted by the managed server and must not
             // wait behind active model work or an unacknowledged steer.
             Some(ComposerEffect::Submit(prompt))
@@ -3242,6 +3371,7 @@ impl RootNode {
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
         match command {
+            SettingsCommand::CodeReview(command) => self.apply_code_review(command),
             SettingsCommand::Btw(question) => {
                 if self.side_pane {
                     self.notification =
@@ -3356,6 +3486,70 @@ impl RootNode {
                 self.notification = Some(Notification::plain(message, Color::Red));
                 ComponentUpdate::render(RenderRequest::Immediate)
             }
+        }
+    }
+
+    fn apply_code_review(
+        &mut self,
+        command: crate::tui::review::Command,
+    ) -> ComponentUpdate<RootEffect> {
+        use crate::tui::review::Command;
+        if let Command::Invalid(message) = command {
+            self.notification = Some(Notification::plain(message, Color::Red));
+            return ComponentUpdate::render(RenderRequest::Immediate);
+        }
+        if !self.action_availability().new_session {
+            self.notification = Some(Notification::plain(
+                "Finish active work before starting a review".into(),
+                Color::Yellow,
+            ));
+            return ComponentUpdate::render(RenderRequest::Immediate);
+        }
+        match command {
+            Command::Choose => {
+                self.overlay = Some(Overlay::CodeReview(Node::new(CodeReviewSelector::new())));
+                ComponentUpdate::render(RenderRequest::Immediate)
+            }
+            Command::Run(target) => {
+                self.overlay = None;
+                // Use ordinary admission, streaming, cancellation and recovery. Keep
+                // any unsent composer draft intact when launched from the palette.
+                self.thread = ThreadState::Started;
+                self.in_flight_turns = self.in_flight_turns.saturating_add(1);
+                self.update_transcript(TranscriptEvent::FollowTail);
+                self.sync_live_controls();
+                let _ = self
+                    .composer
+                    .component_mut()
+                    .update(ComposerEvent::Activity {
+                        active: true,
+                        status: Some("Reviewing…".into()),
+                        now: Instant::now(),
+                    });
+                ComponentUpdate {
+                    effects: vec![RootEffect::Submit(Submission::text(target.prompt()))],
+                    render: RenderRequest::Immediate,
+                }
+            }
+            Command::Invalid(_) => unreachable!(),
+        }
+    }
+
+    fn update_code_review(&mut self, event: Event) -> ComponentUpdate<RootEffect> {
+        let Some(Overlay::CodeReview(selector)) = &mut self.overlay else {
+            return ComponentUpdate::none();
+        };
+        let update = selector.update(event);
+        match update.effects.into_iter().next() {
+            Some(CodeReviewEffect::Run(target)) => {
+                self.overlay = None;
+                self.apply_code_review(crate::tui::review::Command::Run(target))
+            }
+            Some(CodeReviewEffect::Dismiss) => {
+                self.overlay = None;
+                ComponentUpdate::render(RenderRequest::Immediate)
+            }
+            None => ComponentUpdate::render(update.render),
         }
     }
 
@@ -3522,6 +3716,10 @@ impl RootNode {
             let _ = self.session_lookup_status();
             return ComponentUpdate::render(RenderRequest::Immediate);
         }
+        if self.pending_recent_prompts {
+            let _ = self.recent_prompt_lookup_status();
+            return ComponentUpdate::render(RenderRequest::Immediate);
+        }
         self.interactive = true;
         let active = self.has_active_turns();
         let status = active.then(|| {
@@ -3558,6 +3756,7 @@ impl RootNode {
     }
 
     fn agent_stream_closed(&mut self) -> ComponentUpdate<RootEffect> {
+        self.pending_recent_prompts = false;
         self.managed_active_turns = 0;
         self.interactive = false;
         self.reconnecting = Some(true);
@@ -3578,6 +3777,7 @@ impl RootNode {
         pending_local: bool,
         reasoning_mode: ReasoningMode,
     ) -> ComponentUpdate<RootEffect> {
+        self.pending_recent_prompts = false;
         self.set_reasoning_modes(reasoning_mode, reasoning_mode);
         self.reconnecting = None;
         self.interactive = self.pending_session_list.is_none() && !self.resuming_session;
@@ -3797,6 +3997,8 @@ impl RootNode {
             render.max(self.session_resume_status())
         } else if self.pending_session_list.is_some() && self.reconnecting.is_none() {
             render.max(self.session_lookup_status())
+        } else if self.pending_recent_prompts && self.reconnecting.is_none() {
+            render.max(self.recent_prompt_lookup_status())
         } else {
             render
         }
@@ -3814,6 +4016,7 @@ impl RootNode {
             // reconnection or a session lookup owns the input controls.
             if self.reconnecting.is_some()
                 || self.pending_session_list.is_some()
+                || self.pending_recent_prompts
                 || self.resuming_session
             {
                 continue;
@@ -3982,6 +4185,16 @@ impl RootNode {
     }
 
     fn transcript_record(&mut self, record: Arc<TranscriptRecord>) -> ComponentUpdate<RootEffect> {
+        let subagents_changed = self.subagents.observe_record(&record);
+        if subagents_changed {
+            let _ = self
+                .composer
+                .component_mut()
+                .update(ComposerEvent::ActiveSubagents {
+                    count: self.subagents.active_count(),
+                    now: Instant::now(),
+                });
+        }
         if self
             .transcript
             .component()
@@ -3999,8 +4212,27 @@ impl RootNode {
                 .component_mut()
                 .replace(self.context_diagnostics.clone());
         }
-        let vault = crate::tui::vault::request(&record);
+        let private = crate::tui::secure_input::request(&record);
+        // A recognized private intake exclusively owns this request, including echoes.
+        let vault = if private.is_none() {
+            crate::tui::vault::request(&record)
+        } else {
+            None
+        };
         let mut update = self.update_transcript(TranscriptEvent::Record(record));
+        if subagents_changed {
+            update.render = update.render.max(RenderRequest::Streaming);
+        }
+        if let Some(request) = private
+            && self.seen_vault_requests.insert(format!(
+                "private:{}:{}",
+                request.agent(),
+                request.id()
+            ))
+        {
+            update.effects.push(RootEffect::SecureInput(Some(request)));
+            update.render = RenderRequest::Immediate;
+        }
         if let Some((key, command)) = vault
             && self.seen_vault_requests.insert(key)
         {
@@ -4062,6 +4294,7 @@ impl Component for RootNode {
             }
             RootEvent::AgentStreamClosed => self.agent_stream_closed(),
             RootEvent::AgentConnecting => {
+                self.pending_recent_prompts = false;
                 self.interactive = false;
                 self.reconnecting = Some(true);
                 self.reconnection_status("Connecting…")
@@ -4072,6 +4305,7 @@ impl Component for RootNode {
                 reasoning_mode,
             } => self.agent_reconnected(active_turns, pending_local, reasoning_mode),
             RootEvent::AgentReconnectFailed(error) => {
+                self.pending_recent_prompts = false;
                 self.reconnecting = Some(false);
                 self.notification = Some(Notification::plain(error, Color::Red));
                 self.reconnection_status("Connection lost · Enter to reconnect")
@@ -5390,8 +5624,44 @@ mod live_control_tests {
             root.update(RootEvent::Transcript(create))
                 .effects
                 .as_slice(),
-            [RootEffect::Vault(crate::tui::vault::Command::Open)]
+            [RootEffect::SecureInput(Some(
+                crate::tui::secure_input::Request::Private(_)
+            ))]
         ));
+        let private_hint = json!({"type":"browser_login","status":"input_required",
+            "request_id":"11111111-1111-4111-8111-111111111111","challenge_id":"11111111-1111-4111-8111-111111111111",
+            "agent_id":"agent","origin":"https://example.com","allowed_origins":["https://example.com"],"expires_at":9000000000000_u64});
+        let nested = record(
+            5,
+            "exec",
+            json!({"content":[{"type":"text","text":format!("Script completed\nWall time: 1s\nOutput:\n{}",json!({"content":[{"type":"text","text":private_hint.to_string()}],"structuredContent":private_hint}))}]}),
+        );
+        let mut live = root_with_draft("untouched draft");
+        assert!(matches!(
+            live.update(RootEvent::Transcript(nested.clone()))
+                .effects
+                .as_slice(),
+            [RootEffect::SecureInput(Some(
+                crate::tui::secure_input::Request::Private(_)
+            ))]
+        ));
+        assert!(
+            live.update(RootEvent::Transcript(nested.clone()))
+                .effects
+                .is_empty()
+        );
+        let mut replay = root_with_draft("untouched draft");
+        replay.replay_history(RootNode::project_open_session(
+            ReasoningEffort::default(),
+            vec![nested.clone()],
+        ));
+        assert!(
+            replay
+                .update(RootEvent::Transcript(nested))
+                .effects
+                .is_empty()
+        );
+        assert_eq!(replay.composer.component().draft(), "untouched draft");
         let invalid = record(
             4,
             "request_vault_intake",
@@ -5536,7 +5806,7 @@ mod live_control_tests {
         assert!(root.transcript.component().activity().active);
         assert_eq!(
             root.transcript.component().activity().status.as_deref(),
-            Some("Running exec command…")
+            Some("Agent 7: Running exec command…")
         );
         assert!(!root.has_active_turns());
         let mut terminal =
@@ -5749,42 +6019,6 @@ mod live_control_tests {
             root.update(key(KeyCode::Enter)).effects.as_slice(),
             [RootEffect::Submit(prompt)] if prompt.display_text() == "first prompt"
         ));
-    }
-
-    #[test]
-    fn autoroute_locks_model_and_effort_commands_while_pending_and_resolved() {
-        for model in [None, Some(Model::Oai(nanocodex::Model::Glm53))] {
-            for command in [
-                "/model",
-                "/model sol",
-                "/effort",
-                "/effort high",
-                "/thinking high",
-                "/autoroute",
-            ] {
-                let mut root = root_with_draft(command);
-                root.update(RootEvent::RoutingHydrated {
-                    enabled: true,
-                    provider: Some("Vercel".into()),
-                    model,
-                    effort: model.map(|_| ReasoningEffort::Low),
-                });
-                assert!(!root.action_availability().model);
-                assert!(!root.action_availability().auto_route);
-                let update = root.update(key(KeyCode::Enter));
-                assert!(update.effects.is_empty(), "{command}");
-                assert!(root.overlay.is_none(), "{command}");
-                assert!(
-                    root.notification
-                        .as_ref()
-                        .unwrap()
-                        .message
-                        .to_string()
-                        .contains("Automatic routing")
-                );
-                assert!(root.queue.component().is_empty());
-            }
-        }
     }
 
     #[test]
@@ -6741,12 +6975,9 @@ mod live_control_tests {
         use crate::tui::theme::Theme;
         use ratatui::{Terminal, backend::TestBackend};
 
-        let callbacks: [fn() -> RootEvent; 6] = [
-            || RootEvent::RecentPromptsLoaded {
-                session_id: "session".to_owned(),
-                prompts: Vec::new(),
-            },
-            || RootEvent::RecentPromptLoadFailed("lookup failed".to_owned()),
+        // Prompt lookup now has request/cancellation state and is covered by
+        // the executable terminal prompt-cache journeys.
+        let callbacks: [fn() -> RootEvent; 4] = [
             || RootEvent::SessionsLoaded {
                 request_id: 0,
                 sessions: Vec::new(),

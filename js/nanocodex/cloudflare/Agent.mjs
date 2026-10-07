@@ -95,7 +95,9 @@ export function checkpoint(agent) {
 
 /** Atomically steers an active Cloudflare Agent turn or starts a new turn. */
 export function route(agent, options) {
-  return routePrompt(agent, options);
+  // Prefer the agent's own routed-turn wrapper (Claude retains host routes
+  // until its terminal receipt); Codex agents expose the same internal seam.
+  return typeof agent?.turn?.route === "function" ? agent.turn.route(options) : routePrompt(agent, options);
 }
 
 /** Removes the package-owned durable history for one Cloudflare Agent. */
@@ -561,6 +563,8 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
           subagentSessions: cloudflareSubagentSessions(reservation, internalRuntime?.subagentLifecycle),
           subagentRouting: internalRuntime?.subagentRouting,
           toolProviders: internalRuntime?.toolProviders,
+          codeEffectJournal: internalRuntime?.codeEffectJournal,
+          traceTool: internalRuntime?.traceTool,
         },
         harnesses,
         model: internalConfiguration.model, thinking: internalConfiguration.thinking,
@@ -577,7 +581,9 @@ async function createOwned(module, resolved, options, hostAgent, lifecycle, prep
       }
       const exposed = claude.extend(owned => ({
         events: { connect: request => eventSocket?.connect(request) ?? Response.json({ error: "event_persistence_caller_owned" }, { status: 409 }) },
-        turn: { ...owned.turn, route: () => { throw new Error("Claude voice steering is not supported"); } },
+        // Claude live routing (realtime voice delegation) steers the active
+        // turn or starts one through the Claude runtime's owned turn wrapper.
+        turn: { ...owned.turn },
       }));
       const active = {};
       lifecycle.active = active;
@@ -1146,16 +1152,42 @@ async function withTimeout(promise, timeoutMs, message) {
 }
 
 /** Read a single Rust-owned receipt without loading/fencing the execution. */
-export function steerReceipt(owner, operationId, messageId) {
+export async function steerReceipt(owner, operationId, messageId) {
   const { storage } = resolveContext(owner);
   const tables = storage.sql.exec("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('nanocodex_cloudflare_durability', 'nanocodex_durable_states')").toArray();
   if (tables.length !== 2) return null;
   const stateId = storedStateId(storage);
   if (stateId === undefined) return null;
-  const path = `$.nanocodex_durable_state.operations.${JSON.stringify(operationId)}.steer_receipts.${JSON.stringify(messageId)}`;
-  const row = storage.sql.exec("SELECT json_extract(payload, ?) AS receipt FROM nanocodex_durable_states WHERE state_id = ?", path, stateId).toArray()[0];
-  if (row?.receipt == null) return null;
-  const receipt = JSON.parse(row.receipt);
+  const path = `$.nanocodex_durable_state.operations.${JSON.stringify(operationId)}`;
+  const row = storage.sql.exec("SELECT json_extract(payload, ?) AS operation FROM nanocodex_durable_states WHERE state_id = ?", path, stateId).toArray()[0];
+  if (row?.operation == null) return null;
+  const operation = JSON.parse(row.operation);
+  let receipt = operation.steer_receipts?.[messageId];
+  let reference = operation.steer_receipt_root;
+  const digest = async value => [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  const identity = await digest(messageId);
+  const record = key => {
+    const value = storage.sql.exec("SELECT value FROM nanocodex_durable_records WHERE state_id = ? AND key = ?", stateId, key).toArray()[0]?.value;
+    if (typeof value !== "string") throw new Error("missing durable steer receipt record");
+    return value;
+  };
+  for (let depth = 0; receipt == null && reference != null; depth++) {
+    if (depth > 64 || !/^[a-f0-9]{64}$/.test(reference)) throw new Error("invalid durable steer receipt reference");
+    const encoded = record(reference);
+    let content;
+    if (encoded.startsWith("=")) content = encoded.slice(1);
+    else {
+      const count = /^\+[1-9][0-9]*$/.test(encoded) ? Number(encoded.slice(1)) : 0;
+      if (!Number.isSafeInteger(count) || count < 1 || count > 256) throw new Error("invalid durable steer receipt chunks");
+      content = Array.from({ length: count }, (_, index) => record(`${reference}/${index}`)).join("");
+    }
+    if (await digest(content) !== reference) throw new Error("durable steer receipt checksum mismatch");
+    const page = JSON.parse(content);
+    if (page.kind === "Leaf") { receipt = page.entries?.[messageId]; break; }
+    if (page.kind !== "Branch" || depth === 64) throw new Error("invalid durable steer receipt page");
+    reference = page.entries?.[identity[depth]];
+  }
+  if (receipt == null) return null;
   if (!/^[a-f0-9]{64}$/.test(receipt.input_key) || !Number.isSafeInteger(receipt.index) || receipt.index < 1 || typeof receipt.withdrawn !== "boolean") {
     throw new Error("invalid durable steer receipt");
   }

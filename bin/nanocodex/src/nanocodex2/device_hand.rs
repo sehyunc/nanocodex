@@ -98,6 +98,42 @@ impl Drop for BackgroundHandTask {
     }
 }
 
+/// Describe the existing computer without starting a publisher or performing
+/// discovery on the admission path. A missing identity remains unknown until
+/// enrollment publishes it; a terminal must never invent a replacement Hand.
+pub(crate) fn with_client_context(
+    client: ManagedClient,
+    workspace: &Path,
+) -> Result<ManagedClient, ManagedError> {
+    let machine = if std::env::var_os("NANOCODEX_DISABLE_HAND").is_some_and(|v| v == "1") {
+        None
+    } else {
+        let target = client.account_attachment_target()?;
+        let mut origin = target.endpoint().clone();
+        origin
+            .set_scheme(if target.endpoint().scheme() == "wss" {
+                "https"
+            } else {
+                "http"
+            })
+            .map_err(|()| error("invalid origin"))?;
+        origin.set_path("");
+        cached_directory(origin.as_str(), target.bearer()).and_then(|directory| {
+            let value: Value =
+                serde_json::from_slice(&fs::read(directory.join("identity.json")).ok()?).ok()?;
+            let id = uuid::Uuid::parse_str(value["machine_id"].as_str()?).ok()?;
+            (id.get_version_num() == 4).then(|| id.to_string())
+        })
+    };
+    let hand = machine.as_ref().map(|id| format!("user:{id}"));
+    let cwd = machine.as_ref().map(|id| format!("/{id}"));
+    let client = client.with_request_origin("nanocodex2", hand.as_deref(), cwd.as_deref())?;
+    let workspace = workspace
+        .to_str()
+        .ok_or_else(|| error("The current directory must be valid UTF-8"))?;
+    client.with_native_cwd(workspace)
+}
+
 pub(crate) struct BackgroundHand {
     lease: Option<transport::Client>,
 }
@@ -116,12 +152,30 @@ impl BackgroundHand {
             })
             .map_err(|()| error("invalid origin"))?;
         origin.set_path("");
+        // Resolve the authenticated account before enrolling a missing service.
+        let directory = directory(origin.as_str(), target.bearer()).await?;
+        // A healthy publisher already owns the cloud connection. Reuse its IPC
+        // lease directly; launchctl/systemctl are only recovery paths.
+        if let Some(device) = Self::observe_existing(&directory).await? {
+            return Ok(device);
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         ensure_service().await?;
-        let directory = directory(origin.as_str(), target.bearer()).await?;
         Self::observe(&directory)
             .await
             .map_err(|e| error(e.to_string().replace(target.bearer(), "[redacted]")))
+    }
+
+    async fn observe_existing(directory: &Path) -> Result<Option<Self>, ManagedError> {
+        let socket = socket_path(directory)?;
+        let Ok(lease) = transport::connect(&socket).await else {
+            return Ok(None);
+        };
+        let Ok(status) = fs::read_to_string(directory.join("status.json")) else {
+            return Ok(None);
+        };
+        observer_ready(&status)?;
+        Ok(Some(Self { lease: Some(lease) }))
     }
 
     async fn observe(directory: &Path) -> Result<Self, ManagedError> {
@@ -190,6 +244,9 @@ async fn ensure_service() -> Result<(), ManagedError> {
         Path::new("/Library/LaunchDaemons/com.nanocodex.hand.plist").is_file(),
         gui.as_ref().map(|(_, path)| path.is_file()),
         |action| async move {
+            if action == service_start::Action::MacInstall {
+                return install_user_service().await;
+            }
             let (program, args) = action.command(gui_context);
             // Service managers need no account credentials or interactive input.
             let output = tokio::time::timeout(
@@ -215,10 +272,64 @@ async fn ensure_service() -> Result<(), ManagedError> {
     .map_err(error)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn install_user_service() -> Result<service_start::Reply, String> {
+    // Use the companion of this exact release, never a PATH-selected installer.
+    // The installer locks/rechecks ownership and requires a matching saved login.
+    let account =
+        nanocodex_cli_auth::saved_enrollment_account_file().map_err(|error| error.to_string())?;
+    let binary = std::env::current_exe().map_err(|error| error.to_string())?;
+    let installer = binary.with_file_name("nanocodex");
+    let status = Command::new(&installer)
+        .args(["hand", "install", "--if-missing", "--executable"])
+        .arg(&binary)
+        .env("NANOCODEX_ACCOUNT_FILE", account)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Cancellation of a client must not interrupt the installer's service
+        // transaction. It owns its lock and rollback until it exits.
+        .kill_on_drop(false)
+        .status()
+        .await
+        .map_err(|_| {
+            "Cannot start the companion installer. Run nanocodex setup to connect this computer."
+                .to_owned()
+        })?;
+    if !status.success() {
+        return Err("Automatic Hand installation did not complete. Run nanocodex setup to sign in and connect this computer.".into());
+    }
+    Ok(service_start::Reply {
+        success: true,
+        stdout: String::new(),
+    })
+}
+
 fn error(value: impl std::fmt::Display) -> ManagedError {
     ManagedError::Configuration(value.to_string())
 }
 fn home() -> Result<PathBuf, ManagedError> {
+    // A system installation retains state independently of the login user's
+    // HOME. Only its owning OS user may reuse that private daemon and IPC.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = fs::symlink_metadata("/opt/nanocodex");
+        let record = fs::symlink_metadata("/opt/nanocodex/installation.json");
+        let state = fs::symlink_metadata("/srv/nanocodex");
+        if let (Ok(root), Ok(record), Ok(state)) = (root, record, state)
+            && root.is_dir()
+            && root.uid() == 0
+            && root.mode() & 0o022 == 0
+            && record.is_file()
+            && record.uid() == 0
+            && record.mode() & 0o022 == 0
+            && state.is_dir()
+            && state.uid() == nix::unistd::geteuid().as_raw()
+        {
+            return Ok(PathBuf::from("/srv/nanocodex"));
+        }
+    }
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .ok_or_else(|| error("A user home directory is required for the device Hand"))
@@ -302,6 +413,27 @@ fn log_file(directory: &Path, name: &str) -> Result<fs::File, ManagedError> {
     }
     Ok(file)
 }
+fn valid_owner(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+}
+
+fn cached_directory(origin: &str, key: &str) -> Option<PathBuf> {
+    let origin = origin.trim_end_matches('/');
+    let home = home().ok()?;
+    let cache = home
+        .join(".nanocodex/hand-accounts")
+        .join(digest(&format!("{origin}\0{key}")));
+    let owner = fs::read_to_string(cache).ok()?;
+    valid_owner(&owner).then(|| {
+        home.join(".nanocodex/hands")
+            .join(digest(&format!("{origin}\0{owner}")))
+    })
+}
+
 async fn directory(origin: &str, key: &str) -> Result<PathBuf, ManagedError> {
     // Credentials rotate and the desktop and CLI may use different keys. Cache
     // their authenticated account identity so they still share one computer.
@@ -310,15 +442,8 @@ async fn directory(origin: &str, key: &str) -> Result<PathBuf, ManagedError> {
     let accounts = home()?.join(".nanocodex/hand-accounts");
     private_directory(&accounts)?;
     let cache = accounts.join(digest(&format!("{origin}\0{key}")));
-    let valid = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
-    };
     let owner = match fs::read_to_string(&cache) {
-        Ok(owner) if valid(&owner) => owner,
+        Ok(owner) if valid_owner(&owner) => owner,
         _ => {
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
@@ -328,7 +453,7 @@ async fn directory(origin: &str, key: &str) -> Result<PathBuf, ManagedError> {
             let body = account::identify(&client, origin, key).await?;
             let owner = body["user"]["id"]
                 .as_str()
-                .filter(|id| valid(id))
+                .filter(|id| valid_owner(id))
                 .ok_or_else(|| error("Invalid Hand account identity"))?
                 .to_owned();
             let mut file = tempfile::NamedTempFile::new_in(&accounts).map_err(error)?;
@@ -491,19 +616,33 @@ async fn share(
             let leases = tokio::spawn(async move {
                 watch_clients(listener, lease_cancel).await;
             });
-            let machine = serde_json::to_value(&state.machine).map_err(error)?;
-            let recipe = factory_recipe(directory, state.machine.id());
+            // Explicit migration reference for a separately managed factory.
+            // Advertising its provider never takes ownership of its lifetime,
+            // starts a second factory, or weakens the broker's allocation checks.
+            let external_factory = std::env::var("NANOCODEX_EXTERNAL_VM_FACTORY")
+                .ok()
+                .filter(|name| !name.is_empty());
+            let recipe = if external_factory.is_some() {
+                Ok(None)
+            } else {
+                factory_recipe(directory, state.machine.id())
+            };
             let factory_error = recipe.as_ref().err().map(ToString::to_string);
             let recipe = recipe.unwrap_or(None);
-            if let Some(recipe) = &recipe {
+            if let Some(name) = external_factory.as_deref() {
+                state.advertise_vm_provider(name)?;
+            } else if let Some(recipe) = &recipe {
                 state.advertise_vm_provider(&recipe.name)?;
             }
+            let machine = serde_json::to_value(&state.machine).map_err(error)?;
             let status = std::sync::Arc::new(std::sync::Mutex::new(
                 json!({"machine": machine, "status": "connecting", "daemon": {"pid": std::process::id(), "executable": std::env::current_exe().ok(), "version": env!("CARGO_PKG_VERSION")}}),
             ));
             {
                 let mut status = status.lock().unwrap();
-                if recipe.is_none() {
+                if let Some(name) = &external_factory {
+                    status["factory"] = json!({"status": "external", "provider": name});
+                } else if recipe.is_none() {
                     status["factory"] = json!({"status": "unavailable", "error": factory_error.unwrap_or_else(|| "No desktop VM image is configured".into())});
                 }
                 publish(directory, &status)?;
@@ -553,7 +692,7 @@ async fn share(
                 ),
                 |error| {
                     let mut status = status.lock().unwrap();
-                    status["screen"] = json!({"status": if error.is_none() { "ready" } else { "unavailable" }, "transport":"webrtc"});
+                    status["screen"] = json!({"status": if error.is_none() { "ready" } else { "unavailable" }, "transport":"webrtc", "error": error.map(ToString::to_string)});
                     let _ = publish(directory, &status);
                 },
             )
@@ -606,6 +745,10 @@ fn unix_socket_path(base: PathBuf, directory: &Path) -> Result<PathBuf, ManagedE
 
 async fn connect(directory: &Path, cancel: &CancellationToken) -> Result<(), ManagedError> {
     let socket = socket_path(directory)?;
+    #[cfg(target_os = "macos")]
+    if transport::connect(&socket).await.is_err() {
+        ensure_service().await?;
+    }
     // A successful service-manager start can precede account lookup and IPC bind.
     let mut stream = tokio::time::timeout(Duration::from_secs(15), async {
         loop {

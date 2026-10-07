@@ -34,7 +34,11 @@ where
             call_index,
             &conversation.managed.generation_request(),
             self.model,
-            self.thinking,
+            conversation.reasoning.request_effort(
+                self.model,
+                self.thinking,
+                self.config.supports_reasoning_effort_updates(self.model),
+            ),
             self.fast_mode,
         );
         let mut model = self.model;
@@ -50,7 +54,11 @@ where
                     call_index,
                     &conversation.managed.generation_request(),
                     self.model,
-                    self.thinking,
+                    conversation.reasoning.request_effort(
+                        self.model,
+                        self.thinking,
+                        self.config.supports_reasoning_effort_updates(self.model),
+                    ),
                     self.fast_mode,
                 )
                 .native_request(&self.config)

@@ -326,9 +326,16 @@ membership, room, quota, or application routing policy. Event frames are
 `1013`, then continues by reconnecting with that pause cursor as
 `?cursor=<decimal>`.
 
+`toolMode: "code-only"` exposes only `exec` and `wait` to the model. Workspace,
+application, discovery (`tools.tool_search`) and local subagent tools are callable
+inside Code Mode. Discovery returns tool information as cell output; it does not
+add direct schemas. Newly discovered tools are available in the next cell. The
+existing `"code"` mode retains direct workspace/subagent controls, and `"direct"`
+continues to expose function tools without requiring an evaluator.
+
 Cloudflare Agents default to direct tool mode because Workers prohibit dynamic
 `eval`/`new Function`. Caller-defined tools therefore work without a code
-evaluator. Select `toolMode: "code"` only when also supplying an evaluator that
+evaluator. Select `toolMode: "code"` or `toolMode: "code-only"` only when also supplying an evaluator that
 is explicitly compatible with the deployed Worker runtime. Runtime-owned
 Subagents are installed by default, including on a durable root. With a durability
 store, child identities, topology, queued messages, typed results, and native
@@ -831,6 +838,22 @@ fixed Mercator relay because Mercator's job endpoint is not itself CORS-enabled;
 the relay preserves MPP challenges, credentials, and receipts but never signs.
 Passing a generic `MppSession`, an OpenAI key, or ChatGPT host auth does not
 initialize Mercator. Pass `mcp: false` to opt out explicitly.
+
+Trusted hosts can set a server's `privateResult` policy to intercept raw MCP
+results before model output, Code Mode values, and tool-result tracing.
+`beforeCall({ name, arguments }, context)` runs after payment context validation
+and before remote dispatch. It may reject the call or return `{ privateContext }`. An own
+`result` property instead supplies an already-safe receipt and bypasses both
+remote dispatch and `transformResult`, allowing durable policies to replay a
+receipt without repeating an effect.
+`transformResult({ name, arguments, result, privateContext }, context)` receives
+that invocation's `privateContext` and must return only safe MCP content. State stays local
+to each call, including concurrent calls; it is `undefined` without `beforeCall`.
+Both hooks run within the tool deadline. Failed private requests return a fixed
+failure receipt without the original error or cause. Discovery failures also use
+a fixed message. Callbacks and caller-owned clients remain trusted: they must
+not independently log private payloads or return private state. No notification
+consumer is configured by this policy.
 
 Remote Streamable HTTP MCP servers are configured directly on the agent. The
 JavaScript binding uses the official MCP SDK transport, keeps remote tools
@@ -1367,7 +1390,7 @@ package manager or build step:
 
 ```html
 <script type="module">
-  import { Agent, Transport } from "https://cdn.jsdelivr.net/npm/nanocodex@0.6.6/host/index.mjs";
+  import { Agent, Transport } from "https://cdn.jsdelivr.net/npm/nanocodex@0.6.7/host/index.mjs";
   const agent = await Agent.create({
     transport: Transport.hostManaged({
       websocketUrl: "/api/responses",
@@ -1655,3 +1678,135 @@ are not sent again. Inspect `snapshot().warms` and `actualWarmUsd` for evidence.
 Warming rejects thinking requests. Normal policy requests record usage without
 an extra model request when warming is disabled. Native warming is currently
 available for Claude only.
+
+### Standalone account services
+
+`nanocodex/services` accesses Vault and dedicated SMS numbers without an agent,
+thread, model, or WASM runtime. Keep direct account API keys on your server:
+
+```js
+import { createServicesClient } from "nanocodex/services";
+
+const services = createServicesClient({ apiKey: process.env.NANOCODEX_API_KEY });
+const { vault } = await services.vault.list();
+const { status, ok } = await services.vault.request({
+  vault_id: vault[0].id,
+  url: "https://example.com/verify",
+  method: "POST",
+  body_encoding: "json",
+  body: '{"code":"{{NANOCODEX_VAULT_TOTP}}"}',
+});
+```
+
+Direct calls use `https://nanocodex.gakonst.workers.dev/v1/services`. Reads require
+`data:read`, Vault requests require `tools:use`, and phone intents require
+`data:write` plus `tools:use`. Vault returns metadata and destination HTTP status
+only. TOTP seeds and generated codes stay in the broker; the saved exact HTTPS
+origin bounds code injection. There is no code-export method.
+
+Browser apps use an existing Connect client and exact signed service capabilities:
+
+```js
+import { Client } from "nanocodex/connect";
+import { createServicesClient } from "nanocodex/services";
+
+const connect = Client.create({ appId: "example-app" });
+const connection = await connect.connection.connect({
+  capabilities: {
+    services: {
+      vault: { ids: ["selected-vault-id"], origins: ["https://example.com"], request: true },
+      phone: { numberIds: [], read: false, provision: true, release: false },
+    },
+  },
+});
+const services = createServicesClient({ connect, grantId: connection.grant.id });
+```
+
+Service-only connections default to `services.use` and hosted authorization.
+They contain no `agentId`, access key, or MPP budget. Scope is bound into the
+signed approval and checked against the returned grant. Reconnect with the same
+`capabilities.services` to require that exact scope. Service requests use
+`/v1/grants/:grantId/services/...` and the Connect session. Number and Vault IDs
+are explicit; they never expand to the entire account.
+
+Use `phone.available({ country: "US", area_code: "202" })`, `phone.list()`,
+`phone.get(id)`, and `phone.messages(id, { limit: 20, cursor })` for reads. SMS
+messages expire according to the service's retention policy; support for
+verification messages depends on the sender and carrier.
+
+Provisioning and release create requests for human review:
+
+```js
+import { createHostedRequest, openHostedPopup } from "nanocodex/services";
+
+// Persist this UUID before sending; keep it when reconciling an uncertain request.
+const operation_id = crypto.randomUUID();
+const { request } = await services.phone.provision({
+  operation_id, phone_number: "+12025550101", country: "US",
+});
+const approval = createHostedRequest({
+  service: "phone", operationId: request.approval_request_id ?? request.operation_id, appOrigin: location.origin,
+});
+// Open from a separate click handler after the request is ready.
+await openHostedPopup(approval);
+const result = await services.phone.requests.get(request.operation_id);
+```
+
+`phone.release(numberId, { operation_id })` also requires hosted human approval.
+Poll with the **original** caller UUID, including after a dropped intent response.
+Connect returns an additional `request.approval_request_id` for the hosted owner
+approval; use `request.approval_request_id ?? request.operation_id` for its link.
+Any deliberate identical intent replay must retain the original caller UUID.
+A newly provisioned number needs a fresh exact-ID Connect approval before inbox
+access. The SDK never automatically retries a write. `ServiceError` exposes
+`status`, `code`, and `outcomeUnknown`; an unknown outcome requires reconciliation,
+not a new operation ID. No SDK method approves purchases or releases.
+
+TOTP enrollment uses a private hosted form:
+
+```js
+const enrollment = createHostedRequest({ appOrigin: location.origin });
+// Call from a user click. Inputs stay on the account origin.
+const metadata = await openHostedPopup(enrollment);
+if (metadata.service === "vault") console.log(metadata.vault_id);
+```
+
+The popup helper checks the sender window, exact hosted origin, and a unique
+state. Only fixed metadata fields reach the caller. `createHostedRequest`
+also accepts `host` for a trusted HTTPS account deployment and `state` for a
+caller-managed unique nonce. Secret entry and approvals require a top-level window; embedded frames cannot
+perform them. React applications can open the same request with
+`HostedServiceButton` from `nanocodex-react/services`.
+
+To use an existing Vault item before granting access, open the account picker
+from a user click. No service client or Connect grant is needed:
+
+```js
+const selection = createHostedRequest({
+  service: "vault", action: "select", appOrigin: location.origin,
+});
+const selected = await openHostedPopup(selection);
+if (selected.service === "vault" && selected.action === "select") {
+  // The user sees the recipient origin and explicitly chooses this item.
+  // Only its opaque vault_id, kind, and name are shared.
+  const connection = await connect.connection.connect({
+    capabilities: { services: { vault: {
+      ids: [selected.vault_id], origins: ["https://example.com"], request: true,
+    } } },
+  });
+}
+```
+
+The picker does not create or expand a grant and does not enroll the item again.
+The separate Connect approval authorizes the exact selected ID and destination
+origins. Closing the popup or aborting its `signal` cancels the local wait;
+closing a phone approval window does not cancel a server-side operation. Poll
+that operation with its original caller UUID to learn its outcome.
+
+Account management is available through `createServicesClient({ apiKey }).account`
+without an agent or WASM. Use `client.links({ connect: 'google', add: 'login' })`
+for ordinary Connections/Vault URLs, or
+`client.hosted({ service: 'vault', kind: 'card' })` for a private enrollment link.
+OAuth, Cloudflare, MCP, model sign-in, Vault/SSH management, and captured-card
+save/balance methods share the account REST contracts. See the
+[REST, JavaScript and Rust guide](../../docs/STANDALONE_SERVICES.md#account-management-and-browser-links).

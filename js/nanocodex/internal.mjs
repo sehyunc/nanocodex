@@ -545,8 +545,8 @@ const hostBridge = Object.freeze({
   claudeAuth(hostDefinitionId) {
     return requiredDefinitionHost(hostDefinitionId).claudeAuthHeaders();
   },
-  executeClaudeTool(hostDefinitionId, name, input, sessionId, callId, model, turnId) {
-    return requiredDefinitionHost(hostDefinitionId).executeClaudeTool(name, input, sessionId, callId, model, turnId);
+  executeClaudeTool(hostDefinitionId, name, input, sessionId, callId, model, turnId, localDefinitions, executeLocalTool) {
+    return requiredDefinitionHost(hostDefinitionId).executeClaudeTool(name, input, sessionId, callId, model, turnId, localDefinitions, executeLocalTool);
   },
   httpOpen(endpoint, apiKey, accountId, fedramp, sessionId, threadId, turnState, body) {
     const host = requiredSessionHost(threadId);
@@ -683,8 +683,8 @@ const hostBridge = Object.freeze({
   codeReplaySafe(definitionHostId) {
     return requiredDefinitionHost(definitionHostId).codeReplaySafe?.() === true;
   },
-  executeCode(source, sessionId, callId, model, turnId) {
-    return requiredSessionHost(sessionId).executeCode(source, sessionId, callId, model, turnId);
+  executeCode(source, sessionId, callId, model, turnId, localDefinitions, executeLocalTool) {
+    return requiredSessionHost(sessionId).executeCode(source, sessionId, callId, model, turnId, localDefinitions, executeLocalTool);
   },
   waitCode(input, sessionId, callId) {
     return requiredSessionHost(sessionId).waitCode(input, sessionId, callId);

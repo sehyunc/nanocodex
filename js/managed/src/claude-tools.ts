@@ -3,7 +3,14 @@ import type { Workspace } from "nanocodex-tools";
 import type { Tool } from "../../nanocodex/runtime/claude.mjs";
 import { createMcpRuntime } from "../../nanocodex/runtime/mcp-runtime.mjs";
 
-const forbidden = new Set(["exec", "wait", "tool_search", "exec_command", "write_stdin", "apply_patch", "view_image", "update_plan", "web__run", "image_gen__imagegen", "spawn_agent", "send_agent_message", "list_agents", "wait_agent", "interrupt_agent", "close_agent", "submit_result"]);
+// Codex interfaces are replaced by Claude's native tools. Shared subagents are
+// installed separately by the task-tree runtime, preserving its owned handlers.
+const forbidden = new Set([
+  "exec", "wait", "tool_search", "exec_command", "write_stdin", "apply_patch",
+  "view_image", "update_plan", "web__run", "image_gen__imagegen",
+  "spawn_agent", "send_agent_message", "list_agents", "wait_agent",
+  "interrupt_agent", "close_agent", "submit_result",
+]);
 const object = (properties: Record<string, unknown>, required: string[]) => ({ type: "object", properties, required, additionalProperties: false });
 const string = { type: "string" };
 const text = (content: string) => ({ content, isError: false });
@@ -18,11 +25,14 @@ function path(input: Record<string, unknown>): string {
 /** Explicit native Claude tools backed by existing managed capabilities. No Codex catalog. */
 export async function createManagedClaudeTools(options: {
   filesystem: Workspace;
+  prepareFilesystem?: () => Promise<void>;
   bash: NamedTool;
   poll?: NamedTool;
   allowedNames?: readonly string[];
   tools: readonly NamedTool[];
   mcp: McpServers;
+  loadServers?: () => Promise<McpServers>;
+  catalogProvider?: (serverName: string) => string | undefined;
   providers?: readonly { definitions(): readonly { name?: string; description?: string; parameters?: unknown }[]; resolve(name: string): { handler(input: unknown, context: ToolContext): unknown } | undefined }[];
   authorize(context: ToolContext): void;
 }) {
@@ -69,7 +79,7 @@ export async function createManagedClaudeTools(options: {
   };
   const getMcp = async (context: ToolContext) => {
     assertMcpOpen(context);
-    const runtime = await (mcp ??= createMcpRuntime(options.mcp));
+    const runtime = await (mcp ??= createMcpRuntime(options.mcp, { loadServers: options.loadServers, catalogProvider: options.catalogProvider }));
     assertMcpOpen(context);
     return runtime;
   };
@@ -82,7 +92,7 @@ export async function createManagedClaudeTools(options: {
       await runtime?.close();
     })();
   };
-  if (Object.keys(options.mcp).length && (options.allowedNames === undefined
+  if ((Object.keys(options.mcp).length || options.loadServers !== undefined) && (options.allowedNames === undefined
     || options.allowedNames.some(name => name === "MCPToolSearch" || name === "MCPExecute"))) {
     tools.push({ name: "MCPToolSearch", description: "Discover authorized MCP tools and their input schemas; use MCPExecute with an exact returned name.", inputSchema: object({ query: string, limit: { type: "integer", minimum: 1, maximum: 32 } }, ["query"]), handler: async (raw, context) => {
       const input = value(raw);
@@ -139,5 +149,14 @@ export async function createManagedClaudeTools(options: {
     } });
   }
   // Every tool is an explicit host capability and rechecks the current authority.
-  return { tools: tools.filter(tool => options.allowedNames === undefined || options.allowedNames.includes(tool.name)).map(tool => ({ ...tool, handler: (input: unknown, context: ToolContext) => { options.authorize(context); context.signal.throwIfAborted(); return tool.handler(input, context); } })), close };
+  return { tools: tools.filter(tool => options.allowedNames === undefined || options.allowedNames.includes(tool.name)).map(tool => ({ ...tool, handler: async (input: unknown, context: ToolContext) => {
+    options.authorize(context);
+    context.signal.throwIfAborted();
+    if (["Read", "Write", "Edit"].includes(tool.name)) {
+      await options.prepareFilesystem?.();
+      options.authorize(context);
+      context.signal.throwIfAborted();
+    }
+    return tool.handler(input, context);
+  } })), close };
 }

@@ -15,6 +15,7 @@ mod error;
 mod replay;
 pub use replay::ReplaySafety;
 mod harness;
+mod reasoning;
 pub use harness::{ClaudeModel, HarnessFamily, HarnessModel};
 #[cfg(feature = "openai")]
 mod model;

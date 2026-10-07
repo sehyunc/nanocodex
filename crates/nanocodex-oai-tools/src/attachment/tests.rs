@@ -203,7 +203,7 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
     std::fs::create_dir_all(&evidence_dir).unwrap();
     let evidence_path = evidence_dir.join("rust-native-lifecycle.log");
     let subscriber = tracing_subscriber::fmt()
-        .with_env_filter("nanocodex_tools::attachment=info")
+        .with_env_filter("nanocodex_oai_tools::attachment=info")
         .with_ansi(false)
         .with_span_events(
             tracing_subscriber::fmt::format::FmtSpan::NEW
@@ -219,7 +219,8 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
         let mut socket = accept(&listener).await;
         let catalog = recv_json(&mut socket).await;
         assert_eq!(catalog["type"], "catalog");
-        assert_eq!(catalog.as_object().unwrap().len(), 9);
+        assert_eq!(catalog.as_object().unwrap().len(), 10);
+        assert_eq!(catalog["turn_lifecycle"], true);
         assert_catalog_diagnostics(&catalog);
         assert!(
             catalog["runtime_id"]
@@ -240,6 +241,12 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
         );
         send_json(&mut socket, json!({"type":"ready"})).await;
 
+        // Observe the existing heartbeat on this exact established connection.
+        let Message::Ping(nonce) = socket.next().await.unwrap().unwrap() else {
+            panic!("expected native heartbeat ping");
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        socket.send(Message::Pong(nonce)).await.unwrap();
         send_json(&mut socket, call("call-1", "echo")).await;
         let result = recv_result_phases(
             &mut socket,
@@ -257,7 +264,7 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
         assert_eq!(result["outcome"]["status"], "completed");
         eprintln!("native completed receipt timing: {}", result["timing"]);
         send_json(&mut socket, json!({"type":"ack","call_id":"call-1"})).await;
-        let _ = completed_tx.send(());
+        let _ = completed_tx.send(catalog["connection_id"].as_str().unwrap().to_owned());
 
         let drain = recv_json(&mut socket).await;
         assert_eq!(drain, json!({"type":"drain"}));
@@ -275,7 +282,7 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
         .await
         .unwrap();
     assert_eq!(attachment.status(), AttachmentStatus::Ready);
-    completed_rx.await.unwrap();
+    let connection_id = completed_rx.await.unwrap();
     attachment.detach().await.unwrap();
     server.await.unwrap();
     let trace = std::fs::read_to_string(&evidence_path).unwrap();
@@ -294,6 +301,46 @@ async fn catalog_call_result_and_drain_use_exact_frames() {
                     && line.contains(&format!("stage=\"{stage}\""))),
             "trace records actual stage {stage}"
         );
+    }
+    let field = |line: &str, name: &str| -> f64 {
+        let prefix = format!("{name}=");
+        let value = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&prefix))
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(value.is_finite() && value >= 0.0);
+        value
+    };
+    let rtt = trace
+        .lines()
+        .find(|line| {
+            line.contains("stage=\"attachment.transport_rtt\"") && line.contains(&connection_id)
+        })
+        .unwrap();
+    assert!(field(rtt, "roundtrip_ms") >= 10.0);
+    assert!(rtt.contains("connection_id="));
+    let mut elapsed = 0.0;
+    for stage in [
+        "attachment.result_send_started",
+        "attachment.result_flush_started",
+        "attachment.result_sent",
+    ] {
+        let line = trace
+            .lines()
+            .find(|line| {
+                line.contains("transport_call_id=\"call-1\"")
+                    && line.contains(&format!("stage=\"{stage}\""))
+            })
+            .unwrap();
+        let next = field(line, "elapsed_ms");
+        assert!(next >= elapsed);
+        elapsed = next;
+        if stage == "attachment.result_sent" {
+            assert!(field(line, "send_ms") >= field(line, "flush_ms"));
+            assert!(field(line, "send_ms") >= field(line, "feed_ms"));
+        }
     }
 }
 
@@ -373,7 +420,17 @@ async fn cancellation_is_only_an_ordinary_result() {
     let server = tokio::spawn(async move {
         let mut socket = ready(&listener).await;
         send_json(&mut socket, call("call-cancel", "block")).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // A blocked execution must deliver progress before it can finish.
+        for stage in ["received", "execution_started"] {
+            let progress =
+                tokio::time::timeout(Duration::from_secs(1), recv_wire_json(&mut socket))
+                    .await
+                    .expect("live progress must flush before terminal completion");
+            assert_eq!(progress["type"], "diagnostic");
+            assert_eq!(progress["call_id"], "call-cancel");
+            assert_eq!(progress["stage"], stage);
+            eprintln!("native live progress before cancellation: {progress}");
+        }
         send_json(
             &mut socket,
             json!({"type":"cancel","call_id":"call-cancel"}),
@@ -382,12 +439,7 @@ async fn cancellation_is_only_an_ordinary_result() {
         let result = recv_result_phases(
             &mut socket,
             "call-cancel",
-            &[
-                "received",
-                "execution_started",
-                "execution_finished",
-                "result_prepared",
-            ],
+            &["execution_finished", "result_prepared"],
         )
         .await;
         assert_eq!(result["type"], "result");
@@ -1199,4 +1251,154 @@ async fn silent_peer_without_control_pong_reconnects_within_finite_bound() {
     send_json(&mut second, json!({"type":"draining"})).await;
     detach.await.unwrap().unwrap();
     eprintln!("native silent peer: finite reconnect within 1s; same runtime ownership");
+}
+
+struct TurnLifecycleTool(std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
+
+#[async_trait]
+impl Tool for TurnLifecycleTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::function(
+            "lifecycle_probe",
+            "Synthetic lifecycle probe",
+            json!({"type":"object"}),
+        )
+    }
+    async fn execute(&self, _input: ToolInput, _context: ToolContext<'_>) -> ToolResult {
+        Ok(ToolOutput::json(&*self.0.lock().unwrap()))
+    }
+    async fn end_turn(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        hook_event_name: &str,
+    ) -> Result<(), crate::contract::ToolError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((session_id.into(), turn_id.into(), hook_event_name.into()));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn native_attachment_delivers_trusted_turn_cleanup_outside_model_catalog() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ended = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(TurnLifecycleTool(ended.clone()))
+        .build()
+        .unwrap();
+    let (attachment, _) = tools
+        .attach(
+            AttachmentTarget::new(
+                format!("ws://{}/tools", listener.local_addr().unwrap()),
+                "synthetic-bearer",
+            )
+            .unwrap(),
+        )
+        .start()
+        .unwrap();
+    let (mut socket, catalog) = ready_with_catalog(&listener).await;
+    assert_eq!(catalog["turn_lifecycle"], true);
+    assert_eq!(catalog["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(catalog["tools"][0]["definition"]["name"], "lifecycle_probe");
+    send_json(
+        &mut socket,
+        json!({"type":"turn_ended","session_id":"session:one","turn_id":"turn:cancelled","hook_event_name":"Interrupt"}),
+    )
+    .await;
+    // A subsequent ordinary call acts as an ordered transport barrier.
+    send_json(
+        &mut socket,
+        json!({"type":"call","session_id":"session:one","turn_id":"turn:next",
+        "call_id":"probe","model":"fixture","name":"lifecycle_probe","input":{},
+        "output_token_budget":1024,"output_byte_budget":16384,"deadline_at":now_ms()+5000}),
+    )
+    .await;
+    let result = recv_json(&mut socket).await;
+    assert_eq!(result["type"], "result");
+    assert_eq!(
+        *ended.lock().unwrap(),
+        vec![(
+            "session:one".into(),
+            "turn:cancelled".into(),
+            "Interrupt".into()
+        )]
+    );
+    send_json(&mut socket, json!({"type":"ack","call_id":"probe"})).await;
+    let detach = tokio::spawn(async move { attachment.detach().await });
+    assert_eq!(recv_json(&mut socket).await, json!({"type":"drain"}));
+    send_json(&mut socket, json!({"type":"draining"})).await;
+    detach.await.unwrap().unwrap();
+}
+
+// Manual baseline/candidate experiment through the shipped attachment runtime.
+// Run with --ignored --nocapture; compare distributions, never assert wall time.
+#[tokio::test]
+#[ignore = "manual established-connection transport timing experiment"]
+async fn established_connection_transport_experiment() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/tools", listener.local_addr().unwrap());
+    let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut socket = accept(&listener).await;
+        assert_eq!(recv_json(&mut socket).await["type"], "catalog");
+        send_json(&mut socket, json!({"type":"ready"})).await;
+        socket.get_ref().set_nodelay(true).unwrap();
+        let mut samples = Vec::new();
+        for index in 0..205 {
+            let id = format!("experiment-{index}");
+            let started = Instant::now();
+            send_json(&mut socket, call(&id, "echo")).await;
+            let result = recv_result_phases(
+                &mut socket,
+                &id,
+                &[
+                    "received",
+                    "execution_started",
+                    "execution_finished",
+                    "result_prepared",
+                ],
+            )
+            .await;
+            let roundtrip_ms = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(result["outcome"]["status"], "completed");
+            if index >= 5 {
+                samples.push(roundtrip_ms);
+            }
+            eprintln!(
+                "transport experiment index={index} roundtrip_ms={roundtrip_ms:.3} host_elapsed_ms={}",
+                result["timing"]["host_elapsed_ms"]
+            );
+            send_json(&mut socket, json!({"type":"ack","call_id":id})).await;
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "transport experiment warm_samples={} p50_ms={:.3} p95_ms={:.3}",
+            samples.len(),
+            samples[samples.len() / 2],
+            samples[samples.len() * 95 / 100]
+        );
+        completed_tx.send(()).unwrap();
+        assert_eq!(recv_json(&mut socket).await, json!({"type":"drain"}));
+        send_json(&mut socket, json!({"type":"draining"})).await;
+    });
+    let tools = Tools::builder()
+        .without_defaults()
+        .tool(EchoTool)
+        .build()
+        .unwrap();
+    let (attachment, _) = tools
+        .attach(AttachmentTarget::new(endpoint, "bearer").unwrap())
+        .connect()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), completed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    attachment.detach().await.unwrap();
+    server.await.unwrap();
 }

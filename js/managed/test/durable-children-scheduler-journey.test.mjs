@@ -60,26 +60,26 @@ export class FixtureModel extends DurableObject {
       // Responses WebSocket continuation requests contain only the new delta.
       // Emulate provider history so a child stays a child after its tool result.
       history=body.previous_response_id?[...history,...(body.input??[])]:body.input??[];
-      const input=history;
+      const input=history.map(item=>Array.isArray(item.output)?{...item,output:item.output.at(-1)?.text??''}:item);
       const users=JSON.stringify(input.filter(item=>item.role==='user'));
       const child=users.includes('BACKGROUND_SCHEDULER_CHILD');
       this.ctx.storage.sql.exec('INSERT INTO provider_requests(child,body) VALUES (?,?)',child?1:0,JSON.stringify(body));
       if(child&&!this.ctx.storage.sql.exec('SELECT released FROM provider_state').one().released)return;
-      const results=input.filter(item=>item.type==='function_call_output');
-      const call=(name,id,args)=>[{type:'function_call',name,call_id:id,arguments:JSON.stringify(args)}];
+      const results=input.filter(item=>['function_call_output','custom_tool_call_output'].includes(item.type));
+      const call=(name,id,args)=>[{type:'custom_tool_call',name:'exec',call_id:id,input:'const result = await tools.'+name+'('+JSON.stringify(args)+'); text(result);'}];
       const say=text=>[{type:'message',role:'assistant',content:[{type:'output_text',text}]}];
       let output;
       if(child && users.includes('RESUME_RETAINED_CHILD')) {
         const current=input.slice(input.findLastIndex(item=>item.role==='user')+1);
-        output=current.some(item=>item.call_id==='background-resubmit'&&item.type==='function_call_output')?say('BACKGROUND_CHILD_RESUMED'):call('submit_result','background-resubmit',{output:'BACKGROUND_CHILD_RESUMED'});
+        output=current.some(item=>item.call_id==='background-resubmit'&&['function_call_output','custom_tool_call_output'].includes(item.type))?say('BACKGROUND_CHILD_RESUMED'):call('submit_result','background-resubmit',{output:'BACKGROUND_CHILD_RESUMED'});
       } else if(child){
         if(!results.some(item=>item.call_id==='background-proof'))output=call('exec_command','background-proof',{cmd:"printf 'BACKGROUND_EFFECT\\n' >> /brain/background-proof.txt",workdir:'/brain'});
         else if(!results.some(item=>item.call_id==='background-submit'))output=call('submit_result','background-submit',{output:'BACKGROUND_CHILD_OK'});
         else output=say('BACKGROUND_CHILD_OK');
       } else if(users.includes('RESUME_BACKGROUND_CHILD')) {
         const current=input.slice(input.findLastIndex(item=>item.role==='user')+1);
-        const sent=current.find(item=>item.call_id==='resume-send'&&item.type==='function_call_output');
-        const waited=current.find(item=>item.call_id==='resume-wait'&&item.type==='function_call_output');
+        const sent=current.find(item=>item.call_id==='resume-send'&&['function_call_output','custom_tool_call_output'].includes(item.type));
+        const waited=current.find(item=>item.call_id==='resume-wait'&&['function_call_output','custom_tool_call_output'].includes(item.type));
         output=waited?say(waited.output):sent?call('wait_agent','resume-wait',{agent_ids:[1],timeout_ms:10000}):call('send_agent_message','resume-send',{agent_id:1,message:'RESUME_RETAINED_CHILD: submit BACKGROUND_CHILD_RESUMED.',purpose:'delegate',priority:'deferred'});
       } else if(users.includes('INSPECT_BACKGROUND_CHILD')) {
         const result=results.find(item=>item.call_id==='inspect-children');
@@ -206,9 +206,9 @@ test('production managed recovery retains idle child routes for later messages',
     assert.equal(receipt.terminal.final_message, 'ROOT_TERMINAL_WITH_BACKGROUND_PENDING');
     assert.equal(terminal.session.recovery[0]?.pending, 1);
     assert.ok(terminal.session.alarm > Date.now());
-    assert.equal(terminal.session.effects.filter(row => row.call_id === 'background-proof').length, 0);
-    const spawnResult = terminal.model.requests.flatMap(row => JSON.parse(row.body).input ?? []).find(item => item.call_id === 'background-spawn' && item.type === 'function_call_output');
-    const childId = JSON.parse(spawnResult.output).agent_id;
+    assert.equal(terminal.session.effects.filter(row => row.name === 'exec_command').length, 0);
+    const spawnResult = terminal.model.requests.flatMap(row => JSON.parse(row.body).input ?? []).find(item => item.call_id === 'background-spawn' && ['function_call_output','custom_tool_call_output'].includes(item.type));
+    const childId = JSON.parse(Array.isArray(spawnResult.output) ? spawnResult.output.at(-1).text : spawnResult.output).agent_id;
     trace.push({ before_process_death: terminal, root_receipt: receipt, child_id: childId });
     await kill();
 
@@ -217,7 +217,7 @@ test('production managed recovery retains idle child routes for later messages',
     await call('/__alarm', 'POST');
     const resumed = await poll(async () => {
       const value = await inspect();
-      return value.session.recovery[0]?.pending === 0 && value.session.effects.some(row => row.call_id === 'background-proof' && row.state === 'completed') ? value : undefined;
+      return value.session.recovery[0]?.pending === 0 && value.session.effects.some(row => row.name === 'exec_command' && row.state === 'completed') ? value : undefined;
     });
     assert.equal(resumed.session.turns[0].state, 'completed');
     assert.equal(resumed.session.turns[0].attempt_count, terminal.session.turns[0].attempt_count, 'scheduler must not re-admit terminal root');
@@ -254,7 +254,7 @@ test('production managed recovery retains idle child routes for later messages',
     const settled = await inspect();
     assert.equal(settled.session.recovery[0].pending, 0);
     assert.equal(settled.model.requests.length, requestCount);
-    assert.equal(settled.session.effects.filter(row => row.call_id === 'background-proof').length, 1);
+    assert.equal(settled.session.effects.filter(row => row.name === 'exec_command').length, 1);
     assert.equal((await call('/__proof')).text, 'BACKGROUND_EFFECT\n');
     trace.push({ completed_children_do_not_poll: settled });
 

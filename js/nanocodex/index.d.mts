@@ -44,6 +44,7 @@ export type {
   McpClient,
   McpPayment,
   PaidMcpPayment,
+  McpPrivateResultPolicy,
   McpServer,
   McpServers,
   McpTool,

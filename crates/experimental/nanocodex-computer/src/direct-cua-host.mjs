@@ -86,9 +86,12 @@ export function policyReply(request, allowApps) {
   let result;
   switch (request.method) {
     case 'initialize': result = { userAgent: 'nanocodex-cua-policy-host/1', platformFamily: 'unix', platformOs: 'macos' }; break;
+    // Upstream asks for status while initializing its config client. Local CUA
+    // has no OpenAI account or token; never inspect or synthesize credentials.
+    case 'getAuthStatus': result = { authMethod: null, authToken: null, requiresOpenaiAuth: false }; break;
     case 'configRequirements/read': result = { requirements: { computerUse: { allowLockedComputerUse: false, allowPersistentApproval: false } } }; break;
     case 'config/read': result = { config: { computer_use: { default_app_access: allowApps ? 'allow' : 'deny' } }, origins: {}, layers: null }; break;
-    default: return { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: 'Unsupported Nanocodex CUA policy request.' } };
+    default: return { jsonrpc: '2.0', id: request.id, error: { code: -32601, message: `Unsupported Nanocodex CUA policy request${typeof request.method === 'string' && /^[A-Za-z0-9_/-]{1,128}$/.test(request.method) ? ': ' + request.method : ''}.` } };
   }
   return { jsonrpc: '2.0', id: request.id, result };
 }
@@ -99,13 +102,20 @@ const APP_ACCESS_TOOLS = new Set(['click', 'drag', 'get_app_state', 'paste',
   'perform_secondary_action', 'press_key', 'scroll', 'select_text', 'set_value', 'type_text']);
 export function appConsent(request, allowApps, executing) {
   const p = request.params, meta = p?._meta, schema = p?.requestedSchema;
-  const permitted = allowApps && executing && request.method === 'elicitation/create'
+  const emptyConsent = allowApps && executing && request.method === 'elicitation/create'
     && p?.mode === 'form' && record(schema) && schema.type === 'object'
     && record(schema.properties) && Object.keys(schema.properties).length === 0
     && (!schema.required || (Array.isArray(schema.required) && schema.required.length === 0))
-    && meta?.connector_id === 'computer-use' && meta?.codex_approval_kind === 'mcp_tool_call'
-    && APP_ACCESS_TOOLS.has(meta?.tool_name)
+    && meta?.codex_approval_kind === 'mcp_tool_call';
+  const nativeAccess = meta?.connector_id === 'computer-use' && APP_ACCESS_TOOLS.has(meta?.tool_name)
     && typeof meta?.tool_params?.app === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(meta.tool_params.app);
+  // These are the upstream's application-access prompts, not page forms.
+  // The task's normal authorization still governs actions inside an origin.
+  let browserAccess = false;
+  if (meta?.connector_id === 'browser-use' && ['access_browser_origin', 'download_browser_files', 'upload_browser_files'].includes(meta?.tool_name)) {
+    try { const origin = new URL(meta.tool_params.origin); browserAccess = ['https:', 'http:'].includes(origin.protocol) && !origin.username && !origin.password; } catch {}
+  }
+  const permitted = emptyConsent && (nativeAccess || browserAccess);
   return { jsonrpc: '2.0', id: request.id, result: permitted ? { action: 'accept', content: {} } : { action: 'decline' } };
 }
 
@@ -124,11 +134,13 @@ export function configuration(env = process.env, platform = process.platform) {
     allowApps: env.NANOCODEX_CUA_APP_CONSENT === 'allow', env };
 }
 
-// Only host-selected desktop variables reach the provider. In particular no
-// CODEX_CLI_PATH is given to node_repl (its kernel runs without Codex), and no
-// tokens or inherited NODE_OPTIONS can cross into model-controlled JavaScript.
+// The upstream config protocol talks only to our local config responder.
+// The generated node-repl launcher starts the kernel directly, never Codex.
+// No tokens or inherited NODE_OPTIONS enter model-controlled JavaScript.
 function environment(config, socket) {
-  const env = { SKY_CUA_SERVICE_NATIVE_PIPE_PATH: socket, NODE_REPL_DISABLE_ANALYTICS: '1' };
+  const env = { SKY_CUA_SERVICE_NATIVE_PIPE_PATH: socket, NODE_REPL_DISABLE_ANALYTICS: '1',
+    CODEX_CLI_PATH: config.policyHost, CODEX_HOME: path.dirname(socket),
+    NANOCODEX_CUA_APP_CONSENT: config.allowApps ? 'allow' : 'deny' };
   for (const key of ['PATH', 'HOME', 'USER', 'LOGNAME', 'TMPDIR', 'LANG', 'LC_ALL']) if (config.env[key]) env[key] = config.env[key];
   env.NODE_REPL_UNTRUSTED_ENV_ALLOWLIST = 'SKY_CUA_SERVICE_PATH,SKY_CUA_SERVICE_NATIVE_PIPE_PATH';
   return env;
@@ -246,16 +258,82 @@ export async function runHost(config, { input = process.stdin, output = process.
 // Owner-lease watchdog: provider cancellation uses SIGKILL, which a host cannot
 // catch. Its closed stdin is observed here, and this worker reaps its own signed
 // native helper. The worker adds no runtime dependency; it uses the same Node.
+// LaunchServices lets macOS attribute permissions to the signed app bundle.
+// Directly spawning its executable inherits the launching terminal's identity.
+// The system AppKit bridge retains the exact new app instance and an EOF lease;
+// killing either Node owner still closes that lease, including during launch.
+const nativeAppLease = String.raw`
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function task(command, args) {
+  var process = $.NSTask.alloc.init;
+  var output = $.NSPipe.pipe;
+  process.launchPath = command;
+  process.arguments = args;
+  process.standardOutput = output;
+  process.standardError = $.NSFileHandle.fileHandleWithNullDevice;
+  process.launch;
+  process.waitUntilExit;
+  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(output.fileHandleForReading.readDataToEndOfFile, $.NSUTF8StringEncoding));
+}
+function run(args) {
+  var configuration = $.NSWorkspaceOpenConfiguration.configuration;
+  configuration.createsNewApplicationInstance = true;
+  configuration.allowsRunningApplicationSubstitution = false;
+  configuration.activates = false;
+  configuration.addsToRecentItems = false;
+  configuration.promptsUserIfNeeded = false;
+  configuration.environment = $.NSProcessInfo.processInfo.environment;
+  var settled = false, application = null, failure = null;
+  var completion = ObjC.block('void, id, id', function(app, error) {
+    application = app;
+    if (ObjC.unwrap(error) != null) failure = ObjC.unwrap(error.localizedDescription);
+    settled = true;
+  });
+  $.NSWorkspace.sharedWorkspace.openApplicationAtURLConfigurationCompletionHandler(
+    $.NSURL.fileURLWithPath(args[0]), configuration, completion);
+  while (!settled) $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  if (failure != null || application == null) throw new Error(failure || 'Native app launch returned no application');
+  var pid = Number(application.processIdentifier);
+  if (!Number.isSafeInteger(pid) || pid < 2 || ObjC.unwrap(application.bundleURL.path) !== args[0]) {
+    application.terminate;
+    throw new Error('Native app launch identity did not match');
+  }
+  var groupOwned = Number(task('/bin/ps', ['-p', String(pid), '-o', 'pgid=']).trim()) === pid;
+  // The owner writes no data: EOF is the sole request to end this app lease.
+  while (Number($.NSFileHandle.fileHandleWithStandardInput.availableData.length) !== 0) {}
+  application.terminate;
+  if (groupOwned) task('/bin/kill', ['-TERM', '--', '-' + pid]);
+  var deadline = Date.now() + 1500;
+  while (Date.now() < deadline) $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  if (!application.terminated) application.forceTerminate;
+  // Retain escalation even if the app leader exited before its descendants.
+  if (groupOwned) task('/bin/kill', ['-KILL', '--', '-' + pid]);
+}
+`;
+
+async function runNativeAppWorker(env) {
+  const app = absolute(env.NANOCODEX_CUA_NATIVE_APP, 'NANOCODEX_CUA_NATIVE_APP');
+  absolute(env.NANOCODEX_CUA_POLICY_HOST, 'NANOCODEX_CUA_POLICY_HOST');
+  absolute(env.SKY_CUA_SERVICE_NATIVE_PIPE_PATH, 'SKY_CUA_SERVICE_NATIVE_PIPE_PATH');
+  const bundle = path.join(app, 'Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app');
+  const child = spawn('/usr/bin/osascript', ['-l', 'JavaScript', '-e', nativeAppLease, bundle], {
+    env: { ...env, CODEX_CLI_PATH: env.NANOCODEX_CUA_POLICY_HOST }, detached: true, stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  const stop = () => child.stdin.end();
+  child.stdin.on('error', () => {});
+  process.stdin.resume(); process.stdin.once('end', stop); process.stdin.once('error', stop);
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(signal, stop);
+  await new Promise(resolve => {
+    child.once('error', () => { process.exitCode = 1; resolve(); });
+    child.once('exit', code => { process.exitCode = code ?? 1; resolve(); });
+  });
+}
+
 export async function runWorker(env = process.env, kind = 'native') {
-  const native = kind === 'native';
-  let executable;
-  if (native) {
-    const app = absolute(env.NANOCODEX_CUA_NATIVE_APP, 'NANOCODEX_CUA_NATIVE_APP');
-    absolute(env.NANOCODEX_CUA_POLICY_HOST, 'NANOCODEX_CUA_POLICY_HOST');
-    executable = path.join(app, 'Contents/Resources/cua_node/lib/node_modules/@oai/sky/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService');
-  } else executable = absolute(env.NANOCODEX_CUA_NATIVE_PROVIDER, 'NANOCODEX_CUA_NATIVE_PROVIDER');
-  const child = spawn(executable, [], { env: native ? { ...env, CODEX_CLI_PATH: env.NANOCODEX_CUA_POLICY_HOST } : env,
-    detached: true, stdio: native ? ['ignore', 'ignore', 'ignore'] : ['pipe', 'pipe', 'ignore'] });
+  if (kind === 'native') { await runNativeAppWorker(env); return; }
+  const executable = absolute(env.NANOCODEX_CUA_NATIVE_PROVIDER, 'NANOCODEX_CUA_NATIVE_PROVIDER');
+  const child = spawn(executable, [], { env, detached: true, stdio: ['pipe', 'pipe', 'ignore'] });
   let finished = false;
   const stop = () => {
     if (finished) return; finished = true;
@@ -277,11 +355,9 @@ export async function runWorker(env = process.env, kind = 'native') {
     }, 1500);
   };
   child.once('error', stop); child.once('exit', stop);
-  if (!native) {
-    child.stdin.on('error', stop); child.stdout.once('end', () => { process.stdout.end(); stop(); });
-    child.stdout.pipe(process.stdout); process.stdin.pipe(child.stdin);
-    process.stdout.on('error', stop);
-  }
+  child.stdin.on('error', stop); child.stdout.once('end', () => { process.stdout.end(); stop(); });
+  child.stdout.pipe(process.stdout); process.stdin.pipe(child.stdin);
+  process.stdout.on('error', stop);
   process.stdin.resume(); process.stdin.once('end', stop); process.stdin.once('error', stop);
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(signal, stop);
 }

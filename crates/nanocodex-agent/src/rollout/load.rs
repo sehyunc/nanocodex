@@ -24,7 +24,7 @@ impl RolloutSessionInfo {
         self.workspace.as_deref()
     }
 
-    /// Returns a bounded single-line preview of the first user prompt.
+    /// Returns a bounded single-line saved thread name or first user prompt.
     #[must_use]
     pub fn preview(&self) -> Option<&str> {
         self.preview.as_deref()
@@ -81,6 +81,7 @@ impl DurableSession {
             materialized.history,
             materialized.client_authored,
             materialized.context_baseline,
+            materialized.reasoning,
         )
         .map_err(io::Error::other)?;
         Ok(Self {
@@ -161,6 +162,7 @@ pub enum RolloutTranscriptItem {
 }
 
 pub(super) fn list_sessions(codex_home: &Path) -> io::Result<Vec<RolloutSessionInfo>> {
+    let names = session_names(codex_home);
     let mut sessions = HashMap::<String, RolloutSessionInfo>::new();
     for (root, archived) in [
         (codex_home.join("sessions"), false),
@@ -186,7 +188,8 @@ pub(super) fn list_sessions(codex_home: &Path) -> io::Result<Vec<RolloutSessionI
                 let Some(thread_id) = rollout_thread_id(&entry.file_name()) else {
                     continue;
                 };
-                let Some(candidate) = rollout_session_info(&entry.path(), thread_id, archived)
+                let Some(candidate) =
+                    rollout_session_info(&entry.path(), thread_id, archived, &names)
                 else {
                     continue;
                 };
@@ -209,6 +212,37 @@ pub(super) fn list_sessions(codex_home: &Path) -> io::Result<Vec<RolloutSessionI
     Ok(sessions)
 }
 
+// Codex appends renames to this shared index. It is optional display metadata:
+// a missing, unreadable, or partially written index must not hide rollouts.
+fn session_names(codex_home: &Path) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let Ok(file) = File::open(codex_home.join("session_index.jsonl")) else {
+        return names;
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value["id"]
+            .as_str()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        else {
+            continue;
+        };
+        let Some(name) = value["thread_name"].as_str() else {
+            continue;
+        };
+        let id = id.to_string();
+        if let Some(name) = prompt_preview(name) {
+            names.insert(id, name);
+        } else {
+            names.remove(&id);
+        }
+    }
+    names
+}
+
 fn rollout_thread_id(file_name: &std::ffi::OsStr) -> Option<String> {
     let stem = file_name.to_str()?.strip_suffix(".jsonl")?;
     let start = stem.len().checked_sub(36)?;
@@ -223,11 +257,13 @@ fn rollout_session_info(
     path: &Path,
     thread_id: String,
     archived: bool,
+    names: &HashMap<String, String>,
 ) -> Option<RolloutSessionInfo> {
     let expected_id = uuid::Uuid::parse_str(&thread_id).ok()?;
     let modified_at = path.metadata().ok()?.modified().ok()?;
     let mut workspace = None;
-    let mut preview = None;
+    let mut preview = names.get(&thread_id).cloned();
+    let mut has_history = false;
     for line in BufReader::new(File::open(path).ok()?).lines() {
         let Ok(line) = line else {
             return None;
@@ -252,7 +288,9 @@ fn rollout_session_info(
                     .map(str::to_owned);
             }
             Some("event_msg") if preview.is_none() => {
-                let payload = value.get("payload")?;
+                let Some(payload) = value.get("payload") else {
+                    continue;
+                };
                 if payload.get("type").and_then(serde_json::Value::as_str) == Some("user_message") {
                     preview = payload
                         .get("message")
@@ -261,18 +299,23 @@ fn rollout_session_info(
                 }
             }
             Some("response_item" | "compacted") if workspace.is_some() => {
-                return Some(RolloutSessionInfo {
-                    thread_id,
-                    workspace,
-                    preview,
-                    modified_at,
-                    archived,
-                });
+                has_history = true;
             }
             _ => {}
         }
+        // Codex writes developer/environment response items before user_message.
+        // Those establish resumable history, but do not supply a prompt preview.
+        if has_history && preview.is_some() {
+            break;
+        }
     }
-    None
+    has_history.then_some(RolloutSessionInfo {
+        thread_id,
+        workspace,
+        preview,
+        modified_at,
+        archived,
+    })
 }
 
 pub(super) fn prompt_preview(prompt: &str) -> Option<String> {
@@ -374,6 +417,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
     let mut history = Vec::new();
     let mut transcript = Vec::new();
     let mut context_baseline = None;
+    let mut reasoning = crate::reasoning::ReasoningState::default();
     let mut client_authored = std::collections::BTreeSet::new();
     let mut model = Model::Sol;
     for (index, line) in BufReader::new(File::open(path)?).lines().enumerate() {
@@ -465,6 +509,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                     )
                 })?;
                 context_baseline = None;
+                reasoning = crate::reasoning::ReasoningState::default();
             }
             Some("turn_context") => {
                 if let Some(selected) = value["payload"]["model"].as_str() {
@@ -482,6 +527,9 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
                 }
             }
             Some("world_state") => {
+                if let Some(state) = value["payload"]["state"].get("nanocodex_reasoning") {
+                    reasoning = serde_json::from_value(state.clone()).map_err(io::Error::other)?;
+                }
                 if let Some(ids) = value["payload"]["state"].get("nanocodex_client_authored") {
                     client_authored =
                         serde_json::from_value(ids.clone()).map_err(io::Error::other)?;
@@ -536,6 +584,7 @@ fn materialize_rollout(path: &Path, thread_id: &str) -> io::Result<MaterializedR
         history,
         transcript,
         context_baseline,
+        reasoning,
         client_authored,
     })
 }
@@ -548,6 +597,7 @@ struct MaterializedRollout {
     history: Vec<ResponseItem>,
     transcript: Vec<RolloutTranscriptItem>,
     context_baseline: Option<ContextBaseline>,
+    reasoning: crate::reasoning::ReasoningState,
     client_authored: std::collections::BTreeSet<String>,
 }
 
