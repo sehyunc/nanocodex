@@ -423,7 +423,7 @@ impl Nanocodex {
     /// Waits for owner-bound startup recovery without submitting a model turn.
     /// Recovery failures remain observable to every clone and block new prompts.
     pub async fn ready(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "openai", not(target_family = "wasm")))]
         if let Some(startup) = &self.startup {
             let mut result = startup.result.clone();
             loop {
@@ -440,7 +440,7 @@ impl Nanocodex {
 
     /// Starts the embedding's reconstruction only after its native owner is bound.
     #[doc(hidden)]
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "openai", not(target_family = "wasm")))]
     pub fn with_owned_startup(mut self, hook: Option<Arc<dyn execution::TurnOwnership>>) -> Self {
         if let Some(hook) = hook {
             self.caller_ownership = hook.caller_ownership();
@@ -540,7 +540,7 @@ impl Nanocodex {
     /// concurrent and later callers on any clone await or reuse that same
     /// result.
     pub async fn shutdown(&self) -> Result<()> {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "openai", not(target_family = "wasm")))]
         if let Some(startup) = &self.startup {
             let task = startup.task.lock().expect("startup task lock").take();
             if let Some(task) = task {

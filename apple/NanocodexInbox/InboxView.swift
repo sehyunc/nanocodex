@@ -328,7 +328,7 @@ struct InboxView: View {
             }
         }
         .task(id: updateScenePhase) {
-            #if DEBUG
+            #if DEBUG && targetEnvironment(simulator)
             if StartupFixture.enabled { return }
             #endif
             guard updateScenePhase == .active, !model.isDemo else { return }

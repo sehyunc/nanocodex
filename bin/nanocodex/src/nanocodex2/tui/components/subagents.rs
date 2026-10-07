@@ -354,6 +354,7 @@ impl SubagentTree {
     fn ensure_managed_node(&mut self, id: AgentId) {
         if !self.contains(id) {
             self.apply(AgentUpdate::Added(AgentDescriptor {
+                lifetime: Default::default(),
                 id,
                 session_id: String::new(),
                 role: format!("Agent {id}"),
@@ -402,6 +403,9 @@ impl SubagentTree {
                 .and_then(|v| v["model"].as_str())
                 .or_else(|| value["model"].as_str())
                 .and_then(|model| model.parse().ok());
+        }
+        if let Ok(lifetime) = serde_json::from_value(value["lifetime"].clone()) {
+            node.descriptor.lifetime = lifetime;
         }
         if let Some(session) = value["session_id"].as_str() {
             node.descriptor.session_id = session.to_owned();

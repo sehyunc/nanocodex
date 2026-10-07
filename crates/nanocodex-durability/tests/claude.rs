@@ -671,7 +671,7 @@ async fn transaction_recovery(
     let (client, requests, server) = server(move |_, request| {
         if request["tool_choice"]["type"] == "none" {
             return sse(
-                text("Retain the synthetic task and committed receipt."),
+                text("Retain the synthetic task and committed receipt. completed-fetch"),
                 "end_turn",
                 10,
             );
