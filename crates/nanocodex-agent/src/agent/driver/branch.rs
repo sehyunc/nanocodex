@@ -9,6 +9,7 @@ pub(in crate::agent) struct BranchSpawner<S> {
     pub(in crate::agent) provider_session_id: Arc<str>,
     pub(in crate::agent) prompt_cache_key: Option<Arc<str>>,
     pub(in crate::agent) shared_prompt_cache: Option<SharedPromptCache>,
+    pub(in crate::agent) turn_ownership: Option<Arc<dyn execution::TurnOwnership>>,
     pub(in crate::agent) before_compaction: Option<Arc<dyn execution::BeforeCompaction>>,
     pub(in crate::agent) context_config: ContextSourceConfig,
     pub(in crate::agent) context_source: ContextSource,
@@ -43,6 +44,7 @@ impl<S> BranchSpawner<S> {
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             // Preservation belongs to the host that explicitly configured this root.
             before_compaction: None,
+            turn_ownership: self.turn_ownership.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_source.clone(),
             depth: self.depth,
@@ -67,7 +69,7 @@ where
         parent_session_id: &str,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         host_context: Option<Arc<str>>,
         side_conversation: bool,
     ) -> Result<(Nanocodex, AgentEvents)> {
@@ -79,7 +81,7 @@ where
         let mut config = (*spawner.config).clone();
         config.model = model;
         config.thinking = thinking;
-        config.fast_mode = fast_mode;
+        config.service_tier = service_tier;
         spawner.config = Arc::new(config);
         spawner.depth = self.depth.saturating_add(1);
         let service = (spawner.service_factory)(Arc::clone(&spawner.config));
@@ -108,7 +110,7 @@ where
         parent_session_id: &str,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         stateless_http: bool,
         host_context: Option<Arc<str>>,
     ) -> Result<(Nanocodex, AgentEvents)> {
@@ -118,7 +120,7 @@ where
         let mut config = (*self.config).clone();
         config.model = model;
         config.thinking = thinking;
-        config.fast_mode = fast_mode;
+        config.service_tier = service_tier;
         if stateless_http {
             config.responses_transport = ResponsesTransport::Https;
             config.responses_history = ResponsesHistory::FullReplay;
@@ -140,6 +142,7 @@ where
             shared_prompt_cache: self.shared_prompt_cache.clone(),
             // Preservation belongs to the host that explicitly configured this root.
             before_compaction: None,
+            turn_ownership: self.turn_ownership.clone(),
             context_config: self.context_config.clone(),
             context_source: self.context_config.build(),
             depth,
@@ -184,7 +187,7 @@ where
         let mut config = (*spawner.config).clone();
         config.model = snapshot.model;
         config.thinking = snapshot.thinking;
-        config.fast_mode = snapshot.fast_mode;
+        config.service_tier = snapshot.service_tier;
         if snapshot.stateless_http {
             config.responses_transport = ResponsesTransport::Https;
             config.responses_history = ResponsesHistory::FullReplay;
@@ -226,6 +229,7 @@ where
                             client_authored: resume.client_authored,
                             prompt_cache_key: resume.prompt_cache_key,
                             context_baseline: resume.context_baseline,
+                            reasoning: resume.reasoning,
                         }))
                     },
                     |checkpoint| InitialResume::Exact(Box::new(checkpoint)),
@@ -263,7 +267,7 @@ where
                 parent_session_id,
                 defaults.model,
                 defaults.thinking,
-                defaults.fast_mode,
+                defaults.service_tier,
                 false,
                 host_context
                     .as_ref()

@@ -1,3 +1,5 @@
+import { requireSameOriginMutation } from "./same-origin-mutation";
+export { requireSameOriginMutation };
 import { readTodoSourceHealth } from "./todo-source-health";
 import { readTodoCalendarBriefings } from "./todo-calendar-briefings";
 import { backfillTodoPreparation, nextTodoPreparationAlarm, runTodoPreparation, scheduleTodoPreparation } from "./todo-preparation";
@@ -15,7 +17,7 @@ import { configurationCatalog } from "./agent-configuration";
 import { performanceState } from "./performance";
 import { MANAGED_ACCESS_HEADER, managedAccessRequest, readManagedAccess, observeManagedAccess } from "./managed-access";
 import { DurableObject } from "cloudflare:workers";
-import { fetchResponseWithDeadline } from "./deadline";
+import { fetchResponseWithDeadline, withHardDeadline } from "./deadline";
 import { Handler, Kv } from "accounts/server";
 import { Address, PublicKey } from "ox";
 import {
@@ -35,10 +37,8 @@ const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 const PERSISTENT_SESSION_TTL_SECONDS = 365 * 24 * 60 * 60;
 const WEBAUTHN_CHALLENGE_TTL_SECONDS = 5 * 60;
 const OTP_CHALLENGE_TTL_SECONDS = 5 * 60;
-const OTP_RESEND_SECONDS = 60;
-const OTP_PHONE_REQUESTS_PER_HOUR = 5;
-const OTP_IP_REQUESTS_PER_HOUR = 20;
 const OTP_PROVIDER_TIMEOUT_MS = 10_000;
+const OTP_ATTEMPT_LEASE_SECONDS = 30;
 const ACCOUNT_PROVISION_TIMEOUT_MS = 10_000;
 const MAX_WALLET_MUTATION_BODY_BYTES = 16 * 1024;
 const USER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -76,14 +76,123 @@ export function isUserId(value: unknown): value is string {
   return typeof value === "string" && USER_ID.test(value);
 }
 
-export const NonceStorage = Kv.NonceStorage;
+// Keep the SDK's nonce protocol and stored entries compatible. SMS transitions
+// additionally need a transaction spanning the active pointer and challenge.
+export class NonceStorage extends DurableObject<unknown> {
+  private readonly nonce: Kv.NonceStorage;
+  constructor(private readonly smsState: DurableObjectState, env: unknown) {
+    super(smsState, env);
+    this.nonce = new Kv.NonceStorage(smsState as unknown as Kv.NonceStorage.State, env);
+  }
+
+  /** Internal-only discovery projection; callers enforce platform-admin authority. */
+  async adminAccountPage(source: string, after: string | undefined, limit: number): Promise<{ data: string[]; next?: string }> {
+    const prefixes: Record<string, string> = { directory: "admin-account:", sms: "identity:", webauthn: "credential:", address: "address:" };
+    if (!Object.hasOwn(prefixes, source) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100
+      || (after !== undefined && !isUuid(after))) throw new TypeError("invalid_admin_page");
+    const prefix = prefixes[source]!;
+    this.smsState.storage.sql.exec(`CREATE TABLE IF NOT EXISTS admin_page_cursors (
+      id TEXT PRIMARY KEY, source TEXT NOT NULL, position TEXT NOT NULL, expires_at INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS admin_page_expiry ON admin_page_cursors(expires_at);`);
+    this.smsState.storage.sql.exec("DELETE FROM admin_page_cursors WHERE expires_at <= ?", Date.now());
+    const position = after ? this.smsState.storage.sql.exec<{ source: string; key: string }>(
+      "SELECT source, position AS key FROM admin_page_cursors WHERE id=?", after).toArray()[0] : undefined;
+    if (after && (!position || position.source !== source)) throw new TypeError("invalid_admin_cursor");
+    const rows = await this.smsState.storage.list<{ value: unknown; expiresAt?: number }>({ prefix, ...(position ? { startAfter: position.key } : {}), limit: limit + 1 });
+    const entries = [...rows.entries()].slice(0, limit);
+    const data = new Set<string>();
+    for (const [key, entry] of entries) {
+      if (entry.expiresAt !== undefined && entry.expiresAt <= Date.now()) continue;
+      const value = entry.value;
+      let id: unknown;
+      if (source === "directory" || source === "address") id = key.slice(prefix.length);
+      else if (source === "sms" && isSmsIdentity(value)) id = value.userId;
+      else if (source === "webauthn" && isStoredWebAuthnCredential(value)) id = decodeUserId((value as { userId: string }).userId);
+      if (isUserId(id)) data.add(id);
+    }
+    let next: string | undefined;
+    if (rows.size > limit) {
+      next = crypto.randomUUID();
+      // Keep opaque positions private: source keys can contain phone hashes or credential IDs.
+      this.smsState.storage.sql.exec("INSERT INTO admin_page_cursors(id,source,position,expires_at) VALUES(?,?,?,?)",
+        next, source, entries.at(-1)![0], Date.now() + 3_600_000);
+      this.smsState.storage.sql.exec("DELETE FROM admin_page_cursors WHERE id IN (SELECT id FROM admin_page_cursors ORDER BY expires_at DESC,id DESC LIMIT -1 OFFSET 1000)");
+    }
+    return { data: [...data], ...(next ? { next } : {}) };
+  }
+
+  async registerAdminAccount(userId: string): Promise<void> {
+    if (!isUserId(userId)) throw new Error("invalid account identity");
+    await this.smsState.storage.put(`admin-account:${userId}`, { value: true });
+  }
+
+  // Preserve the existing SDK storage envelope and expiry/revocation semantics,
+  // but return session data in one RPC reply instead of a streamed HTTP body.
+  async readAccountSession(token: string): Promise<AccountSessionPayload | undefined> {
+    if (!ANONYMOUS_SESSION_TOKEN.test(token) && !SMS_SESSION_TOKEN.test(token)) return undefined;
+    const entry = await this.smsState.storage.get<{ value: AccountSessionPayload; expiresAt?: number }>(accountSessionKey(token));
+    if (!entry || (entry.expiresAt !== undefined && entry.expiresAt <= Date.now())) return undefined;
+    const session = entry.value;
+    return session && isUserId(session.userId) && session.expiresAt > Date.now() / 1_000 ? session : undefined;
+  }
+
+  override async fetch(request: Request): Promise<Response> {
+    if (new URL(request.url).pathname !== "/sms") return this.nonce.fetch(request);
+    const input = await request.json<SmsOtpTransition>();
+    const result = await this.smsState.storage.transaction(async storage => {
+      const now = Math.floor(Date.now() / 1_000);
+      const challengeKey = `challenge:${input.challengeId}`;
+      const activeKey = `active:${input.phoneDigest}`;
+      const put = (key: string, value: unknown, expiresAt?: number) =>
+        storage.put(key, { value, ...(expiresAt === undefined ? {} : { expiresAt: expiresAt * 1_000 }) });
+      if (input.operation === "publish") {
+        if (!isSmsOtpChallenge(input.challenge) || input.challenge.expiresAt <= now) return undefined;
+        await put(challengeKey, input.challenge, input.challenge.expiresAt);
+        await put(activeKey, input.challengeId, input.challenge.expiresAt);
+        return input.challenge;
+      }
+      const active = await storage.get<Kv.NonceStorage.Entry>(activeKey);
+      const entry = await storage.get<Kv.NonceStorage.Entry>(challengeKey);
+      if (active?.value !== input.challengeId || !isSmsOtpChallenge(entry?.value)
+        || entry.value.phoneDigest !== input.phoneDigest || entry.value.expiresAt <= now) return undefined;
+      let challenge = entry.value;
+      if (input.operation === "claim") {
+        if (challenge.attempt && challenge.attempt.expiresAt > now) return undefined;
+        if (challenge.approval && challenge.approval.codeDigest !== input.codeDigest) return undefined;
+        challenge = { ...challenge, attempt: { id: input.attemptId, expiresAt: now + OTP_ATTEMPT_LEASE_SECONDS } };
+      } else {
+        if (challenge.attempt?.id !== input.attemptId || challenge.attempt.expiresAt <= now) return undefined;
+        if (input.operation === "approve") {
+          const identityKey = `identity:${input.phoneDigest}`;
+          const existing = await storage.get<Kv.NonceStorage.Entry>(identityKey);
+          if (existing && !isSmsIdentity(existing.value)) return undefined;
+          const identity = existing?.value as SmsIdentity | undefined
+            ?? { userId: challenge.candidateUserId };
+          if (!existing) await put(identityKey, identity);
+          challenge = { ...challenge, approval: { codeDigest: input.codeDigest, userId: identity.userId } };
+        } else if (input.operation === "release") {
+          const { attempt: _attempt, ...released } = challenge;
+          challenge = released;
+        } else if (input.operation === "consume") {
+          if (!challenge.approval || challenge.approval.codeDigest !== input.codeDigest) return undefined;
+          await storage.delete(challengeKey);
+          await storage.delete(activeKey);
+          return challenge;
+        }
+      }
+      await put(challengeKey, challenge, challenge.expiresAt);
+      return challenge;
+    });
+    return Response.json({ challenge: result });
+  }
+}
 
 export interface AccountAuthEnv extends IngressPlacement {
   NANOCODEX_PERFORMANCE_TRACE?: string;
   NANOCODEX_ACCESS_SECRET?: string;
   ENVIRONMENT?: string;
   NANOCODEX_MOCK_TWILIO_VERIFY_CODE?: string;
-  NANOCODEX_AUTH: DurableObjectNamespace;
+  NANOCODEX_AUTH: DurableObjectNamespace<NonceStorage>;
   NANOCODEX_USERS: DurableObjectNamespace<UserAccount>;
   NANOCODEX_API_KEYS: DurableObjectNamespace<ApiKeyRecord>;
   NANOCODEX_LOCAL_WEBAUTHN_HMAC_KEY?: string;
@@ -154,6 +263,8 @@ export type Principal = Readonly<{
   role: OrganizationRole;
   subjectId: `user:${string}` | `api_key:${string}`;
   credentialId: string;
+  /** Verified key routing hint; live resolution still checks every authority field. */
+  apiKeyObjectId?: string;
   authorizationEpoch: number;
   capabilities: readonly OrganizationCapability[];
   connectGrant?: ConnectGrantSlice;
@@ -166,6 +277,10 @@ type UserRecord = Readonly<{
   createdAt: number;
   lastAuthenticatedAt: number;
 }>;
+
+// Snapshots belong only to a freshly resolved principal, never to a user/session key.
+// Every authentication still resolves live account and organization authority.
+const resolvedPrincipalAccounts = new WeakMap<Principal, UserRecord>();
 
 type OrganizationGrant = Readonly<{
   organizationId: string;
@@ -226,7 +341,28 @@ type SmsOtpChallenge = Readonly<{
   expiresAt: number;
   phoneDigest: string;
   verificationSid: string;
+  attempt?: Readonly<{ id: string; expiresAt: number }>;
+  approval?: Readonly<{ codeDigest: string; userId: string }>;
 }>;
+
+type SmsOtpTransition = Readonly<{
+  operation: "publish" | "claim" | "approve" | "release" | "consume";
+  challengeId: string;
+  phoneDigest: string;
+  attemptId: string;
+  codeDigest: string;
+  challenge?: SmsOtpChallenge;
+}>;
+
+async function transitionSmsOtp(env: AccountAuthEnv, input: SmsOtpTransition): Promise<SmsOtpChallenge | undefined> {
+  const stub = env.NANOCODEX_AUTH.get(env.NANOCODEX_AUTH.idFromName("sms-otp"));
+  const response = await stub.fetch("https://auth.internal/sms", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error("SMS storage unavailable");
+  return (await response.json<{ challenge?: SmsOtpChallenge }>()).challenge;
+}
 
 type PortableCredential = Readonly<{
   credentialId: string;
@@ -353,8 +489,19 @@ export async function requestApiKeyPermissions(
 export async function resolvePermissionKey(
   env: AccountAuthEnv,
   identity: PermissionRequestIdentity,
+  apiKeyObjectId?: string,
 ): Promise<{ capabilities: readonly OrganizationCapability[] } | undefined> {
-  const key = await permissionKey(env, identity);
+  let key: DurableObjectStub<ApiKeyRecord> | undefined;
+  if (apiKeyObjectId === undefined) {
+    // Retained sockets and older ingress versions have only the public key ID.
+    key = await permissionKey(env, identity);
+  } else {
+    // Routing is not authority: resolve the live key and compare its complete
+    // identity below, including owner, organization, team, and epoch.
+    if (!/^[0-9a-f]{64}$/.test(apiKeyObjectId)) return undefined;
+    try { key = env.NANOCODEX_API_KEYS.get(env.NANOCODEX_API_KEYS.idFromString(apiKeyObjectId)); }
+    catch { return undefined; }
+  }
   if (!key) return undefined;
   const record = consumeRpcData(await key.resolveAuthorizedKey());
   if (!record || record.id !== identity.keyId || record.userId !== identity.userId
@@ -431,6 +578,15 @@ export type AgentSummary = Readonly<{
   turnCount: number;
   mayHaveScheduledJobs: boolean;
   presentation?: AgentPresentation;
+  crewSeat?: CrewSeatSummary;
+}>;
+
+export type CrewSeatSummary = Readonly<{
+  agent_id: string;
+  crew_id: string;
+  seat_name: string;
+  role: string;
+  coordinator_agent_id?: string;
 }>;
 
 type AgentRegistryRow = Readonly<{
@@ -442,6 +598,10 @@ type AgentRegistryRow = Readonly<{
   deleted_at: number | null;
   cron_candidate: number | null;
   presentation: string | null;
+  crew_id: string | null;
+  seat_name: string | null;
+  seat_role: string | null;
+  coordinator_agent_id: string | null;
 }>;
 
 export async function routeAccountRequest(
@@ -522,15 +682,20 @@ export async function routeAccountRequest(
     return webAuthnHandler(env, url).fetch(request);
   }
   if (url.pathname === "/v1/me" && request.method === "GET") {
+    const started = performance.now();
     const resolved = await resolveOrCreateBrowserAccount(request, env, url);
     if (resolved instanceof Response) return resolved;
+    const sessionMs = performance.now() - started;
+    const metadataStarted = performance.now();
     const principal = resolved.principal;
-    const accountAddress = resolved.persistent
-      ? await readAccountWallet(env, principal.userId).then((wallet) => wallet?.address).catch(() => undefined)
-      : await accountAddressForRequest(request, env, url, principal.userId).catch(() => undefined);
-    const portableCookie = resolved.persistent
-      ? await portableLocalCredentialCookieForSession(request, env, url, principal)
-      : undefined;
+    const [accountAddress, portableCookie] = await Promise.all([
+      resolved.persistent
+        ? readAccountWallet(env, principal.userId).then((wallet) => wallet?.address).catch(() => undefined)
+        : accountAddressForRequest(request, env, url, principal.userId).catch(() => undefined),
+      resolved.persistent
+        ? portableLocalCredentialCookieForSession(request, env, url, principal)
+        : undefined,
+    ]);
     const persistentCookie = resolved.persistent
       ? serializePersistentSessionCookie(request, url.protocol)
       : undefined;
@@ -538,6 +703,12 @@ export async function routeAccountRequest(
       (cookie): cookie is string => Boolean(cookie),
     );
     const headers = new Headers();
+    const metadataMs = performance.now() - metadataStarted;
+    const totalMs = performance.now() - started;
+    headers.set("server-timing", `connect_session;dur=${sessionMs.toFixed(1)}, connect_metadata;dur=${metadataMs.toFixed(1)}, connect_total;dur=${totalMs.toFixed(1)}`);
+    console.info({ type: "connect.session_timing", auth_kind: principal.kind,
+      connect: url.searchParams.get("connect") === "1", session_ms: sessionMs,
+      metadata_ms: metadataMs, total_ms: totalMs });
     for (const cookie of cookies) headers.append("set-cookie", cookie);
     return json({
       user: {
@@ -549,9 +720,7 @@ export async function routeAccountRequest(
       team: { id: principal.teamId },
       role: principal.role,
       authentication: principal.kind,
-    }, cookies.length
-      ? { headers }
-      : undefined);
+    }, { headers });
   }
   if (url.pathname === "/v1/wallet") {
     if (request.method !== "GET") return methodNotAllowed();
@@ -564,6 +733,18 @@ export async function routeAccountRequest(
     const principal = await authenticatePersistentAccount(request, env, url);
     if (!principal) return unauthorized();
     return proxyAccountWalletRequest(env, principal.userId, "/balance");
+  }
+  if (["/v1/wallet/link", "/v1/wallet/link/poll", "/v1/wallet/link/cancel", "/v1/wallet/unlink"].includes(url.pathname)) {
+    if (request.method !== "POST") return methodNotAllowed();
+    const principal = await authenticatePersistentAccount(request, env, url);
+    if (!principal) return unauthorized();
+    const originFailure = requireSameOriginMutation(request, url, principal);
+    if (originFailure) return originFailure;
+    const body = await readJson(request, MAX_WALLET_MUTATION_BODY_BYTES);
+    if (body instanceof Response) return body;
+    if (containsBrowserPrivateKey(body)) return json({ error: "invalid_wallet_request" }, { status: 400 });
+    const suffix = url.pathname.slice("/v1/wallet".length) as "/link" | "/link/poll" | "/link/cancel" | "/unlink";
+    return proxyAccountWalletRequest(env, principal.userId, suffix, body);
   }
   if (url.pathname === "/v1/wallet/connect" || url.pathname === "/v1/wallet/revoke-access-key") {
     if (request.method !== "POST") return methodNotAllowed();
@@ -676,27 +857,8 @@ async function startSmsOtp(
   const phone = normalizedPhone(body.phone);
   if (!phone) return json({ error: "invalid_phone" }, { status: 400 });
 
-  const store = authStore(env, "sms-otp");
-  if (!store.create) return json({ error: "sms_otp_unavailable" }, { status: 503 });
-  const [phoneDigest, ipDigest] = await Promise.all([
-    keyedDigest(secret, `phone:${phone}`),
-    keyedDigest(secret, `ip:${request.headers.get("cf-connecting-ip") ?? "local"}`),
-  ]);
+  const phoneDigest = await keyedDigest(secret, `phone:${phone}`);
   const now = Math.floor(Date.now() / 1_000);
-  const limited = !await store.create(`cooldown:${phoneDigest}`, true, { ttl: OTP_RESEND_SECONDS })
-    || !await reserveWindowSlot(
-      store,
-      `phone:${phoneDigest}`,
-      OTP_PHONE_REQUESTS_PER_HOUR,
-      now,
-    )
-    || !await reserveWindowSlot(store, `ip:${ipDigest}`, OTP_IP_REQUESTS_PER_HOUR, now);
-  if (limited) {
-    return json({ error: "rate_limited", retry_after: OTP_RESEND_SECONDS }, {
-      status: 429,
-      headers: { "retry-after": String(OTP_RESEND_SECONDS) },
-    });
-  }
 
   const session = await readBrowserSession(request, env);
   const sessionToken = cookieValue(request, ACCOUNT_COOKIE);
@@ -712,22 +874,19 @@ async function startSmsOtp(
       phoneDigest,
       verificationSid,
     };
-    await Promise.all([
-      store.set(`challenge:${challengeId}`, challenge, { ttl: OTP_CHALLENGE_TTL_SECONDS }),
-      store.set(`active:${phoneDigest}`, challengeId, { ttl: OTP_CHALLENGE_TTL_SECONDS }),
-    ]);
+    if (!await transitionSmsOtp(env, {
+      operation: "publish", challengeId, phoneDigest, challenge, attemptId: "", codeDigest: "",
+    })) throw new Error("SMS challenge expired");
   } catch {
-    await Promise.all([
-      store.delete(`challenge:${challengeId}`),
-      store.delete(`active:${phoneDigest}`),
-      store.delete(`cooldown:${phoneDigest}`),
-    ]);
+    // A failed send must not invalidate the previously delivered challenge.
+    // Publication is atomic; an uncertain storage outcome must not delete a
+    // newer resend's active pointer either.
     return json({ error: "sms_delivery_failed" }, { status: 503 });
   }
   return json({
     challenge_id: challengeId,
     expires_in: OTP_CHALLENGE_TTL_SECONDS,
-    resend_after: OTP_RESEND_SECONDS,
+    resend_after: 0,
   }, { status: 202 });
 }
 
@@ -749,81 +908,79 @@ async function verifySmsOtp(
     return json({ error: "invalid_otp" }, { status: 400 });
   }
 
-  const store = authStore(env, "sms-otp");
-  if (!store.take) return json({ error: "sms_otp_unavailable" }, { status: 503 });
   const phoneDigest = await keyedDigest(secret, `phone:${phone}`);
-  const active = await store.get<unknown>(`active:${phoneDigest}`);
-  const challenge = await store.take<unknown>(`challenge:${challengeId}`);
-  const now = Math.floor(Date.now() / 1_000);
-  if (active !== challengeId || !isSmsOtpChallenge(challenge)
-    || challenge.phoneDigest !== phoneDigest || challenge.expiresAt <= now) {
-    return json({ error: "invalid_or_expired_otp" }, { status: 400 });
-  }
-  let approved: boolean;
+  // Bind cached approval to this exact challenge and code without storing either
+  // the phone or the low-entropy code in plaintext (or an unkeyed hash).
+  const codeDigest = await keyedDigest(secret, `sms-approval:${phoneDigest}:${challengeId}:${code}`);
+  const attemptId = randomBase64Url(32);
+  const transition = (operation: SmsOtpTransition["operation"]) => transitionSmsOtp(env, {
+    operation, phoneDigest, challengeId, codeDigest, attemptId,
+  });
+  let challenge = await transition("claim");
+  const invalid = () => json({ error: "invalid_or_expired_otp" }, { status: 400 });
+  if (!challenge) return invalid();
+  let consumed = false;
   try {
-    approved = await checkTwilioSmsVerification(env, challenge.verificationSid, code);
-  } catch {
-    await store.set(`challenge:${challengeId}`, challenge, {
-      ttl: Math.max(1, challenge.expiresAt - now),
+    if (!challenge.approval) {
+      let approved: boolean;
+      try {
+        approved = await checkTwilioSmsVerification(env, challenge.verificationSid, code);
+      } catch {
+        return json({ error: "sms_verification_failed" }, { status: 503 });
+      }
+      if (!approved) return invalid();
+      // Persist proof before any provisioning. Twilio deletes approved SIDs;
+      // a wallet failure or worker restart must never require approving it twice.
+      // A lost Twilio response before this write still fails closed.
+      challenge = await transition("approve");
+      if (!challenge?.approval) return invalid();
+    }
+    const identity = challenge.approval;
+    let wallet: AccountWalletMetadata;
+    try {
+      [wallet] = await Promise.all([
+        ensureAccountWallet(env, identity.userId),
+        ensureAccount(env, identity.userId, true),
+      ]);
+    } catch {
+      return json({ error: "wallet_unavailable" }, { status: 503 });
+    }
+    const now = Math.floor(Date.now() / 1_000);
+    const token = `s_${randomBase64Url(32)}`;
+    const sessions = authStore(env, "account");
+    await sessions.set(accountSessionKey(token), {
+      authentication: "sms_otp",
+      userId: identity.userId,
+      issuedAt: now,
+      expiresAt: now + SESSION_TTL_SECONDS,
+    } satisfies AccountSessionPayload, { ttl: SESSION_TTL_SECONDS });
+    // Recheck expiry, current resend and attempt ownership atomically. Only the
+    // winner may disclose its session token; stale workers cannot consume a new
+    // attempt or delete a newer challenge's active pointer.
+    if (!await transition("consume")) {
+      await sessions.delete(accountSessionKey(token));
+      return invalid();
+    }
+    consumed = true;
+    const previousToken = cookieValue(request, ACCOUNT_COOKIE);
+    if (previousToken && (ANONYMOUS_SESSION_TOKEN.test(previousToken) || SMS_SESSION_TOKEN.test(previousToken))) {
+      // The new one-use login is committed. A cleanup outage must not discard
+      // its only response and strand the user behind a consumed challenge.
+      try { await sessions.delete(accountSessionKey(previousToken)); } catch { /* best-effort old-session cleanup */ }
+    }
+    return json({
+      user: { address: wallet.address, id: identity.userId, persistent: true },
+    }, {
+      headers: { "set-cookie": accountCookie(token, PERSISTENT_SESSION_TTL_SECONDS, url.protocol) },
     });
-    return json({ error: "sms_verification_failed" }, { status: 503 });
-  }
-  if (!approved) {
-    await store.set(`challenge:${challengeId}`, challenge, {
-      ttl: Math.max(1, challenge.expiresAt - now),
-    });
-    return json({ error: "invalid_or_expired_otp" }, { status: 400 });
-  }
-
-  const proposedIdentity: SmsIdentity = {
-    userId: challenge.candidateUserId,
-  };
-  const identityKey = `identity:${phoneDigest}`;
-  if (!store.create || !await store.create(identityKey, proposedIdentity)) {
-    const existing = await store.get<unknown>(identityKey);
-    if (!isSmsIdentity(existing)) {
-      return json({ error: "sms_identity_unavailable" }, { status: 503 });
+  } finally {
+    // This conditional release cannot resurrect a consumed/superseded challenge.
+    // If the worker disappears, the durable claim expires after 30 seconds while
+    // approval and the original challenge deadline remain intact.
+    if (!consumed) {
+      try { await transition("release"); } catch { /* the durable lease bounds recovery after a storage outage */ }
     }
   }
-  const identity = await store.get<unknown>(identityKey);
-  if (!isSmsIdentity(identity)) {
-    return json({ error: "sms_identity_unavailable" }, { status: 503 });
-  }
-  let wallet: AccountWalletMetadata;
-  try {
-    [wallet] = await Promise.all([
-      ensureAccountWallet(env, identity.userId),
-      ensureAccount(env, identity.userId, true),
-    ]);
-  } catch {
-    await store.set(`challenge:${challengeId}`, challenge, {
-      ttl: Math.max(1, challenge.expiresAt - now),
-    });
-    return json({ error: "wallet_unavailable" }, { status: 503 });
-  }
-  const previousToken = cookieValue(request, ACCOUNT_COOKIE);
-  if (previousToken && (ANONYMOUS_SESSION_TOKEN.test(previousToken) || SMS_SESSION_TOKEN.test(previousToken))) {
-    await authStore(env, "account").delete(accountSessionKey(previousToken));
-  }
-  const token = `s_${randomBase64Url(32)}`;
-  await authStore(env, "account").set(accountSessionKey(token), {
-    authentication: "sms_otp",
-    userId: identity.userId,
-    issuedAt: now,
-    expiresAt: now + SESSION_TTL_SECONDS,
-  } satisfies AccountSessionPayload, { ttl: SESSION_TTL_SECONDS });
-  await store.delete(`active:${phoneDigest}`);
-  return json({
-    user: {
-      address: wallet.address,
-      id: identity.userId,
-      persistent: true,
-    },
-  }, {
-    headers: {
-      "set-cookie": accountCookie(token, PERSISTENT_SESSION_TTL_SECONDS, url.protocol),
-    },
-  });
 }
 
 /** Called only after the self-hosted entrypoint verifies the owner's secret. */
@@ -931,13 +1088,13 @@ async function authenticateLive(request: Request, env: AccountAuthEnv, url: URL)
   const stub = env.NANOCODEX_API_KEYS.getByName(digest, durablePlacementOptions(env.trustedClientIngressColo));
   // RPC returns the small record in one reply. A fetch Response transports its
   // headers and JSON stream separately across Durable Object locations.
-  let record: StoredApiKey | undefined;
+  let record: (StoredApiKey & { account?: UserRecord }) | undefined;
   const rpc = stub.resolveAuthorizedKey;
   if (typeof rpc === "function") {
     const observeCreate = request.method === "POST"
       && (url.pathname === "/v1/agents" || url.pathname === "/v1/agent-runs");
     const rpcStartedAt = performance.now();
-    record = consumeRpcData(await Reflect.apply(rpc, stub, [observeCreate]));
+    record = consumeRpcData(await Reflect.apply(rpc, stub, [observeCreate, url.pathname === "/v1/me"]));
     if (observeCreate) console.info({ type: "managed.auth.api_key_rpc",
       resolve_rpc_ms: Math.round((performance.now() - rpcStartedAt) * 100) / 100 });
 
@@ -952,23 +1109,33 @@ async function authenticateLive(request: Request, env: AccountAuthEnv, url: URL)
     if (response.headers.get("x-nanocodex-api-key-authorized") !== "1"
       && !await apiKeyAuthorized(env, record)) return undefined;
   }
-  return apiKeyPrincipal(record, digest);
+  const principal = apiKeyPrincipal(record, digest, stub.id?.toString());
+  if (principal && isUserRecord(record?.account)
+    && record.account.id === principal.userId
+    && record.account.organizationId === principal.organizationId) {
+    resolvedPrincipalAccounts.set(principal, record.account);
+  }
+  return principal;
 }
 
 async function apiKeyAuthorized(env: AccountAuthEnv, record: StoredApiKey): Promise<boolean> {
+  return Boolean(await authorizedApiKeyAccount(env, record));
+}
+
+async function authorizedApiKeyAccount(env: AccountAuthEnv, record: StoredApiKey): Promise<UserRecord | undefined> {
   const [account, grant] = await Promise.all([
     readAccount(env, record.userId),
     resolveOrganizationGrant(env, { id: record.userId, organizationId: record.organizationId }),
   ]);
-  if (!account || account.organizationId !== record.organizationId) return false;
+  if (!account || account.organizationId !== record.organizationId) return undefined;
   if (!grant
     || grant.teamId !== record.teamId
     || grant.authorizationEpoch !== record.authorizationEpoch
     || organizationRoleRank(record.role) > organizationRoleRank(grant.role)
     || record.capabilities.some((capability) => !grant.capabilities.includes(capability))) {
-    return false;
+    return undefined;
   }
-  return true;
+  return account;
 }
 
 async function resolveUserPrincipal(
@@ -976,23 +1143,34 @@ async function resolveUserPrincipal(
   userId: string,
   credentialId: string,
 ): Promise<Principal | undefined> {
-  // Resolve live membership beside the account record, avoiding a second
-  // edge-to-Durable-Object round trip for browser/passkey sessions.
-  const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/authorization");
-  if (!response.ok) {
-    await response.body?.cancel();
-    return undefined;
+  const stub = env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo));
+  // Return the small live authorization snapshot in one RPC reply instead of
+  // transporting Response headers and its JSON stream across DO locations.
+  let value: { userId?: unknown; grant?: unknown; account?: unknown } | undefined;
+  const rpc = stub.resolveAuthorization;
+  if (typeof rpc === "function") {
+    value = consumeRpcData(await Reflect.apply(rpc, stub, []));
+  } else {
+    const response = await stub.fetch("https://user.internal/authorization");
+    if (!response.ok) {
+      await response.body?.cancel();
+      return undefined;
+    }
+    value = await response.json();
   }
-  const value = await response.json<{ userId?: unknown; grant?: unknown }>();
-  if (value.userId !== userId || !isOrganizationGrant(value.grant)) return undefined;
-  const grant = value.grant;
-  return {
+  if (!value || value.userId !== userId || !isOrganizationGrant(value.grant)) return undefined;
+  const principal: Principal = {
     kind: "account_session",
     userId,
-    ...grant,
+    ...value.grant,
     subjectId: `user:${userId}`,
     credentialId,
   };
+  if (isUserRecord(value.account) && value.account.id === userId
+    && value.account.organizationId === principal.organizationId) {
+    resolvedPrincipalAccounts.set(principal, value.account);
+  }
+  return principal;
 }
 
 export async function resolveChiefOfStaffPrincipal(
@@ -1016,7 +1194,7 @@ export async function authenticatePersistentAccount(
 ): Promise<Principal | undefined> {
   const principal = await authenticate(request, env, url);
   if (!principal || principal.kind !== "account_session") return undefined;
-  const account = await readAccount(env, principal.userId);
+  const account = resolvedPrincipalAccounts.get(principal) ?? await readAccount(env, principal.userId);
   return account?.persistent === true ? principal : undefined;
 }
 
@@ -1029,7 +1207,7 @@ export async function authenticateVaultAccount(
     || principal.connectGrant
     || !principal.capabilities.includes("agents:write")
     || !principal.capabilities.includes("tools:use")) return undefined;
-  const account = await readAccount(env, principal.userId);
+  const account = resolvedPrincipalAccounts.get(principal) ?? await readAccount(env, principal.userId);
   return account?.persistent === true ? principal : undefined;
 }
 
@@ -1076,21 +1254,98 @@ export async function authenticatePersistentPasskeyAccount(
   }
 }
 
-export function requireSameOriginMutation(
-  request: Request,
-  url: URL,
-  principal: Principal,
-): Response | undefined {
-  if (principal.kind !== "account_session") return undefined;
-  return request.headers.get("origin") === url.origin
-    ? undefined
-    : json({ error: "forbidden_origin" }, { status: 403 });
-}
 
 export async function listAgents(env: AccountAuthEnv, userId: string): Promise<AgentSummary[]> {
   const response = await env.NANOCODEX_USERS.getByName(userId, durablePlacementOptions(env.trustedClientIngressColo)).fetch("https://user.internal/agents");
   if (!response.ok) throw new Error("agent listing failed");
   return response.json<AgentSummary[]>();
+}
+
+export async function resolveCrewSeats(
+  env: AccountAuthEnv,
+  userId: string,
+  sourceAgentId: string,
+  targetSeatName: string,
+): Promise<Readonly<{ source: CrewSeatSummary; target: CrewSeatSummary }>> {
+  const query = new URLSearchParams({ source_agent_id: sourceAgentId, seat_name: targetSeatName });
+  const response = await env.NANOCODEX_USERS.getByName(
+    userId,
+    durablePlacementOptions(env.trustedClientIngressColo),
+  ).fetch(`https://user.internal/crew-seats/resolve?${query}`);
+  if (!response.ok) {
+    const failure: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    throw Object.assign(new Error(failure.error ?? "crew_seat_resolution_failed"), { status: response.status });
+  }
+  return response.json<Readonly<{ source: CrewSeatSummary; target: CrewSeatSummary }>>();
+}
+
+export async function setCrewSeat(
+  env: AccountAuthEnv,
+  userId: string,
+  agentId: string,
+  input: Readonly<{ crew_id: string; seat_name: string; role: string; coordinator_agent_id?: string }>,
+): Promise<CrewSeatSummary> {
+  const response = await env.NANOCODEX_USERS.getByName(
+    userId,
+    durablePlacementOptions(env.trustedClientIngressColo),
+  ).fetch(`https://user.internal/agents/${agentId}/crew-seat`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) {
+    const failure: { error?: string } = await response.json<{ error?: string }>().catch(() => ({}));
+    throw Object.assign(new Error(failure.error ?? "crew_seat_update_failed"), { status: response.status });
+  }
+  return response.json<CrewSeatSummary>();
+}
+
+/** Internal service helpers. These do not authenticate; invoke only after the admin tool gate. */
+export async function listAdminAccounts(env: AccountAuthEnv, input: { cursor?: string; limit?: number } = {}) {
+  const limit = input.limit ?? 50;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new TypeError("invalid_admin_page");
+  const sources = ["directory", "sms", "webauthn", "address"];
+  const names = ["admin-directory", "sms-otp", "webauthn", "account"];
+  let source = 0, after: string | undefined;
+  if (input.cursor !== undefined) {
+    if (input.cursor.length > 2048) throw new TypeError("invalid_admin_cursor");
+    try {
+      const parsed = JSON.parse(atob(input.cursor));
+      if (!Array.isArray(parsed) || parsed.length !== 2 || !Number.isInteger(parsed[0]) || parsed[0] < 0 || parsed[0] > 3
+        || (parsed[1] !== null && typeof parsed[1] !== "string")) throw new Error();
+      source = parsed[0]; after = parsed[1] ?? undefined;
+    } catch { throw new TypeError("invalid_admin_cursor"); }
+  }
+  const page = await env.NANOCODEX_AUTH.get(env.NANOCODEX_AUTH.idFromName(names[source]!)).adminAccountPage(sources[source]!, after, limit);
+  const next = page.next !== undefined ? [source, page.next] : source < 3 ? [source + 1, null] : undefined;
+  return { data: page.data.map(owner_id => ({ owner_id })), next_cursor: next ? btoa(JSON.stringify(next)) : null,
+    coverage: { complete: false, sources: ["registered_accounts", "sms_identities", "webauthn_credentials", "account_addresses"],
+      limitation: "Legacy anonymous accounts without retained identity records are not discoverable. Accounts may repeat across source pages; deduplicate by owner_id." } };
+}
+
+export async function listAdminThreads(env: AccountAuthEnv, input: { owner_id: string; cursor?: string; limit?: number }) {
+  if (!isUserId(input.owner_id)) throw new TypeError("invalid_account_identity");
+  const limit = input.limit ?? 32;
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) throw new TypeError("invalid_admin_page");
+  let after: string | undefined;
+  if (input.cursor !== undefined) {
+    try {
+      if (input.cursor.length > 2048) throw new TypeError();
+      const cursor = JSON.parse(atob(input.cursor));
+      if (!Array.isArray(cursor) || cursor.length !== 2 || cursor[0] !== input.owner_id || !isUuid(cursor[1])) throw new TypeError();
+      after = cursor[1];
+    } catch { throw new TypeError("invalid_admin_cursor"); }
+  }
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (after) query.set("after", after);
+  const response = await env.NANOCODEX_USERS.getByName(input.owner_id).fetch(`https://user.internal/admin-threads?${query}`);
+  if (!response.ok) {
+    await response.body?.cancel();
+    if (response.status === 404) throw Object.assign(new Error("account_not_found"), { status: 404 });
+    throw new Error("admin_thread_listing_failed");
+  }
+  const page = await response.json<{ data: AgentSummary[]; next_cursor: string | null }>();
+  return { ...page, owner_id: input.owner_id, next_cursor: page.next_cursor ? btoa(JSON.stringify([input.owner_id, page.next_cursor])) : null };
 }
 
 export async function attachAgent(
@@ -1563,7 +1818,10 @@ export async function ensureAccount(
     "account provisioning",
     (response) => response.status,
   );
-  if (status >= 200 && status < 300) return;
+  if (status >= 200 && status < 300) {
+    await withHardDeadline("account directory", 1000, () => env.NANOCODEX_AUTH.get(env.NANOCODEX_AUTH.idFromName("admin-directory")).registerAdminAccount(userId)).catch(() => { /* Discovery must not prevent account access; coverage remains explicitly partial. */ });
+    return;
+  }
   if (status === 409) {
     const current = await fetchResponseWithDeadline(
       accountStub,
@@ -1573,7 +1831,10 @@ export async function ensureAccount(
       "account provisioning verification",
       (response) => response.ok ? response.json<UserRecord>() : undefined,
     );
-    if (current?.id === userId && (current.persistent || !persistent)) return;
+    if (current?.id === userId && (current.persistent || !persistent)) {
+      await withHardDeadline("account directory", 1000, () => env.NANOCODEX_AUTH.get(env.NANOCODEX_AUTH.idFromName("admin-directory")).registerAdminAccount(userId)).catch(() => { /* Discovery must not prevent account access; coverage remains explicitly partial. */ });
+      return;
+    }
   }
   throw new Error("account provisioning failed");
 }
@@ -1612,7 +1873,7 @@ async function readAccountWallet(
   let response: Response;
   try {
     response = await env.NANOCODEX.fetch(
-      `https://broker.internal/users/${encodeURIComponent(userId)}/wallet`,
+      `https://broker.internal/users/${encodeURIComponent(userId)}/wallet/identity`,
     );
   } catch {
     throw new Error("wallet unavailable");
@@ -1628,7 +1889,7 @@ async function readAccountWallet(
 async function proxyAccountWalletRequest(
   env: AccountAuthEnv,
   userId: string,
-  suffix: "" | "/balance" | "/connect" | "/revoke-access-key",
+  suffix: "" | "/balance" | "/connect" | "/revoke-access-key" | "/link" | "/link/poll" | "/link/cancel" | "/unlink",
   body?: Record<string, unknown>,
 ): Promise<Response> {
   if (!env.NANOCODEX) return json({ error: "wallet_unavailable" }, { status: 503 });
@@ -1703,11 +1964,11 @@ async function resolveOrCreateBrowserAccount(
   const principal = await authenticate(request, env, url);
   if (principal) {
     if (principal.kind === "account_session") {
-      const account = await readAccount(env, principal.userId);
+      const account = resolvedPrincipalAccounts.get(principal) ?? await readAccount(env, principal.userId);
       if (!account) throw new Error("browser account is unavailable");
       return { principal, persistent: account.persistent };
     }
-    const account = await readAccount(env, principal.userId);
+    const account = resolvedPrincipalAccounts.get(principal) ?? await readAccount(env, principal.userId);
     if (!account) throw new Error("API key account is unavailable");
     return { principal, persistent: account.persistent };
   }
@@ -1765,7 +2026,11 @@ async function readBrowserSession(
 ): Promise<AccountSessionPayload | undefined> {
   const token = cookieValue(request, ACCOUNT_COOKIE);
   if (!token) return undefined;
-  const session = await authStore(env, "account").get<AccountSessionPayload>(accountSessionKey(token));
+  const stub = env.NANOCODEX_AUTH.get(env.NANOCODEX_AUTH.idFromName("account"));
+  const rpc = stub.readAccountSession;
+  const session: AccountSessionPayload | undefined = typeof rpc === "function"
+    ? consumeRpcData(await Reflect.apply(rpc, stub, [token]))
+    : await authStore(env, "account").get<AccountSessionPayload>(accountSessionKey(token));
   if (!session || !isUserId(session.userId) || session.expiresAt <= Date.now() / 1_000) {
     return undefined;
   }
@@ -1983,6 +2248,13 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
     if (!columns.has("cron_candidate")) {
       ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN cron_candidate INTEGER CHECK (cron_candidate IN (0, 1))");
     }
+    if (!columns.has("crew_id")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN crew_id TEXT");
+    if (!columns.has("seat_name")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN seat_name TEXT");
+    if (!columns.has("seat_role")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN seat_role TEXT");
+    if (!columns.has("coordinator_agent_id")) ctx.storage.sql.exec("ALTER TABLE agent_registry ADD COLUMN coordinator_agent_id TEXT");
+    ctx.storage.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS agent_registry_active_crew_seat
+      ON agent_registry (crew_id, seat_name COLLATE NOCASE)
+      WHERE deleted_at IS NULL AND crew_id IS NOT NULL AND seat_name IS NOT NULL`);
   }
 
   async alarm(): Promise<void> {
@@ -2013,6 +2285,17 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
   // Live storage read in a single RPC reply, without a streamed HTTP body.
   async readAccount(): Promise<UserRecord | undefined> {
     return this.ctx.storage.get<UserRecord>("account");
+  }
+
+  async resolveAuthorization(): Promise<{ userId: string; grant: OrganizationGrant; account: UserRecord } | undefined> {
+    const account = await this.ctx.storage.get<UserRecord>("account");
+    if (!isUserRecord(account)) return undefined;
+    const grant = await resolveOrganizationGrant(this.env, account);
+    // Recheck ownership after the remote membership read, including deletion.
+    const current = await this.ctx.storage.get<UserRecord>("account");
+    if (!grant || !isUserRecord(current)
+      || current.id !== account.id || current.organizationId !== account.organizationId) return undefined;
+    return { userId: current.id, grant, account: current };
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2059,16 +2342,8 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
       return configurationCatalog(request, this.ctx.storage);
     }
     if (url.pathname === "/authorization" && request.method === "GET") {
-      const account = await this.ctx.storage.get<UserRecord>("account");
-      if (!isUserRecord(account)) return json({ error: "not_found" }, { status: 404 });
-      const grant = await resolveOrganizationGrant(this.env, account);
-      // Account ownership may change while the membership request is in flight.
-      const current = await this.ctx.storage.get<UserRecord>("account");
-      if (!grant || !isUserRecord(current)
-        || current.id !== account.id || current.organizationId !== account.organizationId) {
-        return json({ error: "not_found" }, { status: 404 });
-      }
-      return json({ userId: account.id, grant });
+      const authorization = await this.resolveAuthorization();
+      return authorization ? json(authorization) : json({ error: "not_found" }, { status: 404 });
     }
     if (url.pathname === "/account") {
       if (request.method === "PUT") {
@@ -2194,10 +2469,26 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
       return row?.deleted_at === null ? new Response(null, { status: 204 })
         : json({ error: "agent_deleted" }, { status: 410 });
     }
+    if (url.pathname === "/admin-threads") {
+      if (request.method !== "GET") return json({ error: "method_not_allowed" }, { status: 405 });
+      if (!await this.readAccount()) return json({ error: "not_found" }, { status: 404 });
+      const raw = url.searchParams.get("limit") ?? "50", after = url.searchParams.get("after");
+      const limit = Number(raw);
+      if (!/^[1-9][0-9]{0,2}$/.test(raw) || limit > 100 || (after !== null && !isUuid(after))
+        || [...url.searchParams.keys()].some(key => !["limit", "after"].includes(key) || url.searchParams.getAll(key).length !== 1))
+        return json({ error: "invalid_admin_page" }, { status: 400 });
+      const rows = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry WHERE deleted_at IS NULL AND id > ? ORDER BY id LIMIT ?`, after ?? "", limit + 1,
+      ).toArray();
+      return json({ data: rows.slice(0, limit).map(agentSummary), next_cursor: rows.length > limit ? rows[limit - 1]!.id : null });
+    }
     if (url.pathname === "/agents") {
       if (request.method === "GET") {
         return json(this.ctx.storage.sql.exec<AgentRegistryRow>(
-          `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation
+          `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                  crew_id, seat_name, seat_role, coordinator_agent_id
            FROM agent_registry
            WHERE deleted_at IS NULL
            ORDER BY created_at, id`,
@@ -2233,6 +2524,72 @@ export class UserAccount extends DurableObject<AccountAuthEnv> {
         }
         return new Response(null, { status: 204 });
       }
+    }
+    if (url.pathname === "/crew-seats/resolve" && request.method === "GET") {
+      const sourceAgentId = url.searchParams.get("source_agent_id") ?? "";
+      const seatName = url.searchParams.get("seat_name") ?? "";
+      if (!isUuid(sourceAgentId) || !/^[A-Za-z][A-Za-z0-9 _-]{0,63}$/.test(seatName)
+        || [...url.searchParams.keys()].some(key => !["source_agent_id", "seat_name"].includes(key))) {
+        return json({ error: "invalid_crew_seat_query" }, { status: 400 });
+      }
+      const source = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry WHERE id = ? AND deleted_at IS NULL`, sourceAgentId,
+      ).toArray()[0];
+      if (!source?.crew_id || !source.seat_name || !source.seat_role) {
+        return json({ error: "source_crew_seat_not_found" }, { status: 404 });
+      }
+      const target = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry
+         WHERE crew_id = ? AND seat_name = ? COLLATE NOCASE AND deleted_at IS NULL`, source.crew_id, seatName,
+      ).toArray()[0];
+      if (!target?.seat_name || !target.seat_role) return json({ error: "target_crew_seat_not_found" }, { status: 404 });
+      return json({ source: crewSeatSummary(source), target: crewSeatSummary(target) });
+    }
+    const crewSeatMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/crew-seat$/);
+    if (crewSeatMatch && request.method === "PUT") {
+      const value = await request.json<unknown>();
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        return json({ error: "invalid_crew_seat" }, { status: 400 });
+      }
+      const body = value as Record<string, unknown>;
+      const crewId = typeof body.crew_id === "string" ? body.crew_id.trim() : "";
+      const seatName = typeof body.seat_name === "string" ? body.seat_name.trim() : "";
+      const role = typeof body.role === "string" ? body.role.trim() : "";
+      const coordinatorAgentId = body.coordinator_agent_id;
+      if (Object.keys(body).some(key => !["crew_id", "seat_name", "role", "coordinator_agent_id"].includes(key))
+        || !/^[A-Za-z0-9_-]{1,64}$/.test(crewId)
+        || !/^[A-Za-z][A-Za-z0-9 _-]{0,63}$/.test(seatName)
+        || role.length === 0 || role.length > 512
+        || (coordinatorAgentId !== undefined && !isUuid(coordinatorAgentId))) {
+        return json({ error: "invalid_crew_seat" }, { status: 400 });
+      }
+      const agentId = crewSeatMatch[1]!;
+      if (!this.ctx.storage.sql.exec("SELECT id FROM agent_registry WHERE id = ? AND deleted_at IS NULL", agentId).toArray().length) {
+        return json({ error: "not_found" }, { status: 404 });
+      }
+      if (typeof coordinatorAgentId === "string"
+        && !this.ctx.storage.sql.exec("SELECT id FROM agent_registry WHERE id = ? AND deleted_at IS NULL", coordinatorAgentId).toArray().length) {
+        return json({ error: "coordinator_not_found" }, { status: 404 });
+      }
+      try {
+        this.ctx.storage.sql.exec(
+          `UPDATE agent_registry SET crew_id = ?, seat_name = ?, seat_role = ?, coordinator_agent_id = ?, updated_at = ?
+           WHERE id = ? AND deleted_at IS NULL`,
+          crewId, seatName, role, typeof coordinatorAgentId === "string" ? coordinatorAgentId : null, Date.now(), agentId,
+        );
+      } catch {
+        return json({ error: "crew_seat_conflict" }, { status: 409 });
+      }
+      const row = this.ctx.storage.sql.exec<AgentRegistryRow>(
+        `SELECT id, title, created_at, updated_at, turn_count, deleted_at, cron_candidate, presentation,
+                crew_id, seat_name, seat_role, coordinator_agent_id
+         FROM agent_registry WHERE id = ?`, agentId,
+      ).toArray()[0]!;
+      return json(crewSeatSummary(row));
     }
     const cronMatch = url.pathname.match(/^\/agents\/([0-9a-f-]{36})\/cron-presence$/);
     if (cronMatch && request.method === "POST") {
@@ -2330,7 +2687,18 @@ function agentSummary(row: AgentRegistryRow): AgentSummary {
     turnCount: row.turn_count,
     mayHaveScheduledJobs: row.cron_candidate !== 0,
     ...(row.presentation ? { presentation: { done: false, doneAt: null, ...JSON.parse(row.presentation) } as AgentPresentation } : {}),
+    ...(row.crew_id && row.seat_name && row.seat_role ? { crewSeat: crewSeatSummary(row) } : {}),
 
+  };
+}
+
+function crewSeatSummary(row: AgentRegistryRow): CrewSeatSummary {
+  return {
+    agent_id: row.id,
+    crew_id: row.crew_id!,
+    seat_name: row.seat_name!,
+    role: row.seat_role!,
+    ...(row.coordinator_agent_id ? { coordinator_agent_id: row.coordinator_agent_id } : {}),
   };
 }
 
@@ -2555,19 +2923,20 @@ export class ApiKeyRecord extends DurableObject<AccountAuthEnv> {
     return enteredAt;
   }
 
-  async resolveAuthorizedKey(observeCreate = false): Promise<StoredApiKey | undefined> {
+  async resolveAuthorizedKey(observeCreate = false, includeAccount = false): Promise<(StoredApiKey & { account?: UserRecord }) | undefined> {
     const startedAt = performance.now();
     const record = await this.ctx.storage.get<StoredApiKey>("record");
     const storageMs = performance.now() - startedAt;
     // Read current key, account and membership on every request, including
     // repeated voice starts. RPC changes transport, not revocation semantics.
-    const authorized = isStoredApiKey(record) && await apiKeyAuthorized(this.env, record);
+    const account = isStoredApiKey(record) ? await authorizedApiKeyAccount(this.env, record) : undefined;
+    const authorized = Boolean(account);
     if (observeCreate) console.info({ type: "managed.auth.api_key_handler",
       storage_ms: Math.round(storageMs * 100) / 100,
       membership_ms: Math.round((performance.now() - startedAt - storageMs) * 100) / 100,
       handler_ms: Math.round((performance.now() - startedAt) * 100) / 100,
       authorized });
-    return authorized ? record : undefined;
+    return authorized ? (includeAccount ? { ...record!, account } : record) : undefined;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -2872,21 +3241,6 @@ function otpSecret(env: AccountAuthEnv): string | undefined {
     && env.NANOCODEX_OTP_HMAC_KEY.length >= 32
     ? env.NANOCODEX_OTP_HMAC_KEY
     : undefined;
-}
-
-async function reserveWindowSlot(
-  store: Kv.Kv,
-  subject: string,
-  limit: number,
-  now: number,
-): Promise<boolean> {
-  if (!store.create) return false;
-  const window = Math.floor(now / 3_600);
-  const ttl = 7_200;
-  for (let slot = 0; slot < limit; slot += 1) {
-    if (await store.create(`rate:${subject}:${window}:${slot}`, true, { ttl })) return true;
-  }
-  return false;
 }
 
 async function keyedDigest(secret: string, value: string): Promise<string> {

@@ -10,10 +10,10 @@ const STRING_FIELDS = new Set([
   "transport_call_id", "parent_call_id", "socket_id", "egress_request_id", "relay_id",
   "provider_request_id", "response_id", "lease_id", "connection_id", "host_connection_id", "host_runtime_id",
   "phase", "operation_kind", "transport", "error_kind", "error_code", "failure_phase", "replay_mode",
-  "hand_id", "remote_generation", "role",
+  "hand_id", "remote_generation", "role", "provider_event_type", "output_kind",
 ]);
 const NUMBER_FIELDS = new Set([
-  "duration_ms", "elapsed_ms", "host_elapsed_ms", "send_wait_ms", "first_message_ms", "first_output_ms",
+  "duration_ms", "elapsed_ms", "host_elapsed_ms", "send_wait_ms", "first_message_ms", "first_output_ms", "first_reasoning_delta_ms", "first_answer_delta_ms", "first_tool_delta_ms",
   "last_message_age_ms", "socket_queue_residence_max_ms", "pre_inference_ms", "engine_queue_max_ms",
   "engine_service_ttft_total_ms", "admission_ms", "roundtrip_ms", "settlement_ms", "transit_return_overhead_ms",
   "time_to_first_event_ms", "time_to_first_output_ms", "started_after_ms", "fetch_ms", "decode_ms", "total_ms",
@@ -22,7 +22,7 @@ const NUMBER_FIELDS = new Set([
   "received_message_count", "queued_message_count", "socket_delivered_message_count", "buffered_send_bytes",
   "pending_calls", "pending_call_count", "heartbeat_count", "close_code", "attempt_count", "attempt", "retry_delay_ms",
   "next_attempt", "max_attempts", "status_code",
-  "renewal_count",
+  "renewal_count", "dispatch_to_message_ms", "frame_decode_ms", "lease_validation_ms", "message_to_handler_ms",
 ]);
 const BOOLEAN_FIELDS = new Set(["success", "intentional", "close_clean", "replayed", "start_observed", "reconnect_enabled", "opens_new_socket", "server_requested_delay", "active", "connected"]);
 const HOST_TIMING_FIELDS = new Set(["scheduler_ms", "execution_gate_ms", "execution_ms", "result_encode_ms", "result_queue_ms", "host_elapsed_ms"]);

@@ -1,3 +1,4 @@
+import type { CodeDiscovery } from "nanocodex-tools/runtime/code-discovery";
 import type { Options as ClaudeOptions } from './runtime/claude.mjs';
 export type Thinking = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ReasoningMode = "standard" | "pro";
@@ -7,7 +8,9 @@ export type PromptItem =
   | { type: "text"; text: string }
   | { type: "image"; image_url: string; file_id?: never; detail?: "auto" | "low" | "high" | "original" | undefined }
   | { type: "image"; file_id: string; image_url?: never; detail?: "auto" | "low" | "high" | "original" | undefined }
-  | { type: "audio"; audio_url: string };
+  | { type: "audio"; audio_url: string }
+  /** Inline document (`data:application/pdf;base64,…` or `data:text/plain;base64,…`); native Claude only. */
+  | { type: "file"; file_data: string; filename?: string | undefined };
 
 export type PromptInput = string | readonly PromptItem[];
 
@@ -38,6 +41,8 @@ export type CompactionReceipt = Readonly<{
 }>;
 
 export type AgentOptions = {
+  /** Persisted named configuration and physical routing at each full-history HTTP boundary. */
+  requestPolicy?: import("./runtime/request-policy.mjs").RequestPolicy | undefined;
   harness?: "codex" | undefined;
   /** Explicit alternate-family credentials and native tools; children remain in the shared task tree. */
   harnesses?: Readonly<{ claude?: ClaudeOptions }> | undefined;
@@ -57,12 +62,19 @@ export type AgentOptions = {
   fastMode?: boolean | undefined;
   /** Yield exec/wait observations on accepted steering; cells continue. Default false. */
   instantToolSteering?: boolean | undefined;
+  /** Inline Code Mode tool docs: default 3000 estimated tokens (UTF-8 bytes / 4).
+   * Whole descriptions are omitted at the limit; discovery and invocation remain available. */
+  inlineDocsTokenBudget?: number | undefined;
   /** Emit full raw API request/response events. Defaults to true. */
   rawApiEvents?: boolean | undefined;
   sessionId?: string | undefined;
   thinking?: Thinking | undefined;
   workspace?: string | undefined;
   resume?: SessionSnapshot | undefined;
+  /** Creates a fresh durable branch from exported session data; cannot accompany resume. */
+  documentFork?: DocumentForkSeed | undefined;
+  /** Completed receipts to retain, 0..4096. Historical document boundaries remain available. */
+  terminalReceiptRetention?: number | undefined;
 };
 
 /** Model-visible facts for tools executing outside the embedding process. */
@@ -306,7 +318,7 @@ export type EstimatedUsdCost = Readonly<{
   cached_input_usd: string;
   cache_write_input_usd: string;
   output_usd: string;
-  service_tier: "standard" | "priority" | "fast";
+  service_tier: "standard" | "priority" | "fast" | "ultrafast";
 }>;
 
 export type CostStatus =
@@ -334,6 +346,40 @@ export type TurnUsage = Readonly<{
   total_tokens: number;
   estimated_cost: EstimatedUsdCost | null;
   cost_status: CostStatus;
+}>;
+
+/** JSON data stored within one durable Agent session. */
+export type DocumentValue = null | boolean | number | string | readonly DocumentValue[] | { readonly [key: string]: DocumentValue };
+
+/** Immutable creation policy used when exporting a durable historical branch. */
+export type DocumentForkPolicy = "initial" | "current" | "asOf" | "block";
+
+export type SessionDocument = Readonly<{
+  version: number;
+  initial: DocumentValue;
+  value: DocumentValue;
+  fork: DocumentForkPolicy;
+}>;
+
+export type DocumentWrite = Readonly<{
+  key: string;
+  /** Zero creates; updates require the exact current document version. */
+  expectedVersion: number;
+  /** Null is a stored value, not deletion. */
+  value: DocumentValue;
+  /** Updates must repeat the immutable creation policy. */
+  fork: DocumentForkPolicy;
+}>;
+
+export type DocumentFork = Readonly<{
+  boundary: string;
+  documents: Readonly<Record<string, SessionDocument>>;
+}>;
+
+/** Data-only seed; destination credentials, tools and storage are supplied independently. */
+export type DocumentForkSeed = Readonly<{
+  checkpoint: SessionSnapshot;
+  documents: DocumentFork;
 }>;
 
 export type ForkOptions = Readonly<{ at?: TurnResult | undefined }>;
@@ -364,6 +410,10 @@ export type AgentActions = {
     appendDeveloperMessage(text: string): Promise<AgentSessionContext>;
     compact(): Promise<void>;
     context(): Promise<AgentSessionContext>;
+    document(key: string): Promise<SessionDocument | null>;
+    compareExchangeDocuments(writes: readonly DocumentWrite[]): Promise<void>;
+    stageDocumentWrites(operationId: string, writes: readonly DocumentWrite[]): Promise<void>;
+    documentFork(operationId: string): Promise<DocumentForkSeed>;
     fork(options?: ForkOptions): Promise<DefaultAgent>;
     setModel(model: Model): Promise<void>;
     setFastMode(enabled: boolean): Promise<void>;
@@ -487,7 +537,7 @@ export type TurnResult = Readonly<{
   dispose(): void;
 }>;
 
-import type { NamedTool, ToolMap } from "nanocodex-tools";
+import type { NamedTool, ToolContext, ToolMap } from "nanocodex-tools";
 export type {
   NamedTool,
   SubagentToolContext,
@@ -502,7 +552,9 @@ export type ToolConfiguration<Extension = never> =
   | readonly (NamedTool | Extension)[]
   | import("./tools/Tools.mjs").Tools;
 
-export type CodeEvaluatorEnvironment = {
+export type CodeEvaluatorEnvironment = CodeDiscovery & {
+  /** Trusted session identity; lets shared evaluators schedule child agents independently. */
+  sessionId?: string;
   tools: Readonly<Record<string, (input: unknown) => Promise<unknown>>>;
   toolDefinitions: readonly Record<string, unknown>[];
   text(value: unknown): void;
@@ -566,21 +618,32 @@ export type CodeEffectReceipt = Readonly<{
   thrown: boolean;
   failure?: unknown;
 }>;
+/** Exact terminal cell result retained with its successful state delta. */
+export type CodeCellReceipt = Readonly<{
+  output: unknown;
+  success: boolean;
+  nested_calls: readonly unknown[];
+  notifications?: readonly unknown[];
+}>;
 /** Admission must durably retain intent; completion must durably retain the exact receipt.
  * A recovered intent without an outcome is unknown, never permission to execute again.
  * Keys must scope [sessionId, operationId ?? "", modelCallIndex ?? 0, parentCallId, callId]; validate identity/input and fence concurrent runtime generations. */
 export type CodeEffectJournal = Readonly<{
-  /** Optional durable cell store protocol; provide both methods together.
-   * Context uses name="code-cell", callId=parentCallId, input=null. beginCell
-   * pins and returns immutable starting entries before evaluation. commitStore
-   * merges only writes, once per canonical cell identity (including failed scripts).
-   * Replaying an older committed cell must never overwrite newer session writes.
-   * Entries are JSON snapshots, bounded to 8 MiB/32,768 nodes. Missing legacy
-   * state must fail closed if prior effects make the starting state unprovable.
-   * Deterministic conflicts/corruption throw code="CODE_EFFECT_UNKNOWN";
-   * unclassified transport/storage exceptions remain retryable interruptions. */
-  beginCell?(context: CodeEffectContext): Promise<readonly (readonly [string, unknown])[]>;
-  commitStore?(context: CodeEffectContext, writes: readonly (readonly [string, unknown])[]): Promise<void>;
+  /** Successful store deltas and the exact cell receipt co-commit in one transaction.
+   * Provide beginCell and completeCell together. Pin immutable starting entries
+   * before evaluation; replay completed cells without evaluating guest source.
+   * Interrupted nested intents are unknown and must never redispatch. Failed or
+   * aborted cells commit no writes; external effects cannot be rolled back.
+   * Snapshots and receipts are bounded to 8 MiB/32,768 nodes. */
+  beginCell?(context: CodeEffectContext): Promise<
+    | { status: "execute"; entries: readonly (readonly [string, unknown])[] }
+    | { status: "replay"; receipt: CodeCellReceipt }
+    | { status: "unknown" }
+  >;
+  completeCell?(context: CodeEffectContext, writes: readonly (readonly [string, unknown])[], receipt: CodeCellReceipt): Promise<void>;
+  /** Bounded committed state for independent branch inheritance. Never includes pending writes. */
+  snapshotStore?(sessionId: string): Promise<readonly (readonly [string, unknown])[]>;
+  restoreStore?(sessionId: string, entries: readonly (readonly [string, unknown])[]): Promise<void>;
   begin(context: CodeEffectContext): Promise<
     | { status: "execute" }
     | { status: "replay"; receipt: CodeEffectReceipt }
@@ -590,9 +653,13 @@ export type CodeEffectJournal = Readonly<{
 }>;
 
 declare const mcpPaymentBrand: unique symbol;
+declare const lazyMcpPaymentBrand: unique symbol;
 
 /** MCP payment options returned by `mcpPayment()` from `nanocodex/tempo`. */
 export type PaidMcpPayment = McpPayment & { readonly [mcpPaymentBrand]: true };
+
+/** Deferred payment setup. Methods and context exist only after its factory resolves. */
+export type LazyPaidMcpPayment = { readonly [lazyMcpPaymentBrand]: true };
 
 export type McpPayment = {
   /** MPPx client methods, such as `tempo.session({ account, getClient, channelStore })`. */
@@ -628,6 +695,18 @@ export type McpTool = {
   } | undefined;
 };
 
+/** Trusted host interception; callbacks must never log or throw private values. */
+export type McpPrivateResultPolicy = {
+  /** Runs after payment context validation and before remote execution; throw to reject a call.
+   * privateContext is trusted state scoped to this invocation. An own result
+   * property replays an already-safe receipt, bypassing dispatch and transform. */
+  beforeCall?: ((call: { name: string; arguments: Record<string, unknown> }, context: ToolContext | undefined) => void | { privateContext?: unknown; result?: unknown } | Promise<void | { privateContext?: unknown; result?: unknown }>) | undefined;
+  /** Receives the raw result and this invocation's preflight state (undefined when
+   * beforeCall is absent). Returns ONLY model-safe MCP content. Private state is
+   * never included in tool results or tracing unless this callback returns it. */
+  transformResult: (call: { name: string; arguments: Record<string, unknown>; result: unknown; privateContext: unknown }, context: ToolContext | undefined) => unknown | Promise<unknown>;
+};
+
 export type McpServer = {
   /** Public Streamable HTTP MCP endpoint. Omit when supplying an initialized client. */
   url?: string | URL | undefined;
@@ -637,7 +716,12 @@ export type McpServer = {
   headers?: HeadersInit | undefined;
   fetch?: typeof globalThis.fetch | undefined;
   /** Created with `mcpPayment()` from `nanocodex/tempo` (requires the `mppx` peer). */
-  payment?: PaidMcpPayment | undefined;
+  payment?: PaidMcpPayment | LazyPaidMcpPayment | undefined;
+  /** Host-only interception before all result projections. Errors are replaced with
+   * fixed failures. Caller-owned clients/fetch functions remain trusted and must
+   * not independently log results, notifications, progress, or exceptions. */
+  privateResult?: McpPrivateResultPolicy | undefined;
+
   enabledTools?: readonly string[] | undefined;
   disabledTools?: readonly string[] | undefined;
   /** Declares every remote tool on this server safe for concurrent nested calls. */

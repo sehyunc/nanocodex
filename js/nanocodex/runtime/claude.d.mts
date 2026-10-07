@@ -1,4 +1,7 @@
-import type { Agent as BaseAgent, EventWatcher, TurnUsage, WatchEventsOptions, DurabilityStore, ToolContext } from '../types.mjs';
+import type { Agent as BaseAgent, EventWatcher, TurnUsage, WatchEventsOptions, DurabilityStore, ToolContext, DocumentFork, DocumentWrite, SessionDocument } from '../types.mjs';
+
+/** Native Claude checkpoint data; signed blocks retain their original JSON representation. */
+export type DocumentForkSeed = Readonly<{ checkpoint: Readonly<Record<string, unknown>>; documents: DocumentFork }>;
 
 /** Explicit, caller-approved credentials. The callback is resolved independently for each request. */
 export type Auth = Readonly<
@@ -40,18 +43,23 @@ export type CodexHarnessOptions = Readonly<{
   thinking?: import('../types.mjs').Thinking;
   instructions?: string;
   workspace?: string;
-  toolMode?: 'code' | 'direct';
+  toolMode?: 'code' | 'code-only' | 'direct';
   /** Overrides Node's native evaluator; required for Code Mode in non-Worker Web API hosts. */
   codeEvaluator?: import('../types.mjs').CodeEvaluator;
   tools?: import('../types.mjs').ToolConfiguration;
 }>;
 export type Options = Readonly<{
   harness?: 'claude';
+  /** Direct native tools by default; code-only exposes only exec and wait. */
+  toolMode?: 'direct' | 'code-only';
+  /** Required for code-only; evaluation is never inferred from ambient JavaScript. */
+  codeEvaluator?: import('../types.mjs').CodeEvaluator;
   /** Opt in to the canonical shared subagent task tree. */
   subagents?: Readonly<{ maxConcurrency?: number }>;
   /** Explicit alternate-family capability; no credentials are inferred. */
   harnesses?: Readonly<{ codex?: CodexHarnessOptions }>;
   auth: Auth;
+  requestPolicy?: import("./request-policy.mjs").RequestPolicy;
   model: string;
   endpoint?: string;
   /** Explicit host Messages fetch; never serialized into model/session state. */
@@ -80,6 +88,8 @@ export type Options = Readonly<{
   /** Disabling automatic compaction is not supported. */
   autoCompact?: true;
   terminalReceiptRetention?: number;
+  /** Seeds a pristine durable session; destination authority is supplied independently. */
+  documentFork?: DocumentForkSeed;
   /** Compiled browser WASM module for this exact package. */
   module?: unknown;
 }> & (
@@ -89,7 +99,13 @@ export type Options = Readonly<{
 /** Shared output/event contract, with canonical subagents available through Subagents when enabled. */
 export type Agent = BaseAgent<{
   events: { watch(options?: WatchEventsOptions): EventWatcher };
-  session: { compact(): Promise<void>; cancel(): Promise<void>; shutdown(): Promise<void> };
+  session: {
+    document(key: string): Promise<SessionDocument | null>;
+    compareExchangeDocuments(writes: readonly DocumentWrite[]): Promise<void>;
+    stageDocumentWrites(operationId: string, writes: readonly DocumentWrite[]): Promise<void>;
+    documentFork(operationId: string): Promise<DocumentForkSeed>;
+    compact(): Promise<void>; cancel(): Promise<void>; shutdown(): Promise<void>;
+  };
   turn: { prompt(options: { input: string; id?: string }): Turn };
 }>;
 export type Turn = Readonly<{

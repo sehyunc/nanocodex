@@ -10,6 +10,8 @@ description = "Typed Anthropic Messages protocol and streaming transport"
 [features]
 default = []
 tools = ["dep:nanocodex-claude-tools"]
+# Opt-in native JavaScript tool runtime; each agent owns its own cells.
+code-mode = ["nanocodex-oai-tools/code-mode"]
 # Compatibility alias for existing callers.
 workspace-files = ["tools"]
 
@@ -20,9 +22,11 @@ sha2.workspace = true
 regex.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 url.workspace = true
-nanocodex-claude-tools = { path = "../nanocodex-claude-tools", version = "0.6.6", default-features = false, optional = true }
+nanocodex-claude-tools = { path = "../nanocodex-claude-tools", version = "0.6.7", default-features = false, optional = true }
 futures-util.workspace = true
-nanocodex-agent = { path = "../nanocodex-agent", version = "0.6.6", default-features = false }
+httpdate = "1.0.3"
+nanocodex-agent = { path = "../nanocodex-agent", version = "0.6.7", default-features = false }
+nanocodex-oai-tools = { path = "../nanocodex-oai-tools", version = "0.6.7", default-features = false, features = ["image-processing"] }
 tokio = { workspace = true, features = ["macros", "sync", "time"] }
 web-time.workspace = true
 uuid.workspace = true
@@ -31,13 +35,18 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 wasm-bindgen-futures.workspace = true
+wasmtimer = { version = "0.4.3", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
+image.workspace = true
 tempfile.workspace = true
 rustls.workspace = true
 

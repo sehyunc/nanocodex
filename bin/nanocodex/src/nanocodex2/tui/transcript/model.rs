@@ -61,6 +61,7 @@ pub(crate) struct TranscriptModel {
     managed_answer_entries: HashMap<Arc<str>, HashSet<EntryId>>,
     reasoning: HashMap<ReasoningKey, EntryId>,
     tools: HashMap<String, EntryId>,
+    private_inputs: HashMap<EntryId, crate::tui::secure_input::Request>,
     settled_calls: HashSet<String>,
     shell_sessions: HashMap<ShellSessionKey, EntryId>,
     shell_followups: HashMap<String, EntryId>,
@@ -73,6 +74,7 @@ pub(crate) struct TranscriptModel {
     active_runs: VecDeque<ActiveRun>,
     tool_owners: HashMap<EntryId, RunScope>,
     transient: Option<TransientStatus>,
+    transient_agent_id: Option<u64>,
     transient_retry_origin: Option<(u64, u64)>,
     run_activity: VecDeque<RunActivity>,
     pending_error: Option<String>,
@@ -200,9 +202,18 @@ impl TranscriptModel {
                 _ => None,
             })
             .collect();
+        let private_inputs = entries
+            .iter()
+            .filter_map(|entry| {
+                self.private_inputs
+                    .get(&entry.id)
+                    .map(|request| (entry.id, request.clone()))
+            })
+            .collect();
         Self {
             entries,
             entry_indices,
+            private_inputs,
             next_entry_id: self.next_entry_id,
             message_threads,
             message_order,
@@ -210,8 +221,30 @@ impl TranscriptModel {
         }
     }
 
+    /// Adapted from clabby/tact's Transcript::assistant_response (Apache-2.0).
+    /// Use the same projection for live and restored history. Child activity is
+    /// displayed separately and must not replace this pane's assistant answer.
+    pub(crate) fn assistant_response(&self, index: usize) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .filter_map(|entry| match &entry.kind {
+                EntryKind::Assistant {
+                    text,
+                    complete: true,
+                    agent_id: None,
+                } if !entry.hidden && !text.trim().is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+            .nth(index.checked_sub(1)?)
+    }
+
     pub(crate) fn entries(&self) -> &[TranscriptEntry] {
         &self.entries
+    }
+
+    pub(crate) fn private_input(&self, id: EntryId) -> Option<&crate::tui::secure_input::Request> {
+        self.private_inputs.get(&id)
     }
 
     pub(crate) fn entry(&self, id: EntryId) -> Option<&TranscriptEntry> {
@@ -224,6 +257,10 @@ impl TranscriptModel {
 
     pub(crate) fn transient(&self) -> Option<&TransientStatus> {
         self.transient.as_ref()
+    }
+
+    pub(crate) fn transient_agent_id(&self) -> Option<u64> {
+        self.transient_agent_id
     }
 
     pub(crate) fn transient_retry_origin(&self) -> Option<(u64, u64)> {
@@ -283,6 +320,7 @@ impl TranscriptModel {
             .rev()
             .find(|activity| activity.compacting || activity.status != TransientStatus::Thinking)
             .or_else(|| self.run_activity.back());
+        self.transient_agent_id = activity.and_then(|activity| activity.scope.child);
         self.transient = activity
             .map(|activity| {
                 if activity.compacting {
@@ -983,7 +1021,7 @@ impl TranscriptModel {
             return Ok(false);
         }
         let parent = self.code_parent(&call_id);
-        if tool == "write_stdin"
+        if ToolEntry::tool_family(&tool) == "write_stdin"
             && let Some(session_id) = arguments.get("session_id").and_then(Value::as_i64)
             && let Some(id) = self
                 .shell_sessions
@@ -1009,6 +1047,9 @@ impl TranscriptModel {
                 });
                 self.tools.insert(call_id, id);
                 self.running_tools.insert(id);
+                if let Some(index) = self.index_of(id) {
+                    self.entries[index].tool_agent_id = record.managed_agent_id();
+                }
                 self.tool_owners.insert(id, RunScope::new(record));
                 self.set_run_status(record, Some(TransientStatus::Tool("Shell".to_owned())));
                 return Ok(true);
@@ -1043,6 +1084,9 @@ impl TranscriptModel {
         }
         self.tools.insert(call_id, id);
         self.running_tools.insert(id);
+        if let Some(index) = self.index_of(id) {
+            self.entries[index].tool_agent_id = record.managed_agent_id();
+        }
         self.tool_owners.insert(id, RunScope::new(record));
         self.set_run_status(record, Some(transient));
         Ok(true)
@@ -1054,17 +1098,18 @@ impl TranscriptModel {
             return Ok(false);
         }
         let resumed_shell = self.shell_followups.remove(&payload.call_id);
-        let shell_followup = payload.tool == "write_stdin";
+        let family = ToolEntry::tool_family(&payload.tool);
+        let shell_followup = family == "write_stdin";
         let result = preferred_result(payload.structured_result, payload.result);
         let resumed_result = resumed_shell.map(|_| result.clone());
         let nested_shell_followup = resumed_shell.is_some();
-        let state = tool_result_state(&payload.tool, &payload.status, &result);
+        let state = tool_result_state(family, &payload.status, &result);
         let entry_state = if resumed_shell.is_some() && state == ToolState::Yielded {
             ToolState::Succeeded
         } else {
             state
         };
-        let shell_session_id = (payload.tool == "exec_command")
+        let shell_session_id = (family == "exec_command")
             .then(|| tool_session_id(&result))
             .flatten();
         let id = self
@@ -1100,6 +1145,9 @@ impl TranscriptModel {
                 self.tools.insert(payload.call_id.clone(), id);
                 id
             });
+        if let Some(request) = crate::tui::secure_input::request(record) {
+            self.private_inputs.insert(id, request);
+        }
         let shell_session = shell_session_id.map(|session_id| {
             let arguments = self.entry(id).and_then(|entry| match &entry.kind {
                 EntryKind::Tool(tool) => Some(&tool.arguments),
@@ -1131,7 +1179,7 @@ impl TranscriptModel {
                     } else {
                         merge_shell_result(tool.result.take(), result)
                     }
-                } else if payload.tool == "exec_command" {
+                } else if family == "exec_command" {
                     merge_shell_result(None, result)
                 } else {
                     result
@@ -1195,6 +1243,9 @@ impl TranscriptModel {
         }
         if entry_state == ToolState::Running {
             self.running_tools.insert(id);
+            if let Some(index) = self.index_of(id) {
+                self.entries[index].tool_agent_id = record.managed_agent_id();
+            }
             self.tool_owners.insert(id, RunScope::new(record));
         } else {
             self.running_tools.remove(&id);
@@ -1571,6 +1622,7 @@ impl TranscriptModel {
         self.entries.push(TranscriptEntry {
             id,
             revision: 1,
+            tool_agent_id: None,
             kind,
             hidden,
             parent,

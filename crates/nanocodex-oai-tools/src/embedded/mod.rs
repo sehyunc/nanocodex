@@ -125,6 +125,8 @@ pub enum EmbeddedToolMode {
     /// Expose one Code Mode `exec` tool and nest application tools below it.
     #[default]
     Code,
+    /// Expose only Code Mode controls; workspace, discovery and local tools are nested.
+    CodeOnly,
     /// Expose application tools directly without dynamic code evaluation.
     Direct,
 }
@@ -140,6 +142,13 @@ pub trait CodeModeHost: Send + Sync + 'static {
     /// Selects Code Mode or CSP-safe direct function dispatch.
     fn tool_mode(&self) -> EmbeddedToolMode {
         EmbeddedToolMode::Code
+    }
+
+    /// Whether durable cell state and nested effect receipts permit cold replay.
+    /// Hosts must retain pending effects as unknown and never redispatch them.
+    /// Existing hosts fail closed until they implement that complete protocol.
+    fn code_replay_safe(&self) -> bool {
+        false
     }
 
     /// Whether the host implements resumable `exec`/`wait` cells and helpers.
@@ -198,6 +207,34 @@ pub trait CodeModeHost: Send + Sync + 'static {
                 observer.update(CodeModeUpdate::NestedCallCompleted(call));
             }
             Ok(execution)
+        })
+    }
+
+    /// Whether repeating an interrupted direct call is safe. The host must
+    /// enforce idempotency or reconcile its journal before opting in.
+    fn is_replay_safe(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Executes a cell with Rust-owned tools pinned to its original context.
+    /// Older hosts retain their behavior when no local tools are configured.
+    fn execute_with_local_tools<'a>(
+        &'a self,
+        source: &'a str,
+        context: ToolContext<'a>,
+        tools: Vec<std::sync::Arc<dyn crate::Tool>>,
+        observer: Option<&'a mut dyn CodeModeObserver>,
+    ) -> HostFuture<'a, Result<CodeModeExecution, CodeModeHostError>> {
+        Box::pin(async move {
+            if !tools.is_empty() {
+                return Err(CodeModeHostError::new(
+                    "embedded host does not support nested local tools",
+                ));
+            }
+            match observer {
+                Some(observer) => self.execute_with_updates(source, context, observer).await,
+                None => self.execute(source, context).await,
+            }
         })
     }
 

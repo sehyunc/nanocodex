@@ -6,6 +6,14 @@ optional reverse attachment of a caller-owned `Tools` recipe. The cloud owns
 model execution and retained history; this crate never reads provider
 tokens or application environment variables.
 
+For optional local discovery, `ManagedBuilder::tools_async` prepares a complete
+`Tools` recipe concurrently with creation or opening. It does not delay first
+prompt admission or event delivery. The recipe attaches when ready; failed or
+cancelled builds and disconnect cancel unfinished preparation. Validate required
+configuration before building, and handle optional discovery errors in the
+future. Use `tools` for an already prepared recipe or a required provider whose
+errors must be resolved before admission.
+
 `Managed::create` and `create_live` resolve the authenticated account catalog
 default when no explicit `with_settings` policy is supplied.
 `ManagedClient::create_with_settings` sets the initial model policy atomically.
@@ -100,3 +108,25 @@ destination status). A valid destination failure such as HTTP 403 still returns
 a receipt with `ok:false`; CLI failure means input, authorization, transport or
 receipt validation failed. This operation does not export secrets to native
 processes or implement multi-step native login protocols such as xtool SRP.
+
+Fresh prompt callers can opt into server-side catalog selection with
+`ManagedBuilder::settings_selection(InitialSettingsSelection { ... })` before
+`build_with_prompt`. `InitialSettingsPolicy::Cli` preserves the CLI preference
+for xhigh (when offered) and catalog-supported fast mode; `Sdk` uses model-default
+effort and fast mode off. Optional thinking/reasoning/fast overrides are validated
+against the live catalog. A ChatGPT pin selects only an available OpenAI model,
+preferentially Sol. Explicit `with_settings` takes precedence. Existing builders
+without this opt-in retain their prior behavior and server compatibility.
+
+The opt-in sends `settings_selection` in the combined request and requires the
+server's `X-Nanocodex-Settings` response header before starting the driver. An old
+server or missing/invalid header fails closed; no local model default substitutes
+for the selected model. `build()` rejects this selection option: it applies to
+combined creation with a known first prompt.
+
+For an opt-in unknown model, the first prompt keeps structural validation (and
+still rejects transcript/local media) but defers document-family validation to
+server admission. The selected-model response seeds the driver before it adopts
+the first prompt. The server retains the original request fingerprint and
+resolved settings, so replay after catalog failure or default changes reuses the
+same admission; changing policy, pin, overrides or input with that key conflicts.

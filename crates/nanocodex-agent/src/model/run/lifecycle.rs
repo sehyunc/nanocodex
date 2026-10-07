@@ -13,6 +13,7 @@ pub(super) struct WarmupExecution {
 }
 
 pub(super) struct WarmupOutcome {
+    pub(super) baseline_established: bool,
     pub(super) response_id: Option<String>,
     pub(super) server_reasoning_included: bool,
 }
@@ -61,7 +62,7 @@ impl Drop for CompactionLifecycle<'_> {
 // Untagged success preserves receipts written before failures were recorded.
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-enum RecordedCompactionOutcome {
+pub(super) enum RecordedCompactionOutcome {
     Success(RecordedCompactionResult),
     Failure {
         compaction_error: String,
@@ -73,17 +74,17 @@ enum RecordedCompactionOutcome {
 }
 
 #[derive(Deserialize, Serialize)]
-struct RecordedCompactionResult {
-    response_id: String,
-    status: String,
-    item: ResponseItem,
-    usage: Option<Usage>,
-    attempt: u32,
-    connection_generation: u32,
-    server_reasoning_included: bool,
-    duration_ns: u64,
-    time_to_first_event_ns: u64,
-    time_to_first_output_ns: Option<u64>,
+pub(super) struct RecordedCompactionResult {
+    pub(super) response_id: String,
+    pub(super) status: String,
+    pub(super) item: ResponseItem,
+    pub(super) usage: Option<Usage>,
+    pub(super) attempt: u32,
+    pub(super) connection_generation: u32,
+    pub(super) server_reasoning_included: bool,
+    pub(super) duration_ns: u64,
+    pub(super) time_to_first_event_ns: u64,
+    pub(super) time_to_first_output_ns: Option<u64>,
 }
 
 pub(super) enum ModelTaskOutcome {
@@ -123,7 +124,34 @@ where
             return Ok(false);
         };
         let active_context_tokens = conversation.active_context_tokens();
+        if self.background_compaction.is_some() {
+            self.start_background(factory).await?;
+            if self.background_work.is_some() {
+                self.poll_background().await;
+                if self.force_compaction || active_context_tokens >= auto_compact_token_limit {
+                    self.wait_background().await;
+                }
+                if let Some(true) = self.install_background(conversation, factory).await? {
+                    self.force_compaction = false;
+                    return Ok(true);
+                }
+            }
+            if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
+                return Ok(false);
+            }
+            // A hard limit before dispatch uses the existing synchronous path.
+            self.background_compaction = None;
+            self.background_work = None;
+        }
         if !self.force_compaction && active_context_tokens < auto_compact_token_limit {
+            if active_context_tokens >= auto_compact_token_limit.saturating_mul(4) / 5 {
+                self.background_compaction = Some(background::PendingCompaction {
+                    cutoff: conversation.flattened_history(),
+                    after_model_call_index,
+                    active_context_tokens,
+                    auto_compact_token_limit,
+                });
+            }
             return Ok(false);
         }
         let (item, _usage, server_reasoning_included) = self
@@ -133,6 +161,11 @@ where
                 active_context_tokens,
                 auto_compact_token_limit,
                 factory,
+                conversation.reasoning.request_effort(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                ),
             )
             .await?;
         conversation.observe_server_reasoning(server_reasoning_included);
@@ -160,11 +193,13 @@ where
     pub(super) async fn perform_warmup(
         &mut self,
         factory: &ResponsesAttemptFactory,
+        request_effort: Thinking,
     ) -> Result<WarmupOutcome> {
         if matches!(self.config.responses_transport, ResponsesTransport::Https)
             || !self.config.websocket_warmup
         {
             return Ok(WarmupOutcome {
+                baseline_established: false,
                 response_id: None,
                 server_reasoning_included: false,
             });
@@ -188,23 +223,28 @@ where
             .is_none()
             .then(|| self.prompt_cache.shared().cloned())
             .flatten();
+        let mut shared_prefix_warmed = false;
         let outcome = if let Some(cache) = shared_prompt_cache {
             match cache.entry(self.model, factory.profile()).await {
                 Ok(entry) => {
                     let mut execution = None;
                     let initialized = entry
                         .get_or_try_init(|| async {
-                            let completed = self.execute_warmup(factory, &span).await?;
+                            let completed =
+                                self.execute_warmup(factory, &span, request_effort).await?;
                             execution = Some(completed);
                             Ok(())
                         })
                         .await;
-                    initialized.map(|()| execution.flatten())
+                    initialized.map(|()| {
+                        shared_prefix_warmed = execution.is_none();
+                        execution.flatten()
+                    })
                 }
                 Err(error) => Err(error),
             }
         } else {
-            self.execute_warmup(factory, &span).await
+            self.execute_warmup(factory, &span, request_effort).await
         };
         let execution = match outcome {
             Ok(outcome) => outcome,
@@ -216,12 +256,32 @@ where
             }
         };
         let duration_ns = elapsed_ns(started_at);
+        if execution.is_none() && !shared_prefix_warmed {
+            // Older durable receipts encode a failed warmup as None. Replaying
+            // that receipt must not establish a successful prewarm baseline.
+            span.record("status", "failed");
+            span.record("otel.status_code", "ERROR");
+            span.record("duration_ns", duration_ns);
+            self.stats.warmup_duration_ns += duration_ns;
+            self.events.emit(
+                AgentEventKind::ModelWarmupFailed,
+                WarmupFailed {
+                    duration_ns,
+                    error: "replayed a failed warmup",
+                },
+            )?;
+            return Ok(WarmupOutcome {
+                baseline_established: false,
+                response_id: None,
+                server_reasoning_included: false,
+            });
+        }
         let (response_id, source, attempt, connection_generation, usage, server_reasoning_included) =
             if let Some(execution) = execution {
                 if let Some(usage) = &execution.usage {
                     self.stats
                         .warmup_usage
-                        .add(usage, self.model, self.fast_mode);
+                        .add(usage, self.model, self.service_tier);
                 }
                 (
                     execution
@@ -238,7 +298,7 @@ where
             };
         span.record("warmup.source", source);
         if let Some(usage) = &usage {
-            record_usage(&span, usage, self.model, self.fast_mode);
+            record_usage(&span, usage, self.model, self.service_tier);
         }
         span.record("status", "completed");
         span.record("otel.status_code", "OK");
@@ -257,6 +317,7 @@ where
             },
         )?;
         Ok(WarmupOutcome {
+            baseline_established: true,
             response_id,
             server_reasoning_included,
         })
@@ -266,6 +327,7 @@ where
         &mut self,
         factory: &ResponsesAttemptFactory,
         span: &tracing::Span,
+        request_effort: Thinking,
     ) -> Result<Option<WarmupExecution>> {
         if let Some(steps) = &self.execution_steps
             && let crate::agent::ExecutionStep::Replay(output) = steps
@@ -276,7 +338,7 @@ where
         }
         let success = match self
             .client
-            .execute(factory.warmup(self.model, self.thinking, self.fast_mode))
+            .execute(factory.warmup(self.model, request_effort, self.service_tier))
             .instrument(span.clone())
             .await
         {
@@ -342,11 +404,11 @@ where
         active_context_tokens: u64,
         auto_compact_token_limit: u64,
         factory: &ResponsesAttemptFactory,
+        request_effort: Thinking,
     ) -> Result<(ResponseItem, Option<Usage>, bool)> {
         let step_id = format!("compaction-{after_model_call_index}");
         let model = self.model;
-        let thinking = self.thinking;
-        let fast_mode = self.fast_mode;
+        let service_tier = self.service_tier;
         let trigger = compaction::trigger();
         // This barrier is shared by explicit, pre-turn, and mid-turn compaction.
         // It must settle before even tool-output trimming, and failures leave
@@ -381,6 +443,9 @@ where
                         receipt.validate()?;
                         true
                     }
+                    crate::agent::ExecutionStep::OutcomeUnknown => {
+                        unreachable!("model helper rejects unknown effects")
+                    }
                     crate::agent::ExecutionStep::Execute => false,
                 }
             } else {
@@ -414,8 +479,8 @@ where
             &history,
             trigger,
             model,
-            thinking,
-            fast_mode,
+            request_effort,
+            service_tier,
         );
         let (input_item_count, input_bytes, input_content) = trace_model_input(&request);
         let span = compaction_span(after_model_call_index, input_item_count, input_bytes);
@@ -437,6 +502,9 @@ where
                     .begin::<_, RecordedCompactionOutcome>(&step_id, "compaction", &())
                     .await?
                 {
+                    crate::agent::ExecutionStep::OutcomeUnknown => {
+                        unreachable!("model helper rejects unknown effects")
+                    }
                     crate::agent::ExecutionStep::Execute => None,
                     crate::agent::ExecutionStep::Replay(output) => Some(output),
                 }
@@ -563,8 +631,8 @@ where
             lifecycle.stats.model_duration_ns += duration_ns;
             lifecycle.stats.compaction_duration_ns += duration_ns;
             if let Some(usage) = &usage {
-                record_usage(&span, usage, model, self.fast_mode);
-                lifecycle.stats.usage.add(usage, model, self.fast_mode);
+                record_usage(&span, usage, model, self.service_tier);
+                lifecycle.stats.usage.add(usage, model, self.service_tier);
             }
             lifecycle.stats.last_response_id = Some(response_id);
             Ok((item, usage, server_reasoning_included))

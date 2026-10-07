@@ -43,9 +43,41 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Reuse only the exact running CLI covered by this release manifest.
+fn verified_running_binary(manifest: &[u8], asset_name: &str) -> Option<Vec<u8>> {
+    let expected = checksum_for(manifest, asset_name).ok()?;
+    let path = std::env::current_exe().ok()?;
+    if fs::metadata(&path).ok()?.len() > MAX_BINARY_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    (hex::encode(Sha256::digest(&bytes)) == expected).then_some(bytes)
+}
+
+/// A managed installation already contains its verified Hand companion.
+/// Restrict reuse to the version directory of this exact running executable.
+fn cached_linux_hand() -> Option<Vec<u8>> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let directory = executable.parent()?;
+    let key = directory.file_name()?.to_str()?;
+    let store = VersionStore::discover().ok()?;
+    if store.version_dir(key).canonicalize().ok()?.as_path() != directory
+        || !store.is_cached_bundle(key, false).ok()?
+    {
+        return None;
+    }
+    fs::read(directory.join("nanocodex2")).ok()
+}
+
 /// Resolve one immutable Linux Hand binary for local or SSH installation.
 /// The controller verifies the release manifest before any credential is sent.
 pub(crate) async fn linux_hand_binary() -> Result<Vec<u8>> {
+    if let Some(binary) = cached_linux_hand() {
+        return Ok(binary);
+    }
     let client = Client::builder()
         .user_agent(format!("nanocodex/{}", version::SEMVER_VERSION))
         .connect_timeout(CONNECT_TIMEOUT)
@@ -230,6 +262,10 @@ impl ReleaseAsset {
 
 impl Update {
     pub(crate) async fn run(self) -> Result<()> {
+        self.run_with_install_tag(None).await
+    }
+
+    async fn run_with_install_tag(self, install_tag: Option<&str>) -> Result<()> {
         let manager_version = Version::parse(env!("CARGO_PKG_VERSION"))
             .wrap_err("the installed Nanocodex version is invalid")?;
         let store = VersionStore::discover()?;
@@ -317,7 +353,9 @@ impl Update {
 
         // Complete cached releases can still be selected offline. A legacy
         // binary-only cache must consult release metadata to discover voice.
-        if let Some(requested) = &self.version {
+        if let Some(requested) = &self.version
+            && install_tag.is_none()
+        {
             let key = requested.to_string();
             if !self.force
                 && store.is_cached_bundle(&key, false)?
@@ -339,10 +377,22 @@ impl Update {
             .build()
             .wrap_err("failed to create the update client")?;
         let release_description = self.release_description();
-        let release_api = release_api(self.nightly, self.version.as_ref());
+        let release_api = install_tag.map_or_else(
+            || release_api(self.nightly, self.version.as_ref()),
+            |tag| Cow::Owned(format!("{TAGGED_RELEASE_API}/{tag}")),
+        );
         let mut release =
             fetch_release(&client, release_api.as_ref(), &release_description).await?;
-        if self.nightly {
+        if let Some(tag) = install_tag {
+            if self.nightly {
+                validate_immutable_nightly(&release, tag)?;
+            } else if release.tag_name != tag {
+                bail!(
+                    "GitHub returned release {} for requested tag {tag}",
+                    release.tag_name
+                );
+            }
+        } else if self.nightly {
             release = fetch_immutable_nightly(&client, &release).await?;
         }
 
@@ -395,32 +445,39 @@ impl Update {
         let (binary, compressed) = find_preferred_asset(&release, binary_name)?;
         let (companion, companion_compressed) =
             find_preferred_asset(&release, nanocodex2_binary_asset_name()?)?;
-        let voice_contents = match voice_asset {
-            Some(asset) => Some(download_verified(&client, asset, &checksum_manifest, true).await?),
-            None => None,
-        };
-        let archive = download_verified(&client, binary, &checksum_manifest, true).await?;
-        let contents = unpack_release_asset(archive, &binary.name, compressed)?;
-        let companion_archive =
-            download_verified(&client, companion, &checksum_manifest, true).await?;
-        let companion_contents =
-            unpack_release_asset(companion_archive, &companion.name, companion_compressed)?;
-        let guest_contents = if self.nightly {
-            if let Some(guest_name) = vm_guest_binary_asset_name() {
-                let (guest, compressed) = find_preferred_asset(&release, guest_name)?;
-                let guest_archive =
-                    download_verified(&client, guest, &checksum_manifest, true).await?;
-                Some(unpack_release_asset(
-                    guest_archive,
-                    &guest.name,
-                    compressed,
-                )?)
-            } else {
-                None
+        // Independent payloads overlap; reuse the bootstrap only when this
+        // release's manifest verifies the exact running executable bytes.
+        let cli_download = async {
+            if let Some(contents) = verified_running_binary(&checksum_manifest, binary_name) {
+                return Ok(contents);
             }
-        } else {
-            None
+            let archive = download_verified(&client, binary, &checksum_manifest, true).await?;
+            unpack_release_asset(archive, &binary.name, compressed)
         };
+        let hand_download = async {
+            let archive = download_verified(&client, companion, &checksum_manifest, true).await?;
+            unpack_release_asset(archive, &companion.name, companion_compressed)
+        };
+        let voice_download = async {
+            match voice_asset {
+                Some(asset) => download_verified(&client, asset, &checksum_manifest, true)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
+        };
+        let guest_download = async {
+            if self.nightly
+                && let Some(name) = vm_guest_binary_asset_name()
+            {
+                let (asset, compressed) = find_preferred_asset(&release, name)?;
+                let archive = download_verified(&client, asset, &checksum_manifest, true).await?;
+                return unpack_release_asset(archive, &asset.name, compressed).map(Some);
+            }
+            Ok(None)
+        };
+        let (contents, companion_contents, voice_contents, guest_contents) =
+            tokio::try_join!(cli_download, hand_download, voice_download, guest_download)?;
         store.install_bundle(
             &key,
             &contents,
@@ -455,9 +512,33 @@ impl Update {
 /// The curl bootstrap downloads only that CLI; this native updater owns every
 /// companion binary, voice resource, activation, and automatic-update detail.
 pub(crate) async fn install_latest() -> Result<PathBuf> {
+    let tag = std::env::var("NANOCODEX_RELEASE_TAG")
+        .ok()
+        .filter(|tag| !tag.is_empty());
+    let nightly = tag
+        .as_deref()
+        .is_some_and(|tag| tag.starts_with("nightly-"));
+    let requested = match tag.as_deref() {
+        Some(tag) if nightly => {
+            let sha = &tag["nightly-".len()..];
+            if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("expected nightly-<full 40-hex commit> release tag");
+            }
+            None
+        }
+        Some(tag) => {
+            let version = parse_release_version(tag)?;
+            if tag != format!("v{version}") || !version.pre.is_empty() || !version.build.is_empty()
+            {
+                bail!("expected a stable vMAJOR.MINOR.PATCH release tag");
+            }
+            Some(version)
+        }
+        None => None,
+    };
     Update {
-        version: None,
-        nightly: false,
+        version: requested,
+        nightly,
         branch: None,
         pr: None,
         path: None,
@@ -469,7 +550,7 @@ pub(crate) async fn install_latest() -> Result<PathBuf> {
         background: false,
         restart_hand: false,
     }
-    .run()
+    .run_with_install_tag(tag.as_deref())
     .await?;
     let store = VersionStore::discover()?;
     if cfg!(windows) {

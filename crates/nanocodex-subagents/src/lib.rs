@@ -1,7 +1,7 @@
-//! Ephemeral, reusable subagent tools and in-memory task-tree runtime.
-//!
-//! Children and their retained history exist only for the lifetime of this runtime.
+//! Reusable child agents with optional fenced durable recovery.
 
+mod ownership;
+pub use ownership::RegistryOwnership;
 mod capacity;
 mod diagnostics;
 
@@ -17,8 +17,8 @@ mod task_tree;
 mod tools;
 
 pub use model::{
-    AgentDescriptor, AgentId, AgentMessage, AgentMessageUpdate, AgentStatus, AgentThread,
-    AgentUpdate, MessageDeliveryState, MessageDisposition, MessageId, MessagePriority,
+    AgentDescriptor, AgentId, AgentLifetime, AgentMessage, AgentMessageUpdate, AgentStatus,
+    AgentThread, AgentUpdate, MessageDeliveryState, MessageDisposition, MessageId, MessagePriority,
     MessagePurpose, MessageSender, ScopedAgentUpdate, SubagentRuntimeId, ThreadId,
 };
 pub use runtime::{
@@ -26,7 +26,7 @@ pub use runtime::{
 };
 pub use tools::{
     AgentStartReport, AgentTask, AgentToolResult, install_tools, start_agent, start_agent_with,
-    start_agents, start_agents_observed,
+    start_agents, start_agents_observed, start_fork_agent,
 };
 
 /// Unlimited active turns by default. Explicit finite limits remain supported.

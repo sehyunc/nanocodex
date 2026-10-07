@@ -73,7 +73,7 @@ export type Options = Readonly<{
 }>;
 
 export type CreateSettings = Readonly<{
-  model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5";
+  model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-fable-5-1";
   thinking: Thinking;
   reasoningMode: ReasoningMode;
   fastMode: boolean;
@@ -165,7 +165,7 @@ export type State = Readonly<{
   latest_event_cursor: string;
   stream_error: string | null;
   settings: Readonly<{
-    model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5";
+    model: Model | "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-sonnet-5-5" | "claude-opus-5-5" | "claude-fable-5-1";
     thinking: Thinking;
     reasoning_mode: ReasoningMode;
     fast_mode: boolean;
@@ -379,9 +379,10 @@ export type Agent = Readonly<{
   /** Account-owned list metadata, present on handles returned by `list()`. */
   summary?: Summary | undefined;
   turn: Readonly<{ prompt(options: PromptOptions): Turn }>;
-  /** Copy the latest committed model boundary into a separate durable agent.
+  /** Copy a completed model boundary and policy-selected session documents into a separate durable agent.
+   * `at` selects a completed turn ID; omitted selects the latest completed turn.
    * Reuse the same key to reconcile an uncertain response. */
-  fork(options: Readonly<{ idempotencyKey: string; signal?: AbortSignal | undefined }>): Promise<Agent>;
+  fork(options: Readonly<{ idempotencyKey: string; at?: string | undefined; signal?: AbortSignal | undefined }>): Promise<Agent>;
   settings: Readonly<{
     read(): Promise<CreateSettings>;
     update(patch: SettingsPatch): Promise<CreateSettings>;

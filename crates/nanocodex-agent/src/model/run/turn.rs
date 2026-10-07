@@ -16,7 +16,7 @@ where
         &mut self,
         requested_workspace: Option<Arc<str>>,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         logical_turn: u64,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
         execution_steps: Option<ExecutionSteps>,
@@ -26,7 +26,7 @@ where
             .compact_inner(
                 requested_workspace,
                 thinking,
-                fast_mode,
+                service_tier,
                 logical_turn,
                 cancel,
                 execution_steps,
@@ -40,14 +40,14 @@ where
         &mut self,
         requested_workspace: Option<Arc<str>>,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         logical_turn: u64,
         cancel: &mut tokio::sync::oneshot::Receiver<()>,
         execution_steps: Option<ExecutionSteps>,
     ) -> Result<ModelCompactOutcome> {
         self.execution_steps = execution_steps;
         self.thinking = thinking;
-        self.fast_mode = fast_mode;
+        self.service_tier = service_tier;
         self.start_timing();
         self.stats = RunStats::default();
         self.transport_baseline = self.transport_stats.snapshot();
@@ -79,6 +79,15 @@ where
             .prepare_request_policy(self.continuation_policy());
 
         if !resumed {
+            let history_len = session.conversation.managed.history().len();
+            if let Some(update) = session.conversation.reasoning.sampling_update(
+                self.model,
+                self.thinking,
+                self.config.supports_reasoning_effort_updates(self.model),
+                history_len,
+            ) {
+                session.conversation.append([update]);
+            }
             self.retain_execution(&session, ExecutionPhase::Compact)
                 .await?;
         }
@@ -95,6 +104,11 @@ where
                 active_context_tokens,
                 auto_compact_token_limit,
                 &session.factory,
+                session.conversation.reasoning.request_effort(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                ),
             );
             tokio::pin!(compaction);
             tokio::select! {
@@ -148,10 +162,10 @@ where
         task: &Prompt,
         workspace: Option<&str>,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
     ) -> Result<()> {
         self.thinking = thinking;
-        self.fast_mode = fast_mode;
+        self.service_tier = service_tier;
         self.start_timing();
         self.stats = RunStats::default();
         self.events.emit(
@@ -195,7 +209,7 @@ where
         task: &Prompt,
         workspace: Option<&str>,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         error: &NanocodexError,
     ) -> Result<()> {
         if matches!(
@@ -208,7 +222,7 @@ where
             return Ok(());
         }
         self.thinking = thinking;
-        self.fast_mode = fast_mode;
+        self.service_tier = service_tier;
         self.start_timing();
         self.stats = RunStats::default();
         self.events.emit(
@@ -237,7 +251,7 @@ where
         task: Prompt,
         workspace: Option<Arc<str>>,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         logical_turn: u64,
         steering: TurnSteering,
         mut cancel: tokio::sync::oneshot::Receiver<()>,
@@ -247,7 +261,7 @@ where
         self.execution_steps = execution_steps;
         self.instruction_revision = task.instruction_revision();
         self.thinking = thinking;
-        self.fast_mode = fast_mode;
+        self.service_tier = service_tier;
         self.start_timing();
         self.stats = RunStats::default();
         if let Some(tools) = &self.active_tools {
@@ -552,6 +566,15 @@ where
         };
 
         if !resumed {
+            let history_len = session.conversation.managed.history().len();
+            if let Some(update) = session.conversation.reasoning.sampling_update(
+                self.model,
+                self.thinking,
+                self.config.supports_reasoning_effort_updates(self.model),
+                history_len,
+            ) {
+                session.conversation.append([update]);
+            }
             self.retain_execution(&session, phase).await?;
         }
         match phase {
@@ -572,8 +595,13 @@ where
                 }
             }
             ExecutionPhase::Warmup => {
+                let request_effort = session.conversation.reasoning.request_effort(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                );
                 let warmup = {
-                    let warmup = self.perform_warmup(&session.factory);
+                    let warmup = self.perform_warmup(&session.factory, request_effort);
                     tokio::pin!(warmup);
                     tokio::select! {
                         biased;
@@ -587,6 +615,16 @@ where
                 };
                 match warmup {
                     Ok(outcome) => {
+                        if outcome.baseline_established {
+                            // Only completed warmup may establish a baseline without
+                            // an authored configuration item. Failed/skipped warmup
+                            // leaves sampling responsible for the initial update.
+                            session.conversation.reasoning.pin(
+                                self.model,
+                                self.thinking,
+                                self.config.supports_reasoning_effort_updates(self.model),
+                            );
+                        }
                         session
                             .conversation
                             .observe_server_reasoning(outcome.server_reasoning_included);
@@ -622,10 +660,6 @@ where
                 ));
             }
         }
-        if phase != ExecutionPhase::Generate {
-            self.retain_execution(&session, ExecutionPhase::Generate)
-                .await?;
-        }
 
         let outcome = {
             let task = self.drive_session(
@@ -648,11 +682,12 @@ where
         }
     }
 
-    pub(super) const fn continuation_policy(&self) -> ContinuationPolicy {
+    pub(super) fn continuation_policy(&self) -> ContinuationPolicy {
         ContinuationPolicy {
             model: self.model,
             thinking: self.thinking,
-            fast_mode: self.fast_mode,
+            service_tier: self.service_tier,
+            reasoning_effort_updates: self.config.supports_reasoning_effort_updates(self.model),
         }
     }
 
@@ -814,11 +849,34 @@ where
                 self.drain_steers(&mut session.conversation, &mut pending_steers, call_index)
                     .await?;
             }
+            // Advancing a recovered first batch would retire effects awaiting replay.
+            if first_batch && resumed {
+                // Legacy Generate continuations have no reasoning sidecar. Preserve
+                // their exact request and effects, then retain its baseline in memory.
+                session.conversation.reasoning.pin(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                );
+            }
             if !first_batch {
+                let history_len = session.conversation.managed.history().len();
+                let update = session.conversation.reasoning.sampling_update(
+                    self.model,
+                    self.thinking,
+                    self.config.supports_reasoning_effort_updates(self.model),
+                    history_len,
+                );
+                if let Some(update) = update {
+                    session.conversation.append([update]);
+                }
                 self.retain_execution(session, ExecutionPhase::Generate)
                     .await?;
             }
             first_batch = false;
+            self.start_background(&session.factory).await?;
+            // Installation belongs after foreground replay, at maybe_compact or
+            // the terminal boundary. Changing input here would invalidate replay.
             Self::publish_fork_snapshot(session, fork_snapshots, self.global_instructions.as_ref());
             let ModelCallOutcome {
                 request,
@@ -826,7 +884,12 @@ where
                 transport_continuation_valid,
                 server_reasoning_included,
             } = self
-                .perform_model_call(call_index, &session.conversation, &session.factory)
+                .perform_model_call(
+                    call_index,
+                    &mut session.conversation,
+                    &session.factory,
+                    &session.tools,
+                )
                 .await?;
             let TurnResult {
                 id,
@@ -837,6 +900,7 @@ where
                 usage,
                 ..
             } = response;
+            let previous_history = session.conversation.shared_history();
             session
                 .conversation
                 .managed
@@ -850,6 +914,10 @@ where
                 .map_err(|_| NanocodexError::MalformedResponse {
                     detail: "completed turn did not have a response ID",
                 })?;
+            session.conversation.reasoning.reconcile_history_repair(
+                previous_history.iter(),
+                session.conversation.managed.history(),
+            );
             can_drain_steers = true;
 
             if code_calls.is_empty() {
@@ -898,6 +966,11 @@ where
                     continue;
                 }
                 if let Some(message) = final_message {
+                    // Owned work settles before the foreground operation becomes terminal.
+                    self.start_background(&session.factory).await?;
+                    self.wait_background().await;
+                    self.install_background(&mut session.conversation, &session.factory)
+                        .await?;
                     return Ok(if message.trim().is_empty() {
                         "The model completed without emitting assistant text.".to_owned()
                     } else {

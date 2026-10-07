@@ -64,7 +64,24 @@ impl Commands {
         }
     }
 
-    fn cancel(&mut self, app: &mut App, target: PaneId) {
+    pub(super) fn has_model_selection(&self) -> bool {
+        self.0
+            .iter()
+            .any(|command| matches!(command, WorkerCommand::SetModel { .. }))
+    }
+
+    pub(super) fn recovery_model(&mut self) -> Option<HarnessModel> {
+        let index = self
+            .0
+            .iter()
+            .position(|command| matches!(command, WorkerCommand::SetModel { .. }))?;
+        match self.0.remove(index)? {
+            WorkerCommand::SetModel { model } => Some(model),
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) fn cancel(&mut self, app: &mut App, target: PaneId) {
         const CANCELLED: &str = "Cancelled before initialization finished";
         let mut commands = std::mem::take(&mut self.0);
         while let Some(command) = commands.pop_front() {
@@ -136,9 +153,12 @@ impl Backend {
                 .as_ref()
                 .map(|session| PathBuf::from(session.workspace()))
                 .map_or_else(|| resolve_cwd(&config), Ok)?;
-            let observability = observability
-                .map(|args| args.install(true, &cwd))
-                .transpose()?;
+            let observability = observability.map(|args| args.install(true)).transpose()?;
+            tracing::info!(
+                pid = std::process::id(),
+                workspace = %cwd.display(),
+                "TUI workspace selected"
+            );
             let updater = crate::startup_timing::Stage::new("updater_setup");
             if let Err(error) = crate::update::prepare_legacy_nightly_bootstrap() {
                 tracing::warn!(%error, "failed to prepare the Nanocodex updater bootstrap");
@@ -157,6 +177,12 @@ impl Backend {
             } else {
                 config.build_tui(vm).await?
             };
+            tracing::info!(
+                pid = std::process::id(),
+                session.id = %configured.handle.session_id(),
+                workspace = %cwd.display(),
+                "TUI session initialized"
+            );
             Ok(Self {
                 configured,
                 observability,

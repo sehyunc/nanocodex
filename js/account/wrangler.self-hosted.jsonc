@@ -38,6 +38,8 @@
       "/code",
       "/commits",
       "/requests",
+      "/vault",
+      "/services/phone",
       "/connect",
       "/connect/*",
       "/connect-dialog",

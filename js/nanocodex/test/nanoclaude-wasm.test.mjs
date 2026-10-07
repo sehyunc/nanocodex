@@ -127,7 +127,10 @@ for (const [target, subscription] of [["node",false], ["browser",false], ["node"
       await assert.rejects(run(agent, "perform one synthetic effect", "first"), /synthetic followup failure/);
       assert.equal(effects, 1);
       assert.equal(requests.length, 3, "automatic compaction executed a real SSE summary request");
-      assert.deepEqual(requests[2].body.messages[1].content, subscription ? signed.map(block => block.type === "tool_use" ? {...block,name: "_" + block.name} : block) : signed);
+      const retained = signed.filter(block => block.type !== "thinking" && block.type !== "redacted_thinking");
+      assert.deepEqual(requests[2].body.messages[1].content,
+        subscription ? retained.map(block => block.type === "tool_use" ? {...block,name: "_" + block.name} : block) : retained,
+        "summary replacement removes prefix-bound thinking and preserves every other block exactly");
       assert.deepEqual(requests[2].body.messages[2].content[0].content, receipt);
       assert.equal(requests[2].body.messages[2].content[0].tool_use_id, "effect-once");
       assert.deepEqual(requests[0].body.cache_control, { type: "ephemeral", ttl: "1h" });
@@ -363,4 +366,110 @@ test('Claude reconstructs the same durable owner while its previous host remains
   assert.equal((await run(replacement, 'Second turn', 'owner-second')).finalMessage, 'RECONSTRUCTED');
   await first.session.shutdown().catch(() => {});
   assert.equal((await run(replacement, 'After old owner cleanup', 'owner-third')).finalMessage, 'RECONSTRUCTED');
+});
+
+for (const target of ['node', 'browser']) {
+  test(`actual ${target} Claude historical document fork retains signed native blocks and independent SQLite state`, { timeout: 60_000 }, async t => {
+    const Claude = await sdk(target);
+    const directory = await mkdtemp(join(tmpdir(), 'nanoclaude-document-fork-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const nativeBlocks = [
+      { type: 'thinking', thinking: 'historical opaque thought', signature: 'fork-signature/+==', native_extension: { retained: true } },
+      { type: 'redacted_thinking', data: 'fork-redacted/+==', opaque: 'retain' },
+    ];
+    const { endpoint, requests } = await fixture(t, index => index === 1
+      ? sse([...nativeBlocks, { type: 'tool_use', id: 'stage-document', name: 'stage', input: {} }], 'tool_use')
+      : sse(text(`DOCUMENT_ANSWER_${index}`)));
+    let db;
+    let agent;
+    let effects = 0;
+    const open = () => (db = sqlite(join(directory, 'documents.sqlite'))).store;
+    const write = (key, expectedVersion, value, fork = 'asOf') => ({ key, expectedVersion, value, fork });
+    const create = (durability, durabilityId, extra = {}) => Claude.create({
+      endpoint, model: 'fixture-model', auth: { apiKey: 'synthetic-destination-document-key' },
+      tools: [{ name: 'stage', description: 'Stage a synthetic session document', inputSchema: { type: 'object' },
+        async handler(_input, context) {
+          effects++;
+          await agent.session.stageDocumentWrites(context.turnId, [write('staged', 0, 'committed with first turn')]);
+          return { content: 'staged' };
+        } }], durability, durabilityId, terminalReceiptRetention: 1, ...extra,
+    });
+    const wasm = target === 'browser' ? await readFile(new URL('../pkg-web/nanocodex_bg.wasm', import.meta.url)) : undefined;
+    const options = wasm === undefined ? {} : { module: wasm };
+    try {
+      let store = open(); agent = await create(store, 'claude-doc-parent', options);
+      await agent.session.compareExchangeDocuments(['initial', 'current', 'asOf'].map(policy => write(policy, 0, 1, policy)));
+      await run(agent, 'CLAUDE_DOCUMENT_FIRST', 'claude-document-0');
+      assert.equal((await agent.session.document('staged')).value, 'committed with first turn');
+      await agent.session.compareExchangeDocuments(['initial', 'current', 'asOf'].map(policy => write(policy, 1, 2, policy)));
+      const before = db.stateText();
+      await assert.rejects(agent.session.compareExchangeDocuments([write('asOf', 2, 99), write('current', 1, 99, 'current')]), /version/i);
+      assert.equal(db.stateText(), before, 'rejected transaction retains all documents and durable revision');
+      for (let index = 1; index < 5; index++) await run(agent, `CLAUDE_DOCUMENT_LATER_${index}`, `claude-document-${index}`);
+      await agent.session.shutdown(); agent = undefined; db.close();
+      store = open(); agent = await create(store, 'claude-doc-parent', options);
+      const seed = await agent.session.documentFork('claude-document-0');
+      assert.deepEqual(['initial', 'current', 'asOf'].map(key => seed.documents.documents[key].value), [1, 2, 1]);
+      assert.equal(seed.documents.documents.asOf.fork, 'asOf');
+      assert.ok(!JSON.stringify(seed).includes('synthetic-destination-document-key'));
+      const beforeReplay = requests.length;
+      await assert.rejects(run(agent, 'CLAUDE_DOCUMENT_FIRST', 'claude-document-0'), /terminal/i);
+      assert.equal(requests.length, beforeReplay, 'pruned operation cannot rerun inference or tools');
+      await agent.session.shutdown(); agent = undefined;
+      agent = await create(store, 'claude-doc-child', { ...options, documentFork: seed });
+      await agent.session.compareExchangeDocuments([write('asOf', seed.documents.documents.asOf.version, 42)]);
+      await agent.session.shutdown(); agent = undefined; db.close();
+      store = open(); agent = await create(store, 'claude-doc-child', options);
+      assert.equal((await agent.session.document('asOf')).value, 42);
+      await run(agent, 'CLAUDE_DOCUMENT_CHILD_ONLY', 'claude-child-next');
+      const child = requests.at(-1).body;
+      assert.match(JSON.stringify(child), /CLAUDE_DOCUMENT_FIRST/);
+      assert.doesNotMatch(JSON.stringify(child), /CLAUDE_DOCUMENT_LATER_/);
+      const retainedBlocks = child.messages.flatMap(message => Array.isArray(message.content) ? message.content : [])
+        .filter(block => ['thinking', 'redacted_thinking'].includes(block.type));
+      assert.deepEqual(retainedBlocks, nativeBlocks, 'fork retains exact native signed and redacted blocks');
+      await assert.rejects(create(store, 'claude-doc-child', { ...options, documentFork: seed }), /pristine|empty|existing|already|occupied/i);
+      await agent.session.shutdown(); agent = await create(store, 'claude-doc-parent', options);
+      assert.equal((await agent.session.document('asOf')).value, 2);
+      assert.equal(effects, 1);
+      t.diagnostic(JSON.stringify({ target, parentTurns: 5, receiptRetention: 1, historicalBoundary: seed.documents.boundary,
+        selectedValues: [1, 2, 1], childValue: 42, parentValue: 2, signedBlocks: retainedBlocks, effects, requests: requests.length }));
+    } finally { await agent?.session.shutdown().catch(() => {}); db?.close(); }
+  });
+}
+test("actual WASM Claude live route starts idle turns, steers active turns, and sends native media blocks", { timeout: 15_000 }, async t => {
+  const Claude = await sdk();
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const { endpoint, requests } = await fixture(t, index => index === 1
+    ? sse([{ type: "tool_use", id: "held", name: "hold", input: {} }], "tool_use")
+    : sse(text(index === 2 ? "ROUTED_DONE" : "CONTENT_DONE")));
+  const agent = await Claude.create({ endpoint, model: "fixture-model", auth: { apiKey: "synthetic-only" },
+    tools: [{ name: "hold", description: "Held synthetic tool", handler: async () => { started.resolve(); await release.promise; return "held"; } }],
+  });
+  try {
+    // Realtime voice frontends deliver live text through route: idle starts a turn.
+    const turn = await agent.turn.route({ input: "book the flight" });
+    assert.ok(turn, "idle live input starts a turn");
+    const result = turn.result();
+    await started.promise;
+    // An active turn absorbs the next live input without a concurrent model call.
+    assert.equal(await agent.turn.route({ input: "and ask for a window seat" }), undefined);
+    release.resolve();
+    assert.equal((await result).finalMessage, "ROUTED_DONE");
+    assert.equal(requests.length, 2);
+    assert.match(JSON.stringify(requests[1].body.messages), /and ask for a window seat/);
+
+    const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const pdf = `data:application/pdf;base64,${Buffer.from("%PDF-1.4\n%%EOF\n").toString("base64")}`;
+    const content = [{ type: "text", text: "describe both" }, { type: "image", image_url: png }, { type: "file", file_data: pdf, filename: "brief.pdf" }];
+    assert.equal((await run(agent, content)).finalMessage, "CONTENT_DONE");
+    const blocks = requests[2].body.messages.at(-1).content;
+    assert.deepEqual(blocks.map(block => block.type), ["text", "image", "document"]);
+    assert.deepEqual(blocks[1].source, { type: "base64", media_type: "image/png", data: png.split(",")[1] });
+    assert.deepEqual(blocks[2].source, { type: "base64", media_type: "application/pdf", data: pdf.split(",")[1] });
+    assert.equal(blocks[2].title, "brief.pdf");
+    assert.throws(() => agent.turn.prompt({ input: [] }), /non-empty/);
+    await assert.rejects(run(agent, [{ type: "file", file_data: "data:application/pdf;base64,bm90IGEgcGRm" }]), /document/i);
+  } finally { await shutdown(agent); }
 });

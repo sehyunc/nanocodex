@@ -1,7 +1,7 @@
 import { forwardManagedPreview, previewBridgeEnabled, type PreviewBridgeEnv } from "../../managed/src/preview-bridge.ts";
 import { consumeRpcData } from "nanocodex/cloudflare/rpc";
 import { apiKeyDigest, apiKeyPrincipal } from "nanocodex/cloudflare/managed-auth";
-import { nativeLiveRequest, liveAgentSettings, liveAgentFailure, liveAgentRequest, newManagedAgentId } from "nanocodex/cloudflare/managed-live";
+import { nativeLiveRequest, liveAgentSettings, liveAgentFailure, liveAgentRequest, newManagedAgentId, nativeRunRequest, nativeRunBody, runAgentRequest } from "nanocodex/cloudflare/managed-live";
 import { durablePlacementOptions, ingressColo } from "nanocodex/cloudflare/durable-placement";
 
 import { MANAGED_ACCESS_HEADER, MANAGED_ACCESS_TTL_MS, isHandViewerUpgrade, readManagedAccess, handRequestFailure, handBrokerRequest } from "nanocodex/cloudflare/managed-access";
@@ -11,6 +11,7 @@ export type ManagedProxyEnv = PreviewBridgeEnv & {
   NANOCODEX_ACCESS_SECRET?: string;
   NANOCODEX_HAND_BROKER?: DurableObjectNamespace;
   NANOCODEX_LIVE_API_KEYS?: { getByName(name: string, options?: ReturnType<typeof durablePlacementOptions>): {
+    id?: { toString(): string };
     resolveAuthorizedKey?: () => Promise<unknown>;
   } };
   NANOCODEX_LIVE_SESSIONS?: { getByName(name: string, options?: ReturnType<typeof durablePlacementOptions>): {
@@ -25,10 +26,10 @@ const GENERATED_APP_ROUTE = /^\/v1\/apps(?:\/[A-Za-z0-9_-]{1,128}(?:\/(?:data|re
 // are available only inside Workers; their absence preserves the same policy.
 const nativeTracing = import("nanocodex/cloudflare/tracing").catch(() => undefined);
 
-const MANAGED_ROUTE = /^(?:\/auth(?:\/.*)?|\/webauthn\/.*|\/sandbox-preview\/[^/]+(?:\/.*)?|\/v1\/(?:auth(?:\/.*)?|me|account\/(?:admin|communication|hosted-tool-stats|tool-host|vm-host|hand-hosts(?:\/[0-9a-f-]{36})?|hands(?:\/(?:screens|host|view|renew|ice))?)|hand-hosts\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/hands\/(?:host|ice|renew)|system\/vm-host|vm-host-attachments\/[A-Za-z0-9_-]{43}\/[0-9a-f-]{36}\/(?:tool-host|hands\/(?:host|ice|renew))|wallet(?:\/(?:balance|connect|revoke-access-key))?|egress|data|crm(?:\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?:\/(?:identities|facts|relationships))?)?|router|responses|models|inference(?:\/.*)?|api-keys(?:\/.*)?|credentials(?:\/.*)?|connect(?:\/.*)?|connectors(?:\/.*)?|agents(?:\/.*)?|meetings(?:\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:\/(?:preview|summarize|audio(?:\/(?:complete|parts\/[1-9]\d*))?))?)?|todo(?:\/(?:snooze|traces|schedule|source-health|items\/[0-9a-fA-F-]{36}(?:\/prepare)?|decisions\/[0-9a-fA-F-]{36}(?:\/(?:respond|prepare))?|mail\/(?:accounts|threads(?:\/[A-Za-z0-9_-]+(?:\/modify)?)?|drafts(?:\/[0-9a-fA-F-]{36})?|send|suggest|messages\/[A-Za-z0-9_-]+\/attachments\/[A-Za-z0-9_-]+)))?|rooms(?:\/.*)?|history(?:\/.*)?|memories\/(?:list|read|search|add_ad_hoc_note|write|status)|markdown-memory\/(?:get|search|write|status)|organization(?:\/.*)?))$/;
+const MANAGED_ROUTE = /^(?:\/auth(?:\/.*)?|\/webauthn\/.*|\/sandbox-preview\/[^/]+(?:\/.*)?|\/v1\/(?:auth(?:\/.*)?|me|admin\/threads|account\/(?:admin|communication|hosted-tool-stats|tool-host|vm-host|hand-hosts(?:\/[0-9a-f-]{36})?|hands(?:\/(?:screens|host|view|renew|ice))?)|hand-hosts\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/hands\/(?:host|ice|renew)|system\/vm-host|vm-host-attachments\/[A-Za-z0-9_-]{43}\/[0-9a-f-]{36}\/(?:tool-host|hands\/(?:host|ice|renew))|wallet(?:\/(?:balance|connect|revoke-access-key|link(?:\/(?:poll|cancel))?|unlink))?|egress|data|crm(?:\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}(?:\/(?:identities|facts|relationships))?)?|router|responses|models|inference(?:\/.*)?|api-keys(?:\/.*)?|credentials(?:\/.*)?|connect(?:\/.*)?|connectors(?:\/.*)?|agent-definitions(?:\/[A-Za-z0-9_-]{1,64})?|environment-templates(?:\/[A-Za-z0-9_-]{1,64})?|agents(?:\/.*)?|meetings(?:\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?:\/(?:preview|summarize|audio(?:\/(?:complete|parts\/[1-9]\d*))?))?)?|todo(?:\/(?:snooze|traces|schedule|source-health|items\/[0-9a-fA-F-]{36}(?:\/prepare)?|decisions\/[0-9a-fA-F-]{36}(?:\/(?:respond|prepare))?|mail\/(?:accounts|threads(?:\/[A-Za-z0-9_-]+(?:\/modify)?)?|drafts(?:\/[0-9a-fA-F-]{36})?|send|suggest|messages\/[A-Za-z0-9_-]+\/attachments\/[A-Za-z0-9_-]+)))?|rooms(?:\/.*)?|history(?:\/.*)?|memories\/(?:list|read|search|add_ad_hoc_note|write|status)|markdown-memory\/(?:get|search|write|status)|organization(?:\/.*)?))$/;
 
 export function isManagedRoutePath(pathname: string): boolean {
-  return pathname === "/v1/account/hand-relays" || pathname === "/v1/account/hand-relays/retire" || pathname === "/v1/vault/request" || PERMISSION_REQUEST_ROUTE.test(pathname) || GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
+  return pathname === "/v1/services" || pathname.startsWith("/v1/services/") || pathname === "/v1/account/links" || pathname === "/v1/account/hands/inventory" || pathname === "/v1/account/hand-relays" || pathname === "/v1/account/hand-relays/retire" || /^\/v1\/vault\/(?:request|store|card)$/.test(pathname) || PERMISSION_REQUEST_ROUTE.test(pathname) || GENERATED_APP_ROUTE.test(pathname) || pathname === "/api/router" || pathname === "/v1/agent-runs" || MANAGED_ROUTE.test(pathname) || /^\/v1\/shared\/[0-9a-f-]{36}(?:\/(?:events(?:\/history)?|turns))?$/.test(pathname) || /^\/v1\/phone\/bridge\/(?:health|check|calls(?:\/[0-9a-f-]{36}(?:\/(?:hangup|steer))?)?|status\/[0-9a-f-]{36}|media\/[0-9a-f-]{36}\/|internal\/(?:state|setup))$/.test(pathname);
 }
 
 /**
@@ -106,7 +107,7 @@ async function routeMeasuredManaged(
       }
       // Undefined means ineligible/unconfigured before session creation. A failed
       // direct dispatch throws to the 503 boundary; never create a second agent.
-      response = await directLiveAgent(request, env) ?? await env.NANOCODEX_BACKEND.fetch(request);
+      response = await directLiveAgent(request, env) ?? await directAgentRun(request, env) ?? await env.NANOCODEX_BACKEND.fetch(request);
     }
     if (url.pathname === "/v1/agent-runs" || /^\/v1\/agents(?:\/(?:live|[0-9a-f-]{36}(?:\/(?:routing|settings|done|prepare|ws|events(?:\/history)?|turns(?:\/[A-Za-z0-9_.:-]{1,128}\/cancel)?))?))?$/.test(url.pathname)) {
       // Match the managed receipt without reading a body or changing upgraded
@@ -151,7 +152,7 @@ async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<
   // Older/unconfigured bindings keep the full managed route, before any create.
   const resolve = key.resolveAuthorizedKey;
   if (typeof resolve !== "function") return;
-  const principal = apiKeyPrincipal(consumeRpcData(await Reflect.apply(resolve, key, [])), digest);
+  const principal = apiKeyPrincipal(consumeRpcData(await Reflect.apply(resolve, key, [])), digest, key.id?.toString());
   const admitted = performance.now();
   const authFinishedAt = Date.now();
   const failure = liveAgentFailure(request, principal);
@@ -183,6 +184,48 @@ async function directLiveAgent(request: Request, env: ManagedProxyEnv): Promise<
   } catch { /* Observations cannot alter the upgrade. */ }
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers,
     ...(response.status === 101 ? { webSocket: response.webSocket } : {}) });
+}
+
+/** Reuse the live key authority and Session boundary without an extra Worker hop. */
+async function directAgentRun(request: Request, env: ManagedProxyEnv): Promise<Response | undefined> {
+  if (!env.NANOCODEX_LIVE_API_KEYS || !env.NANOCODEX_LIVE_SESSIONS || !nativeRunRequest(request)) return;
+  const run = await nativeRunBody(request);
+  if (!run) return;
+  const startedAt = Date.now(), started = performance.now();
+  const digest = await apiKeyDigest(request);
+  if (!digest) return;
+  const colo = ingressColo(request.cf?.colo);
+  const key = env.NANOCODEX_LIVE_API_KEYS.getByName(digest, durablePlacementOptions(colo));
+  const resolve = key.resolveAuthorizedKey;
+  if (typeof resolve !== "function") return;
+  const principal = apiKeyPrincipal(consumeRpcData(await Reflect.apply(resolve, key, [])), digest, key.id?.toString());
+  const authFinishedAt = Date.now();
+  const failure = liveAgentFailure(request, principal);
+  if (failure) return failure;
+  const internal = await runAgentRequest(request, principal!, run, colo);
+  const dispatchAt = Date.now();
+  const response = await env.NANOCODEX_LIVE_SESSIONS.getByName(internal.agentId, durablePlacementOptions(colo)).fetch(internal.request);
+  if (response.ok && (!response.headers.get("content-type")?.startsWith("text/event-stream")
+    || response.headers.get("x-nanocodex-agent-id") !== internal.agentId
+    || response.headers.get("x-nanocodex-turn-id") !== internal.turnId)) {
+    await response.body?.cancel();
+    return json({ error: "turn_admission_invalid_response" }, { status: 502 });
+  }
+  const headers = new Headers(response.headers);
+  let phases: Record<string, unknown> = {};
+  try { phases = JSON.parse(headers.get("x-nanocodex-run-phases") ?? "{}"); } catch { /* Timing is optional. */ }
+  headers.delete("x-nanocodex-run-phases");
+  headers.set("x-nanocodex-request-id", crypto.randomUUID());
+  try {
+    console.info({ type: "managed.agent.run_created", route: "direct_run", thread_id: internal.agentId,
+      turn_id: internal.turnId, status: response.status, auth_started_at_ms: startedAt,
+      auth_finished_at_ms: authFinishedAt, session_dispatch_at_ms: dispatchAt, response_ready_at_ms: Date.now(),
+      create_ms: performance.now() - started,
+      session_constructor_entered_at_ms: phases.constructor_entered_at_ms,
+      session_handler_entered_at_ms: phases.handler_entered_at_ms,
+      session_handler_ms: phases.handler_ms, first_turn_admit_ms: phases.first_turn_admit_ms });
+  } catch { /* Observations must not change admission or streaming. */ }
+  return new Response(response.body, { status: response.status, headers });
 }
 
 // A browser WebSocket cannot send the access header. Carry the existing signed

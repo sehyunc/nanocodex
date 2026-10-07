@@ -1,7 +1,9 @@
 #![allow(missing_docs)]
 
 mod attachment;
+mod code_discovery;
 mod code_mode_drain;
+mod native_mcp;
 mod oauth;
 mod preempt;
 mod support;

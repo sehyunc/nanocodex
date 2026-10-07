@@ -33,6 +33,7 @@ where
             history,
             client_authored,
             context_baseline,
+            reasoning,
             checkpoint,
         } = snapshot.into_resume()?;
         Arc::make_mut(&mut config).model = model;
@@ -59,6 +60,7 @@ where
                     client_authored,
                     prompt_cache_key: Arc::clone(&restored_cache_key),
                     context_baseline,
+                    reasoning,
                 }))
             },
             |checkpoint| InitialResume::Exact(Box::new(checkpoint)),
@@ -115,6 +117,7 @@ where
             prompt_cache_key,
             shared_prompt_cache: shared,
             before_compaction: codex.before_compaction,
+            turn_ownership: codex.turn_ownership,
             instant_tool_steering: codex.instant_tool_steering,
             context_config: codex.context,
             context_source,
@@ -180,6 +183,8 @@ where
         origin.parent_session_id.as_deref(),
         initial_resume.as_ref().map(InitialResume::history_len),
     )?;
+    #[cfg(not(target_family = "wasm"))]
+    let tools = execution.configure_tools(tools);
     let (runtime, event_stream) = BackendRuntime::new_openai(session_id);
     let events = EventSink::from_publisher(runtime.events());
     shutdown.set_execution_policy_owned(execution.identifies_prompts());
@@ -206,6 +211,8 @@ where
     let rollout = execution.info().cloned();
     #[cfg(target_family = "wasm")]
     let rollout = None;
+    #[cfg(not(target_family = "wasm"))]
+    let ownership = spawner.turn_ownership.clone();
     let agent = runtime.bind_with_rollout(
         LocalLifecycle {
             child_handle,
@@ -244,6 +251,8 @@ where
         shutdown.complete(outcome);
     };
     spawn_driver(driver_task)?;
+    #[cfg(not(target_family = "wasm"))]
+    let agent = agent.with_owned_startup(ownership);
     Ok((agent, event_stream))
 }
 

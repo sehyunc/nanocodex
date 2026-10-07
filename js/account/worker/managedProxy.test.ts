@@ -116,7 +116,7 @@ test("direct broker failure and stale generation never replay through the manage
 
 test("inference credentials cannot reach account, connector, agent or hand proxy paths", async () => {
   for (const path of ["/v1/todo", "/v1/todo/decisions/11111111-1111-4111-8111-111111111111/respond", "/v1/me", "/v1/agents", "/v1/api-keys", "/v1/connectors/github", "/v1/credentials",
-    "/v1/account/hands", "/v1/account/hands/screens", "/v1/account/hosted-tool-stats", "/v1/account/tool-host", "/v1/data", "/v1/history", "/v1/memories/list", "/v1/memories/write", "/v1/memories/status", "/v1/markdown-memory/get", "/v1/egress", "/v1/vault/request", "/v1/wallet"]) {
+    "/v1/account/hands", "/v1/account/hands/inventory", "/v1/account/hands/screens", "/v1/account/hosted-tool-stats", "/v1/account/tool-host", "/v1/data", "/v1/history", "/v1/memories/list", "/v1/memories/write", "/v1/memories/status", "/v1/markdown-memory/get", "/v1/egress", "/v1/vault/request", "/v1/wallet", "/v1/wallet/link", "/v1/wallet/link/poll", "/v1/wallet/link/cancel", "/v1/wallet/unlink"]) {
     const request = new Request("https://nanocodex.example" + path, {
       headers: { authorization: "Bearer nci_live_synthetic", cookie: "synthetic=account", upgrade: "websocket", "x-nanocodex-managed-access": "synthetic" },
     });
@@ -183,6 +183,16 @@ test("agent lifecycle timings correlate across Workers without touching response
       assert.equal(JSON.stringify(logs).includes("private-"), false);
     } finally { console.info = original; }
   }
+});
+
+test("account forwarding admits managed agent definitions and crew seats", () => {
+  const id = "11111111-1111-4111-8111-111111111111";
+  for (const path of [
+    "/v1/agent-definitions",
+    "/v1/agent-definitions/remora-fox-v1",
+    "/v1/environment-templates/remora",
+    `/v1/agents/${id}/crew-seat`,
+  ]) assert.equal(isManagedRoutePath(path), true, path);
 });
 
 

@@ -84,6 +84,8 @@ export async function claudeProvider(request) {
     }
     if ((key === 'refresh' || key === 'refresh-uncertain') && !auth.endsWith('-refreshed')) return Response.json({error:'unauthorized'}, {status:401});
     if (key === 'message-uncertain') return Response.json({error:'synthetic overload'}, {status:503});
+    if (key === 'rate-limit') return Response.json({type:'error',error:{type:'rate_limit_error',
+      message:'private provider text synthetic-claude-rate-limit'}},{status:429,headers:{'retry-after':'3600'}});
     if (request.headers.get('x-app') !== 'cli' || request.headers.has('x-claude-code-request-class')
       || request.headers.get('anthropic-dangerous-direct-browser-access') !== 'true'
       || !/^claude-cli\/2\.1\.280 \(external, cli\)$/.test(request.headers.get('user-agent') ?? '')) return new Response(null,{status:400});

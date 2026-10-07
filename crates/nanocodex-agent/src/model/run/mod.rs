@@ -1,3 +1,4 @@
+mod background;
 mod continuation;
 mod lifecycle;
 mod responses;
@@ -78,7 +79,7 @@ pub(crate) struct ModelRun<S> {
     config: Arc<ModelConfig>,
     model: Model,
     thinking: Thinking,
-    fast_mode: bool,
+    service_tier: ServiceTier,
     client: ResponsesClient<S>,
     transport_stats: Arc<TransportStats>,
     started_at: Instant,
@@ -99,6 +100,8 @@ pub(crate) struct ModelRun<S> {
     instruction_revision: Option<u64>,
     global_instructions: Option<Arc<str>>,
     force_compaction: bool,
+    background_compaction: Option<background::PendingCompaction>,
+    background_work: Option<background::CompactionWork>,
     pending_developer_messages: Vec<ResponseItem>,
     execution_steps: Option<ExecutionSteps>,
     before_compaction: Option<Arc<dyn crate::execution::BeforeCompaction>>,
@@ -163,6 +166,7 @@ pub(crate) struct HistoryCheckpoint {
     pub(crate) client_authored: std::collections::BTreeSet<String>,
     pub(crate) prompt_cache_key: Arc<str>,
     pub(crate) context_baseline: Option<ContextBaseline>,
+    pub(crate) reasoning: crate::reasoning::ReasoningState,
 }
 
 impl ModelCheckpoint {
@@ -194,6 +198,14 @@ impl ModelCheckpoint {
         self.conversation.managed.client_authored()
     }
 
+    pub(crate) const fn reasoning(&self) -> &crate::reasoning::ReasoningState {
+        &self.conversation.reasoning
+    }
+
+    pub(crate) fn restore_reasoning(&mut self, reasoning: crate::reasoning::ReasoningState) {
+        self.conversation.reasoning = reasoning;
+    }
+
     pub(crate) fn context_usage(&self) -> crate::session::ContextUsage {
         let (usage, server_reasoning_included) = self.conversation.managed.context_usage();
         crate::session::ContextUsage {
@@ -209,6 +221,13 @@ impl ModelCheckpoint {
             usage.server_reasoning_included,
             usage.is_estimate,
         );
+    }
+
+    pub(crate) const fn request_policy(&self) -> &Value {
+        &self.conversation.request_policy
+    }
+    pub(crate) fn restore_request_policy(&mut self, state: Value) {
+        self.conversation.request_policy = state;
     }
 
     pub(crate) fn snapshot_history(&self) -> Vec<ResponseItem> {
@@ -271,7 +290,7 @@ impl<S> ModelRun<S> {
     ) -> Self {
         let model = config.model;
         let thinking = config.thinking;
-        let fast_mode = config.fast_mode;
+        let service_tier = config.service_tier;
         let global_instructions = context_source.global_instructions();
         Self {
             events,
@@ -279,7 +298,7 @@ impl<S> ModelRun<S> {
             config,
             model,
             thinking,
-            fast_mode,
+            service_tier,
             client,
             transport_stats,
             started_at: Instant::now(),
@@ -299,6 +318,8 @@ impl<S> ModelRun<S> {
             instruction_revision: None,
             global_instructions,
             force_compaction: false,
+            background_compaction: None,
+            background_work: None,
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             before_compaction: None,
@@ -343,7 +364,7 @@ impl<S> ModelRun<S> {
         );
         let model = config.model;
         let thinking = config.thinking;
-        let fast_mode = config.fast_mode;
+        let service_tier = config.service_tier;
         let context_source =
             context_source.with_fallback_global(checkpoint.global_instructions.clone());
         let global_instructions = context_source.global_instructions();
@@ -353,7 +374,7 @@ impl<S> ModelRun<S> {
             config,
             model,
             thinking,
-            fast_mode,
+            service_tier,
             client,
             transport_stats,
             started_at: Instant::now(),
@@ -380,6 +401,8 @@ impl<S> ModelRun<S> {
             instruction_revision: None,
             global_instructions,
             force_compaction: false,
+            background_compaction: None,
+            background_work: None,
             pending_developer_messages: Vec::new(),
             execution_steps: None,
             before_compaction: None,
@@ -503,6 +526,46 @@ impl<S> ModelRun<S> {
     }
 }
 
+// Old discovery results can install direct schemas even after the request prefix
+// has been rebuilt. Preserve the transcript and call/output pairing, but remove
+// provider capability declarations when restoring an embedded strict runtime.
+#[cfg(target_family = "wasm")]
+fn code_only_checkpoint(mut checkpoint: ModelCheckpoint, runtime: &ToolRuntime) -> ModelCheckpoint {
+    if !runtime.is_code_only() {
+        return checkpoint;
+    }
+    let has_schemas = checkpoint
+        .conversation
+        .managed
+        .history()
+        .any(|item| match item {
+            ResponseItem::ToolSearchOutput { tools, .. } => !tools.is_empty(),
+            ResponseItem::AdditionalTools { tools, .. } => !tools.is_empty(),
+            _ => false,
+        });
+    if has_schemas {
+        let mut history = checkpoint.conversation.flattened_history();
+        clear_code_only_schemas(&mut history);
+        checkpoint
+            .conversation
+            .managed
+            .replace_prepared_history(history);
+        checkpoint.preserve_inherited_delta = false;
+    }
+    checkpoint
+}
+
+#[cfg(target_family = "wasm")]
+fn clear_code_only_schemas(history: &mut [ResponseItem]) {
+    for item in history {
+        match item {
+            ResponseItem::ToolSearchOutput { tools, .. } => tools.clear(),
+            ResponseItem::AdditionalTools { tools, .. } => tools.clear(),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn prepare_checkpoint(
     checkpoint: ModelCheckpoint,
     config: &ModelConfig,
@@ -513,6 +576,8 @@ pub(crate) fn prepare_checkpoint(
     let selected_agents_md = context_source
         .project_instructions(checkpoint.workspace())
         .map(Arc::from);
+    #[cfg(target_family = "wasm")]
+    let checkpoint = code_only_checkpoint(checkpoint, &runtime);
     PreparedCheckpoint {
         checkpoint,
         runtime,
@@ -555,6 +620,8 @@ pub(crate) fn prepare_resumed_checkpoint(
     let selected_agents_md = context_source
         .project_instructions(checkpoint.workspace())
         .map(Arc::from);
+    #[cfg(target_family = "wasm")]
+    let checkpoint = code_only_checkpoint(checkpoint, &runtime);
     Ok(PreparedCheckpoint {
         checkpoint,
         runtime,
@@ -578,6 +645,7 @@ pub(crate) fn prepare_history_checkpoint(
         client_authored,
         prompt_cache_key,
         context_baseline,
+        reasoning,
     } = resume;
     let selected_agents_md = context_source
         .project_instructions(&workspace)
@@ -593,7 +661,7 @@ pub(crate) fn prepare_history_checkpoint(
     )?
     .prefix()
     .to_vec();
-    let checkpoint = ModelCheckpoint::resume(
+    let mut checkpoint = ModelCheckpoint::resume(
         workspace,
         provider_session_id,
         request_prefix,
@@ -604,6 +672,9 @@ pub(crate) fn prepare_history_checkpoint(
         context_source.global_instructions(),
         context_baseline,
     )?;
+    checkpoint.restore_reasoning(reasoning);
+    #[cfg(target_family = "wasm")]
+    let checkpoint = code_only_checkpoint(checkpoint, &runtime);
     Ok(PreparedCheckpoint {
         checkpoint,
         runtime,

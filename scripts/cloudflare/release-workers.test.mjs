@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { existsSync, writeFileSync, readFileSync, statSync, mkdtempSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DeploymentLedgerError } from './deployment-ledger.mjs';
 import { releaseWorkers, releasePhases, prepareReleasePhase, guardedCommand, accountHealth } from './release-workers.mjs';
 function fixture(selected, overrides = {}) {
   const events = [], calls = [];
@@ -28,6 +29,9 @@ test('all selected Workers preserve dependency barriers, literal arguments and a
     const next = releasePhases[i].map(name => f.events.findIndex(row => row[0] === 'start' && row[1] === name));
     assert.ok(Math.max(...previous) < Math.min(...next));
   }
+  assert.ok(f.events.findIndex(row => row[0] === 'success' && row[1] === 'managed')
+    < f.events.findIndex(row => row[0] === 'start' && row[1] === 'egress'),
+  'publish the private PhoneProvider entry point before the egress binding');
   for (const { command } of f.calls) {
     assert.equal(command[command.indexOf('--message') + 1], f.options.env.DEPLOY_MESSAGE);
     assert.equal(command[command.indexOf('--tag') + 1], `nc-ci-${'a'.repeat(64)}`);
@@ -43,12 +47,12 @@ test('all selected Workers preserve dependency barriers, literal arguments and a
 });
 
 test('phase failure waits for siblings, records failure, and blocks dependent deployments', async () => {
-  const f = fixture(['egress', 'x', 'managed', 'account']);
-  f.options.run = async (_, { directory }) => { if (directory === 'js/egress') throw Error('deploy failed'); await new Promise(resolve => setImmediate(resolve)); return true; };
+  const f = fixture(['email', 'dialog', 'account']);
+  f.options.run = async (_, { directory }) => { if (directory === 'js/email') throw Error('deploy failed'); await new Promise(resolve => setImmediate(resolve)); return true; };
   await assert.rejects(f.release(), /Release phase failed/);
-  assert.ok(f.events.some(row => row[0] === 'failure' && row[1] === 'egress'));
-  assert.ok(f.events.some(row => row[0] === 'success' && row[1] === 'x'));
-  assert.ok(!f.events.some(row => ['managed', 'account'].includes(row[1])));
+  assert.ok(f.events.some(row => row[0] === 'failure' && row[1] === 'email'));
+  assert.ok(f.events.some(row => row[0] === 'success' && row[1] === 'dialog'));
+  assert.ok(!f.events.some(row => row[1] === 'account'));
 });
 
 test('supersession before deployment avoids ledger writes and guarded skips cannot become successes', async () => {
@@ -86,7 +90,7 @@ test('Astra secrets use a private temporary file in the single tagged guarded de
 });
 
 test('health failures cannot certify account, managed, or any API-only phase', async () => {
-  for (const selected of [['account'], ['managed'], ['x'], ['egress', 'x'], ['email', 'astra']]) {
+  for (const selected of [['account'], ['managed'], ['x'], ['egress'], ['email', 'astra']]) {
     const f = fixture(selected, { health: async () => { f.events.push(['health']); throw Error('unhealthy'); } });
     await assert.rejects(f.release(), /Release phase failed/);
     assert.equal(f.events.filter(row => row[0] === 'health').length, 1);
@@ -211,11 +215,11 @@ test('preparation failure preserves earlier releases and blocks dependent upload
   const f = fixture(['egress', 'managed', 'account']), prepared = [];
   f.options.prepare = async plan => {
     prepared.push(...plan.selected);
-    if (plan.selected.includes('managed')) throw Error('synthetic build failure');
+    if (plan.selected.includes('egress')) throw Error('synthetic build failure');
   };
   await assert.rejects(f.release(), /phase preparation failed/);
-  assert.deepEqual(prepared, ['egress', 'managed']);
-  assert.deepEqual(f.events, [['start', 'egress'], ['health'], ['success', 'egress']]);
+  assert.deepEqual(prepared, ['managed', 'egress']);
+  assert.deepEqual(f.events, [['start', 'managed'], ['health'], ['success', 'managed']]);
 });
 
 test('superseded phases skip compilation and freshness is rechecked after building', async () => {
@@ -305,4 +309,35 @@ test('managed releases enter the CRM migration/upload boundary with their pinned
   await f.release();
   assert.deepEqual(f.calls[0].command.slice(0, 5), [process.execPath, '../../scripts/cloudflare/managed-crm.mjs', 'deploy', '--config', 'wrangler.ci.jsonc']);
   assert.ok(f.calls[0].command.includes('--containers-rollout'));
+});
+
+
+test('admission failure identifies Worker and GitHub status without leaking provider output', async () => {
+  const f = fixture(['managed', 'account']);
+  f.options.ledger.start = async () => { throw new DeploymentLedgerError(422); };
+  await assert.rejects(f.release(), /managed ledger admission: .*GitHub HTTP 422/);
+  assert.equal(f.calls.length, 0);
+  assert.deepEqual(f.events, []);
+});
+
+test('freshness and completion failures retain safe stage diagnostics and block dependencies', async () => {
+  const freshness = fixture(['managed', 'account']);
+  let checks = 0;
+  freshness.options.isCurrent = async () => {
+    if (++checks > 1) throw Error('synthetic-private-provider-output');
+    return true;
+  };
+  await assert.rejects(freshness.release(), error => {
+    assert.match(error.message, /managed freshness check/);
+    assert.ok(!error.message.includes('synthetic-private'));
+    assert.ok(!error.cause);
+    return true;
+  });
+  assert.equal(freshness.calls.length, 0);
+  const completion = fixture(['managed', 'account']);
+  completion.options.ledger.finish = async (_, state) => {
+    if (state === 'success') throw new DeploymentLedgerError(403);
+  };
+  await assert.rejects(completion.release(), /managed completion receipt: .*GitHub HTTP 403/);
+  assert.equal(completion.calls.length, 1);
 });

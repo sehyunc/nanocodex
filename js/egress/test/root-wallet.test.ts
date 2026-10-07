@@ -10,6 +10,47 @@ import type { EgressEnv } from "../src/egress";
 const workerEnv = env as unknown as EgressEnv;
 
 describe("per-user root wallets", () => {
+  it("reads only public committed identity through the control route and RPC", async () => {
+    const owner = "wallet-identity-rpc";
+    const missing = await SELF.fetch(`https://broker.internal/users/${owner}/wallet/identity`);
+    expect(missing.status).toBe(404);
+    const wallet = await provision(owner);
+    const response = await SELF.fetch(`https://broker.internal/users/${owner}/wallet/identity`);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(wallet);
+    const identity = await workerEnv.USER_CREDENTIALS.getByName(owner).readWalletIdentity();
+    expect(identity).toEqual(wallet);
+    expect(Object.keys(identity!).sort()).toEqual(["address", "created_at"]);
+  });
+
+  it("returns identity while an unrelated credential operation waits on its provider", async () => {
+    const user = "wallet-identity-queue";
+    const wallet = await provision(user);
+    const control = async (action: string) => {
+      const response = await fetch("https://rpc.tempo.xyz/__wallet-balance-fixture", {
+        method: "POST", body: JSON.stringify({ action, account: wallet.address }),
+      });
+      return response.json<{ started: boolean }>();
+    };
+    await control("hold");
+    let pending: Promise<Response> | undefined;
+    try {
+      pending = SELF.fetch(`https://broker.internal/users/${user}/wallet/balance`);
+      for (let attempt = 0; !(await control("status")).started; attempt++) {
+        expect(attempt).toBeLessThan(100);
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      const identityRequest = SELF.fetch(`https://broker.internal/users/${user}/wallet/identity`);
+      expect(await Promise.race([identityRequest.then(() => "identity"), pending.then(() => "balance")])).toBe("identity");
+      const identity = await identityRequest;
+      expect(identity.status).toBe(200);
+      expect(await identity.json()).toEqual(wallet);
+    } finally {
+      await control("clear");
+      await pending;
+    }
+  });
+
   it("provisions once, keeps root material encrypted, and separates users", async () => {
     const first = await provision("wallet-provision-a");
     const second = await provision("wallet-provision-a");
@@ -21,7 +62,7 @@ describe("per-user root wallets", () => {
 
     const metadata = await SELF.fetch("https://broker.internal/users/wallet-provision-a/wallet");
     expect(metadata.status).toBe(200);
-    expect(await metadata.json()).toEqual(first);
+    expect(await metadata.json()).toEqual({ ...first, mode: "internal", original_address: first.address });
 
     const stub = workerEnv.USER_CREDENTIALS.getByName("wallet-provision-a");
     await runInDurableObject(stub, async (_instance: UserCredentialBroker, state) => {
@@ -100,12 +141,12 @@ describe("per-user root wallets", () => {
     const wallet = await provision(user);
     const snapshot = await SELF.fetch(`https://broker.internal/users/${user}/wallet`, { headers: { accept: "application/vnd.nanocodex.wallet-snapshot+json" } });
     expect(snapshot.status).toBe(200);
-    await expect(snapshot.json()).resolves.toEqual({ ...wallet, balance: {
+    await expect(snapshot.json()).resolves.toEqual({ ...wallet, mode: "internal", original_address: wallet.address, balance: {
       account: wallet.address, balance: "12345678", decimals: 6, symbol: "MACH",
       token: "0x20c000000000000000000000f37de3740adec032",
     } });
     const metadata = await SELF.fetch(`https://broker.internal/users/${user}/wallet`);
-    await expect(metadata.json()).resolves.toEqual(wallet);
+    await expect(metadata.json()).resolves.toEqual({ ...wallet, mode: "internal", original_address: wallet.address });
   });
 
   it("keeps a stalled balance out of the credential queue and refreshes the next snapshot live", async () => {
@@ -136,13 +177,13 @@ describe("per-user root wallets", () => {
       const status = await SELF.fetch(`https://broker.internal/users/${user}/credentials`);
       await expect(status.json()).resolves.toMatchObject({ ready: false, openai: { connected: false } });
       const metadata = await SELF.fetch(`https://broker.internal/users/${user}/wallet`);
-      await expect(metadata.json()).resolves.toEqual(wallet);
+      await expect(metadata.json()).resolves.toEqual({ ...wallet, mode: "internal", original_address: wallet.address });
       const unavailable = await snapshot;
       expect(unavailable.status).toBe(200);
-      await expect(unavailable.json()).resolves.toEqual({ ...wallet, balance: null });
+      await expect(unavailable.json()).resolves.toEqual({ ...wallet, mode: "internal", original_address: wallet.address, balance: null });
       await control("release", "0x" + "0".repeat(62) + "2a");
       const recovered = await SELF.fetch(`https://broker.internal/users/${user}/wallet`, { headers: { accept: "application/vnd.nanocodex.wallet-snapshot+json" } });
-      await expect(recovered.json()).resolves.toEqual({ ...wallet, balance: {
+      await expect(recovered.json()).resolves.toEqual({ ...wallet, mode: "internal", original_address: wallet.address, balance: {
         account: wallet.address, balance: "42", decimals: 6, symbol: "MACH",
         token: "0x20c000000000000000000000f37de3740adec032",
       } });
@@ -223,7 +264,9 @@ describe("per-user root wallets", () => {
 async function provision(user: string): Promise<{ address: string; created_at: number }> {
   const response = await SELF.fetch(`https://broker.internal/users/${user}/wallet`, { method: "PUT" });
   expect(response.status).toBe(200);
-  return response.json<{ address: string; created_at: number }>();
+  const value = await response.json<{ address: string; created_at: number }>();
+  expect(Object.keys(value).sort()).toEqual(["address", "created_at"]);
+  return value;
 }
 
 function walletConnect(user: string, body: unknown): Promise<Response> {

@@ -18,6 +18,13 @@ nanocodex run "inspect the repository" --harness claude --model opus
 nanocodex --claude auth logout
 ```
 
+You can also launch `nanocodex` and use `/model` or `/model sonnet` before the
+first prompt to select Claude. The picker includes both families; model selection
+is locked once the thread starts. A missing Claude login leaves the previous
+selection intact and shows the login command. Queued input is not sent after a
+failed selection; select a model again before resubmitting. Claude-only credentials
+are sufficient when the first prompt selects a Claude model.
+
 Login opens the authorization URL and accepts the browser's `code#state` through
 private terminal input. `--no-open` prints the URL for opening manually; piped
 stdin is also accepted. Never put the code in command arguments or agent prompts.
@@ -141,7 +148,8 @@ It does not guess that the remote POST failed and replay it.
 
 Messages retries once after an explicit HTTP 401. A late rejection of an older
 token cannot invalidate its replacement. The client does not automatically replay
-403, 429, transport failures or an accepted stream. Refresh scope negotiation
+403, 429, transport failures or an accepted stream; Claude agent sessions apply
+their own bounded transient-failure retries. Refresh scope negotiation
 allows one separate POST after a definitive `invalid_scope` rejection, using the
 exact previously granted scopes. Expired refresh grants, invalid grants and an
 account-on-hold response have explicit lifecycle outcomes. Logout commits its

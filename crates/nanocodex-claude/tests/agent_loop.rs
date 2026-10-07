@@ -1,12 +1,17 @@
 //! End-to-end behavioral contract against a synthetic loopback Messages API.
 use axum::{Json, Router, response::IntoResponse, routing::post};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
+use image::{DynamicImage, ImageFormat};
 use nanocodex_agent::{Nanocodex, events::AgentEventKind};
 use nanocodex_claude::{Claude, ClaudeClient, Effort, ToolDefinition};
 use serde_json::{Value, json};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    io::Cursor,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 fn stream(blocks: Vec<Value>, stop: &str) -> String {
@@ -35,6 +40,131 @@ fn stream(blocks: Vec<Value>, stop: &str) -> String {
     emit(json!({"type":"message_delta","delta":{"stop_reason":stop},"usage":{"output_tokens":5}}));
     emit(json!({"type":"message_stop"}));
     out
+}
+
+fn png(width: u32, height: u32) -> String {
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::new_rgb8(width, height)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    STANDARD.encode(bytes.into_inner())
+}
+
+fn image_dimensions(block: &Value) -> Option<(u32, u32)> {
+    let bytes = STANDARD.decode(block["source"]["data"].as_str()?).ok()?;
+    let image = image::load_from_memory(&bytes).ok()?;
+    Some((image.width(), image.height()))
+}
+
+#[tokio::test]
+async fn calls_outside_the_catalog_get_paired_errors_and_the_turn_continues() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let unknown_name = "unknown界".repeat(10_000);
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/v1/messages",
+        post({
+            let requests = requests.clone();
+            let unknown_name = unknown_name.clone();
+            move |Json(body): Json<Value>| {
+                let requests = requests.clone();
+                let unknown_name = unknown_name.clone();
+                async move {
+                    let index = {
+                        let mut log = requests.lock().unwrap();
+                        log.push(body);
+                        log.len()
+                    };
+                    let (blocks, stop) = match index {
+                        1 => (vec![
+                            json!({"type":"tool_use","id":"denied-plan","name":"update_plan","input":{}}),
+                            json!({"type":"tool_use","id":"denied-long-name","name":unknown_name,"input":{}}),
+                        ], "tool_use"),
+                        2 => (vec![json!({"type":"tool_use","id":"corrected","name":"exec","input":{}})], "tool_use"),
+                        3 => (vec![json!({"type":"text","text":"corrected and completed"})], "end_turn"),
+                        _ => (vec![json!({"type":"tool_use","id":"denied-plan","name":"exec","input":{}})], "tool_use"),
+                    };
+                    ([("content-type", "text/event-stream")], stream(blocks, stop))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let effects = Arc::new(AtomicUsize::new(0));
+    let counter = effects.clone();
+    let (agent, _) = Nanocodex::builder(Claude::new(
+        ClaudeClient::new(reqwest::Client::new(), endpoint, "synthetic"),
+        "test",
+    ))
+    .tool(
+        ToolDefinition {
+            name: "exec".into(),
+            description: "Synthetic admitted effect".into(),
+            input_schema: json!({"type":"object"}),
+            strict: None,
+            defer_loading: false,
+        },
+        move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok("committed once".into()) }
+        },
+    )
+    .build()
+    .unwrap();
+    let outcome = agent
+        .prompt("complete using the admitted tool")
+        .await
+        .unwrap()
+        .result()
+        .await;
+    assert_eq!(outcome.unwrap().final_message(), "corrected and completed");
+    let log = requests.lock().unwrap().clone();
+    assert_eq!(log.len(), 3);
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let denied = &log[1]["messages"];
+    for (index, (id, name)) in [
+        ("denied-plan", "update_plan"),
+        ("denied-long-name", unknown_name.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(denied[1]["content"][index]["id"], id);
+        let result = &denied[2]["content"][index];
+        assert_eq!(result["tool_use_id"], id);
+        assert_eq!(result["is_error"], true);
+        let reason = result["content"].as_str().unwrap();
+        assert!(reason.len() <= 256, "denial must have a bounded reason");
+        assert!(
+            !reason.contains(name),
+            "denial must not echo the requested name"
+        );
+    }
+    let success = &log[2]["messages"][4]["content"][0];
+    assert_eq!(success["tool_use_id"], "corrected");
+    assert_eq!(success["content"], "committed once");
+
+    let reused = agent
+        .prompt("reuse the denied identity")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap_err();
+    assert!(
+        reused
+            .to_string()
+            .contains("reused an admitted tool_use id")
+    );
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        1,
+        "a denied identity cannot later authorize an effect"
+    );
+    agent.shutdown().await.unwrap();
+    server.abort();
 }
 
 #[tokio::test]
@@ -98,7 +228,7 @@ async fn stream_tool_once_compact_and_failed_turn_preserves_history() {
         let requests = requests.clone();
         async move {
             let index = { let mut r = requests.lock().unwrap(); r.push(body.clone()); r.len() };
-            if index == 5 { return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "synthetic failure".to_string()).into_response(); }
+            if index == 5 { return (axum::http::StatusCode::BAD_REQUEST, "synthetic failure".to_string()).into_response(); }
             let (blocks, reason) = match index {
                 1 => (vec![json!({"type":"text","text":"Hello "}),json!({"type":"text","text":"world"})], "end_turn"),
                 2 => (vec![json!({"type":"thinking","thinking":"","signature":"signed-tool-turn","binding":"opaque"}),json!({"type":"tool_use","id":"tool-1","name":"lookup","input":{"key":"x"}})], "tool_use"),
@@ -228,14 +358,29 @@ async fn stream_tool_once_compact_and_failed_turn_preserves_history() {
     assert!(log[3]["messages"].as_array().unwrap().len() > 4);
     // The observed Claude Code continuation installs the summary as USER
     // context, not as an API system prompt or a fabricated signed block.
-    assert_eq!(log[4]["messages"].as_array().unwrap().len(), 1);
-    assert_eq!(log[5]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(log[4]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(log[5]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        log[4]["messages"][1],
+        json!({"role":"user","content":[{"type":"text","text":"fail now"}]})
+    );
+    assert_eq!(
+        log[5]["messages"][1],
+        json!({"role":"user","content":[{"type":"text","text":"continue"}]})
+    );
+    assert_eq!(
+        log[4]["messages"][0], log[5]["messages"][0],
+        "a failed turn must preserve the prior summary"
+    );
     let resumed = log[5]["messages"][0]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(resumed.starts_with("This session is being continued from a previous conversation"));
+    assert_eq!(log[5]["messages"][0]["role"], "user");
     assert!(resumed.contains("SUMMARY: user greeting"));
-    assert!(resumed.contains("continue"));
+    assert!(
+        !resumed.contains("fail now"),
+        "failed input must not enter retained history"
+    );
     assert!(log[5].get("system").is_none());
     server.abort();
 }
@@ -263,7 +408,7 @@ async fn failed_compaction_and_cancelled_turn_keep_previous_context() {
                     };
                     match index {
                         2 => (
-                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::http::StatusCode::BAD_REQUEST,
                             "synthetic compact failure".to_string(),
                         )
                             .into_response(),
@@ -424,7 +569,11 @@ async fn auto_compacts_at_usage_threshold_before_next_prompt() {
         .as_str()
         .unwrap();
     assert!(next.contains("carry first answer"));
-    assert!(next.contains("second"));
+    assert_eq!(log[2]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        log[2]["messages"][1],
+        json!({"role":"user","content":[{"type":"text","text":"second"}]})
+    );
     assert!(!next.contains("first answer\n\nfirst answer"));
     server.abort();
 }
@@ -629,7 +778,11 @@ async fn compaction_accepts_latest_model_thinking_before_text_summary() {
         .unwrap();
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[2]["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(requests[2]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        requests[2]["messages"][1],
+        json!({"role":"user","content":[{"type":"text","text":"second"}]})
+    );
     assert!(
         requests[2]["messages"][0]["content"][0]["text"]
             .as_str()
@@ -662,7 +815,7 @@ async fn claude_client_tool_can_return_multimodal_blocks_without_codex_result_sh
     );
     let (agent,_)=Nanocodex::builder(Claude::new(client,"test"))
         .tool_blocks(ToolDefinition { name:"ReadImage".into(), description:"Test image".into(), input_schema:json!({"type":"object"}),strict:None,defer_loading:false }, |_| async {
-            Ok(vec![json!({"type":"text","text":"image follows"}),json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"cG5n"}})])
+            Ok(vec![json!({"type":"text","text":"image follows"}),json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":png(1, 1)}})])
         }).build().unwrap();
     assert_eq!(
         agent
@@ -678,9 +831,120 @@ async fn claude_client_tool_can_return_multimodal_blocks_without_codex_result_sh
     let log = requests.lock().unwrap();
     assert_eq!(
         log[1]["messages"][2]["content"][0]["content"][1]["source"]["data"],
-        "cG5n"
+        png(1, 1)
     );
     assert_eq!(log[1]["messages"][2]["content"][0]["type"], "tool_result");
+    server.abort();
+}
+
+#[tokio::test]
+async fn tool_images_fit_many_image_limit_before_history_crosses_twenty() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let log = requests.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(body): Json<Value>| {
+            let log = log.clone();
+            async move {
+                // Mirror the Messages API: every image must decode, and a request
+                // with more than twenty images applies a stricter dimension limit.
+                let images: Vec<Value> = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|message| message["content"].as_array().unwrap())
+                    .flat_map(|block| block["content"].as_array().into_iter().flatten())
+                    .filter(|block| block["type"] == "image")
+                    .cloned()
+                    .collect();
+                let limit = if images.len() > 20 { 3000 } else { 8000 };
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(body);
+                    log.len()
+                };
+                if !images.iter().all(|image| {
+                    image_dimensions(image).is_some_and(|(width, height)| width.max(height) <= limit)
+                }) {
+                    return (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        "invalid or oversized image",
+                    )
+                        .into_response();
+                }
+                let (blocks, reason) = if index < 3 {
+                    (
+                        vec![json!({"type":"tool_use","id":format!("capture-{index}"),"name":"Capture","input":{"batch":index}})],
+                        "tool_use",
+                    )
+                } else {
+                    (vec![json!({"type":"text","text":"seen all"})], "end_turn")
+                };
+                ([("content-type", "text/event-stream")], stream(blocks, reason)).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let capture = ToolDefinition {
+        name: "Capture".into(),
+        description: "Capture synthetic screenshots".into(),
+        input_schema: json!({"type":"object"}),
+        strict: None,
+        defer_loading: false,
+    };
+    let image = |data: String| json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data}});
+    let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool_blocks(capture, move |input| {
+            let blocks = if input["batch"] == 1 {
+                vec![
+                    json!({"type":"text","text":"captured"}),
+                    image(png(4000, 200)),
+                    image("cG5n".into()),
+                ]
+            } else {
+                vec![image(png(16, 16)); 20]
+            };
+            async move { Ok(blocks) }
+        })
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent
+            .prompt("capture twice")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "seen all"
+    );
+    let log = requests.lock().unwrap();
+    assert_eq!(log.len(), 3);
+    let first = &log[1]["messages"][2];
+    let receipt = &first["content"][0];
+    assert_ne!(
+        receipt["is_error"], true,
+        "the completed effect is not an error"
+    );
+    assert_eq!(receipt["content"][0]["text"], "captured");
+    assert_eq!(image_dimensions(&receipt["content"][1]), Some((3000, 150)));
+    assert_eq!(
+        receipt["content"][2]["type"], "text",
+        "unprocessable image is omitted"
+    );
+    assert_eq!(
+        log[2]["messages"][2], *first,
+        "earlier tool images stay byte-identical once history exceeds twenty images"
+    );
     server.abort();
 }
 
@@ -1012,11 +1276,10 @@ async fn queued_user_text_counts_toward_next_compaction_decision() {
     let log = received.lock().unwrap();
     assert_eq!(log.len(), 3, "summary precedes the next main request");
     assert!(log[1]["messages"].as_array().unwrap().len() >= 2);
-    assert!(
-        log[2]["messages"][0]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains(&second)
+    assert_eq!(log[2]["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        log[2]["messages"][1],
+        json!({"role":"user","content":[{"type":"text","text":second}]})
     );
     server.abort();
 }
@@ -1615,4 +1878,514 @@ async fn steering_acknowledges_consumption_at_tool_and_terminal_boundaries() {
         agent.shutdown().await.unwrap();
         server.abort();
     }
+}
+
+/// Regression: a streamed Claude answer must not render twice. Clients (iOS
+/// InboxCore and nanocodex-react) fold the final `assistant.message` into the
+/// streamed `assistant.delta` row only when both carry the same response
+/// identity (`model_call_index`, `item_id`, `phase`). The delta used to publish
+/// `item_id: null` beside a concrete final message ID, so every answer was
+/// appended as a second, duplicate row.
+#[tokio::test]
+async fn streamed_text_and_final_message_share_one_response_identity() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(_body): Json<Value>| {
+            let received = received.clone();
+            async move {
+                let call = received.fetch_add(1, Ordering::SeqCst) + 1;
+                let (blocks, stop) = if call == 1 {
+                    (
+                        vec![
+                            json!({"type":"text","text":"Checking "}),
+                            json!({"type":"text","text":"the lookup."}),
+                            json!({"type":"tool_use","id":"tool-1","name":"lookup","input":{"key":"x"}}),
+                        ],
+                        "tool_use",
+                    )
+                } else {
+                    (vec![json!({"type":"text","text":"Found the value."})], "end_turn")
+                };
+                let response =
+                    stream(blocks, stop).replace("\"id\":\"msg\"", &format!("\"id\":\"msg_{call}\""));
+                ([("content-type", "text/event-stream")], response)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(
+            ToolDefinition {
+                name: "lookup".into(),
+                description: "Test lookup".into(),
+                input_schema: json!({"type":"object","properties":{"key":{"type":"string"}}}),
+                strict: None,
+                defer_loading: false,
+            },
+            |_input| async move { Ok("value".to_owned()) },
+        )
+        .build()
+        .unwrap();
+    let result = agent
+        .prompt("look up x")
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    assert_eq!(result.final_message(), "Found the value.");
+
+    // Project the event stream exactly like a transcript client: deltas with
+    // the same identity append to one streaming row; a final message replaces
+    // the row with a matching identity, or appends a new row otherwise.
+    type Identity = (Value, Value, Value);
+    let identity = |payload: &Value| -> Identity {
+        (
+            payload["model_call_index"].clone(),
+            payload["item_id"].clone(),
+            payload["phase"].clone(),
+        )
+    };
+    let mut rows: Vec<(Identity, String, bool)> = Vec::new();
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(event.payload.get()).unwrap();
+        match event.kind {
+            AgentEventKind::AssistantDelta => {
+                assert!(
+                    payload["item_id"].is_string(),
+                    "streamed Claude text must identify its provider message: {payload}"
+                );
+                let key = identity(&payload);
+                match rows.last_mut() {
+                    Some((last, text, false)) if *last == key => {
+                        text.push_str(payload["text"].as_str().unwrap());
+                    }
+                    _ => rows.push((key, payload["text"].as_str().unwrap().to_owned(), false)),
+                }
+            }
+            AgentEventKind::AssistantMessage => {
+                let key = identity(&payload);
+                let text = payload["text"].as_str().unwrap().to_owned();
+                match rows
+                    .iter_mut()
+                    .rev()
+                    .find(|(row, _, done)| *row == key && !done)
+                {
+                    Some(row) => {
+                        assert_eq!(row.1, text, "final text must equal its streamed text");
+                        row.2 = true;
+                    }
+                    None => rows.push((key, text, true)),
+                }
+            }
+            AgentEventKind::RunCompleted | AgentEventKind::RunFailed => break,
+            _ => {}
+        }
+    }
+    agent.shutdown().await.unwrap();
+    server.abort();
+    let texts = rows
+        .iter()
+        .map(|(_, text, _)| text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["Checking the lookup.", "Found the value."],
+        "each Claude response must render exactly once"
+    );
+    assert!(
+        rows.iter().all(|(_, _, done)| *done),
+        "every streamed row is finalized"
+    );
+    assert_ne!(
+        rows[0].0, rows[1].0,
+        "separate model calls keep separate identities"
+    );
+}
+
+/// A realtime voice frontend delegates through live routing: idle input
+/// starts a Claude turn, and input while that turn is working steers it
+/// instead of admitting a concurrent operation.
+#[tokio::test]
+async fn live_route_starts_idle_turn_and_steers_active_turn() {
+    use nanocodex_agent::PromptRoute;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let started = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/v1/messages",
+        post({
+            let requests = requests.clone();
+            move |Json(body): Json<Value>| {
+                let requests = requests.clone();
+                async move {
+                    let index = {
+                        let mut log = requests.lock().unwrap();
+                        log.push(body);
+                        log.len()
+                    };
+                    let (blocks, stop) = match index {
+                        1 => (
+                            vec![json!({"type":"tool_use","id":"held","name":"hold","input":{}})],
+                            "tool_use",
+                        ),
+                        2 => (
+                            vec![json!({"type":"text","text":"Booked and noted the window seat."})],
+                            "end_turn",
+                        ),
+                        _ => (
+                            vec![json!({"type":"text","text":"Second turn."})],
+                            "end_turn",
+                        ),
+                    };
+                    (
+                        [("content-type", "text/event-stream")],
+                        stream(blocks, stop),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let (agent, _events) = Nanocodex::builder(Claude::new(client, "claude-opus-5-5"))
+        .tool(
+            ToolDefinition {
+                name: "hold".into(),
+                description: "Held tool".into(),
+                input_schema: json!({"type":"object"}),
+                strict: None,
+                defer_loading: false,
+            },
+            {
+                let started = started.clone();
+                let release = release.clone();
+                move |_| {
+                    let started = started.clone();
+                    let release = release.clone();
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok("booked".into())
+                    }
+                }
+            },
+        )
+        .build()
+        .unwrap();
+
+    let PromptRoute::Started(turn) = agent.route_prompt("book the flight").await.unwrap() else {
+        panic!("idle live input must start a turn");
+    };
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            agent
+                .route_prompt("and ask for a window seat")
+                .await
+                .unwrap(),
+            PromptRoute::Steered
+        ),
+        "live input during an active turn must steer it"
+    );
+    release.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), turn.result())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.final_message(), "Booked and noted the window seat.");
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            2,
+            "steering must not admit a concurrent model call"
+        );
+        let continuation = log[1]["messages"].to_string();
+        assert!(
+            continuation.contains("and ask for a window seat"),
+            "steered voice input reaches the active turn: {continuation}"
+        );
+    }
+
+    let PromptRoute::Started(next) = agent.route_prompt("anything else?").await.unwrap() else {
+        panic!("input after the active turn finished must start a new turn");
+    };
+    assert_eq!(next.result().await.unwrap().final_message(), "Second turn.");
+    agent.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// Managed attachments reach Claude as native content blocks: inline images
+/// become image blocks and inline PDFs/text become document blocks, with
+/// explicit errors for unsupported or mislabeled media before any request.
+#[tokio::test]
+async fn prompt_images_and_documents_become_native_claude_blocks() {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use nanocodex_agent::input::{Prompt, UserInput};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let log = requests.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(body): Json<Value>| {
+            let log = log.clone();
+            async move {
+                log.lock().unwrap().push(body);
+                (
+                    [("content-type", "text/event-stream")],
+                    stream(vec![json!({"type":"text","text":"Read both."})], "end_turn"),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let (agent, _) = Nanocodex::builder(Claude::new(client, "claude-opus-5-5"))
+        .build()
+        .unwrap();
+    let png = STANDARD.encode(b"\x89PNG\r\n\x1a\nsynthetic");
+    let pdf = STANDARD.encode(b"%PDF-1.7\nsynthetic invoice\n%%EOF");
+    let notes = STANDARD.encode("Quarterly notes: revenue up.".as_bytes());
+    let prompt = Prompt::content([
+        UserInput::Text {
+            text: "Compare the chart with the invoice.".into(),
+        },
+        UserInput::Image {
+            image_url: format!("data:image/png;base64,{png}"),
+            detail: None,
+        },
+        UserInput::File {
+            file_data: format!("data:application/pdf;base64,{pdf}"),
+            filename: Some("invoice.pdf".into()),
+        },
+        UserInput::File {
+            file_data: format!("data:text/plain;base64,{notes}"),
+            filename: None,
+        },
+    ]);
+    let result = agent.prompt(prompt).await.unwrap().result().await.unwrap();
+    assert_eq!(result.final_message(), "Read both.");
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(
+            log[0]["messages"][0]["content"],
+            json!([
+                {"type":"text","text":"Compare the chart with the invoice."},
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":png}},
+                {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":pdf},"title":"invoice.pdf"},
+                {"type":"document","source":{"type":"text","media_type":"text/plain","data":"Quarterly notes: revenue up."}},
+            ])
+        );
+    }
+
+    let rejected = |file_data: String, filename: Option<&str>| {
+        Prompt::content([UserInput::File {
+            file_data,
+            filename: filename.map(str::to_owned),
+        }])
+    };
+    for (prompt, expected) in [
+        (
+            rejected(format!("data:application/zip;base64,{pdf}"), None),
+            "application/pdf and text/plain",
+        ),
+        (
+            rejected(format!("data:application/pdf;base64,{png}"), None),
+            "does not match",
+        ),
+        (
+            rejected("https://example.com/invoice.pdf".into(), None),
+            "base64 data URL",
+        ),
+        (
+            rejected(
+                format!("data:application/pdf;base64,{pdf}"),
+                Some("../etc/passwd"),
+            ),
+            "filename",
+        ),
+        (
+            Prompt::content((0..6).map(|_| UserInput::File {
+                file_data: format!("data:application/pdf;base64,{pdf}"),
+                filename: None,
+            })),
+            "5 documents",
+        ),
+    ] {
+        let error = match agent.prompt(prompt).await {
+            Err(error) => error.to_string(),
+            Ok(turn) => turn
+                .result()
+                .await
+                .expect_err("invalid media must fail")
+                .to_string(),
+        };
+        assert!(
+            error.contains(expected),
+            "{error} should mention {expected}"
+        );
+    }
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "invalid media never reaches the provider"
+    );
+    agent.shutdown().await.unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn truncated_complete_tool_block_is_never_dispatched_or_finalized() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let received = requests.clone();
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |Json(body): Json<Value>| {
+            let received = received.clone();
+            async move {
+                let call = {
+                    let mut log = received.lock().unwrap();
+                    log.push(body);
+                    log.len()
+                };
+                let response = if call == 1 {
+                    let complete = stream(
+                        vec![
+                            json!({"type":"text","text":"partial progress"}),
+                            json!({"type":"tool_use","id":"unsafe","name":"mutate","input":{}}),
+                        ],
+                        "tool_use",
+                    );
+                    complete[..complete.rfind("data: {\"type\":\"message_stop\"}").unwrap()]
+                        .to_owned()
+                } else {
+                    stream(
+                        vec![json!({"type":"text","text":"explicit recovery"})],
+                        "end_turn",
+                    )
+                };
+                ([("content-type", "text/event-stream")], response)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let tools = Arc::new(AtomicUsize::new(0));
+    let counter = tools.clone();
+    let client = ClaudeClient::new(
+        reqwest::Client::new(),
+        format!("http://{address}/v1/messages"),
+        "synthetic",
+    );
+    let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(
+            ToolDefinition {
+                name: "mutate".into(),
+                description: "Synthetic mutation".into(),
+                input_schema: json!({"type":"object"}),
+                strict: None,
+                defer_loading: false,
+            },
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok("must not execute".to_owned()) }
+            },
+        )
+        .build()
+        .unwrap();
+    let failed = agent
+        .prompt("perform one mutation")
+        .await
+        .unwrap()
+        .result()
+        .await;
+    assert!(failed.is_err());
+    assert_eq!(
+        tools.load(Ordering::SeqCst),
+        0,
+        "missing terminal cannot authorize dispatch"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "accepted incomplete request must not be retried"
+    );
+    loop {
+        let event = events.next().await.unwrap();
+        assert_ne!(
+            event.kind,
+            AgentEventKind::AssistantMessage,
+            "no canonical success from partial stream"
+        );
+        assert_ne!(
+            event.kind,
+            AgentEventKind::ToolCall,
+            "no tools from partial stream"
+        );
+        if event.kind == AgentEventKind::RunFailed {
+            break;
+        }
+    }
+    assert_eq!(
+        agent
+            .prompt("continue explicitly")
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "explicit recovery"
+    );
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        assert!(
+            !log[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == "assistant"),
+            "partial text and complete-looking tool block cannot enter replay history"
+        );
+    }
+    agent.shutdown().await.unwrap();
+    server.abort();
 }

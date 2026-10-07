@@ -2,16 +2,21 @@
 //! Failure cases defined before implementation: terminal receipt replay after
 //! restart; completed tool receipts after a failed provider continuation; live
 //! cancellation after an effect starts (unknown outcome, never dispatched again);
-//! signed/opaque compaction suffixes and container/discovery state across reopen.
+//! opaque compaction suffixes and container/discovery state across reopen.
 //! Pending effects after a process crash follow the store's at-least-once policy.
 #![cfg(all(feature = "claude", feature = "sqlite"))]
 
 use axum::{Json, Router, response::IntoResponse, routing::post};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::{DynamicImage, ImageFormat};
 use nanocodex_agent::{Nanocodex, PromptRequest};
 use nanocodex_claude::{Claude, ClaudeClient, ToolDefinition};
-use nanocodex_durability::{DurableAgentExt, DurableSession, SqliteStore};
+use nanocodex_durability::{DurableAgentExt, DurableSession, SqliteStore, StepStatus};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    io::Cursor,
+    sync::{Arc, Mutex},
+};
 
 fn sse(blocks: Vec<Value>, stop: &str, input: u64) -> String {
     let mut frames = vec![
@@ -121,6 +126,13 @@ fn tool() -> ToolDefinition {
         defer_loading: false,
     }
 }
+fn png_block(width: u32, height: u32) -> Value {
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::new_rgb8(width, height)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":STANDARD.encode(bytes.into_inner())}})
+}
 
 #[tokio::test]
 async fn completed_request_receipt_replays_after_sqlite_reopen() {
@@ -178,22 +190,79 @@ fn signed_round() -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn completed_effect_and_signed_compaction_suffix_survive_reopen() {
+async fn retried_model_call_receipt_replays_after_sqlite_reopen() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.sqlite");
-    let (client, requests, server) = server(|index, _| match index {
+    let (client, requests, server) = server(|index, request| {
+        if index == 1 {
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n".into()
+        } else if request["messages"].to_string().contains("tool_result") {
+            sse(text("completed after retry"), "end_turn", 10)
+        } else {
+            sse(signed_round(), "tool_use", 10)
+        }
+    })
+    .await;
+    let effects = Arc::new(AtomicUsize::new(0));
+    for _ in 0..2 {
+        let counter = effects.clone();
+        let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+            .tool(tool(), move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async { Ok("committed once".into()) }
+            })
+            .durability(reopen(&path).await)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let result = agent
+            .prompt(PromptRequest::new("perform effect once").request_id("retried-request"))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        assert_eq!(result.final_message(), "completed after retry");
+        assert_eq!(result.usage().unwrap().total_tokens(), 30);
+        agent.shutdown().await.unwrap();
+        drop((agent, events));
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let log = requests.lock().unwrap();
+    assert_eq!(log.len(), 3, "replay must not call the provider");
+    assert_eq!(log[0], log[1], "a retry resends the admitted request");
+    server.abort();
+}
+
+#[tokio::test]
+async fn completed_effect_and_opaque_compaction_suffix_survive_reopen() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let fresh = vec![
+        json!({"type":"thinking","thinking":"reconcile receipt","signature":"replacement-prefix"}),
+        json!({"type":"text","text":"recovered"}),
+    ];
+    let recovered = fresh.clone();
+    let (client, requests, server) = server(move |index, _| match index {
         1 => sse(signed_round(), "tool_use", 70_000),
         2 => sse(text("Preserve the original task."), "end_turn", 10),
         3 => "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"synthetic followup failure\"}}\n\n".into(),
-        _ => sse(text("recovered"), "end_turn", 10),
+        4 => sse(recovered.clone(), "end_turn", 10),
+        _ => sse(text("reviewed"), "end_turn", 10),
     }).await;
     let effects = Arc::new(AtomicUsize::new(0));
     let receipt = vec![
         json!({"type":"text","text":"effect committed"}),
-        json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"cG5n"}}),
+        png_block(1, 1),
     ];
-    for recovery in [false, true] {
+    for (prompt, expected) in [
+        ("perform effect once", None),
+        ("reconcile existing receipt", Some("recovered")),
+        ("review after restart", Some("reviewed")),
+    ] {
         let counter = effects.clone();
         let returned = receipt.clone();
         let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
@@ -209,34 +278,29 @@ async fn completed_effect_and_signed_compaction_suffix_survive_reopen() {
             .build()
             .unwrap();
         let result = agent
-            .prompt(
-                PromptRequest::new(if recovery {
-                    "reconcile existing receipt"
-                } else {
-                    "perform effect once"
-                })
-                .request_id(if recovery { "recovery" } else { "first" }),
-            )
+            .prompt(PromptRequest::new(prompt).request_id(prompt))
             .await
             .unwrap()
             .result()
             .await;
-        if recovery {
-            assert_eq!(result.unwrap().final_message(), "recovered");
-        } else {
-            assert!(result.is_err());
+        match expected {
+            Some(expected) => assert_eq!(result.unwrap().final_message(), expected),
+            None => assert!(result.is_err()),
         }
         agent.shutdown().await.unwrap();
         drop((agent, events));
     }
     let log = requests.lock().unwrap();
-    assert_eq!(log.len(), 4);
+    assert_eq!(log.len(), 5);
     assert_eq!(
         effects.load(Ordering::SeqCst),
         1,
         "completed effects must not repeat after reopen"
     );
-    assert_eq!(log[2]["messages"][1]["content"], json!(signed_round()));
+    assert_eq!(
+        log[2]["messages"][1]["content"],
+        json!(&signed_round()[2..])
+    );
     assert_eq!(
         log[2]["messages"][2]["content"][0]["content"],
         json!(receipt)
@@ -244,6 +308,11 @@ async fn completed_effect_and_signed_compaction_suffix_survive_reopen() {
     assert_eq!(
         &log[3]["messages"].as_array().unwrap()[..3],
         log[2]["messages"].as_array().unwrap()
+    );
+    assert_eq!(
+        log[4]["messages"][4]["content"],
+        json!(fresh),
+        "reasoning received after compaction remains replayable after reopen"
     );
     assert_eq!(log[3]["container"], "stable-container");
     assert_eq!(log[0]["tools"], log[3]["tools"]);
@@ -312,7 +381,10 @@ async fn live_interrupted_effect_is_unknown_after_compaction_and_reopen() {
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     let log = requests.lock().unwrap().clone();
     assert_eq!(log.len(), 3);
-    assert_eq!(log[2]["messages"][1]["content"], json!(signed_round()));
+    assert_eq!(
+        log[2]["messages"][1]["content"],
+        json!(&signed_round()[2..])
+    );
     let unknown = &log[2]["messages"][2]["content"][0];
     assert_eq!(unknown["tool_use_id"], "effect-once");
     assert_eq!(unknown["is_error"], true);
@@ -329,6 +401,7 @@ async fn live_interrupted_effect_is_unknown_after_compaction_and_reopen() {
 
 #[tokio::test]
 async fn discovery_and_container_survive_restart_then_compaction_requires_rediscovery() {
+    use nanocodex_claude::{ClaudeToolReply, ClaudeTools, ToolResultContent};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state.sqlite");
@@ -344,6 +417,21 @@ async fn discovery_and_container_survive_restart_then_compaction_requires_redisc
         let counter = effects.clone();
         let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
             .client_tool_search()
+            .tools_factory(|_| {
+                let mut search = tool();
+                search.name = "ToolSearch".into();
+                search.defer_loading = false;
+                Ok(ClaudeTools::new().custom_tool_search().tool_with_context(
+                    search,
+                    |_, _| async {
+                        // Preserve a pre-fix/custom discovery receipt in SQLite.
+                        Ok(ClaudeToolReply::success(ToolResultContent::Blocks(vec![
+                            json!({"type":"tool_reference","tool_name":"effect"}),
+                            json!({"type":"text","text":"retained discovery details"}),
+                        ])))
+                    },
+                ))
+            })
             .tool(deferred, move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
                 async { Ok("receipt".into()) }
@@ -378,6 +466,22 @@ async fn discovery_and_container_survive_restart_then_compaction_requires_redisc
     let log = requests.lock().unwrap();
     assert_eq!(log.len(), 6);
     assert_eq!(effects.load(Ordering::SeqCst), 1);
+    for request in &*log {
+        for message in request["messages"].as_array().unwrap() {
+            for receipt in message["content"].as_array().unwrap() {
+                if let Some(blocks) = receipt["content"].as_array()
+                    && blocks.iter().any(|b| b["type"] == "tool_reference")
+                {
+                    assert!(blocks.iter().all(|b| b["type"] == "tool_reference"));
+                }
+            }
+        }
+    }
+    assert!(
+        log[2]["messages"]
+            .to_string()
+            .contains("retained discovery details")
+    );
     assert!(log[2]["messages"].to_string().contains("tool_reference"));
     assert!(!log[5]["messages"].to_string().contains("tool_reference"));
     assert_eq!(log[2]["container"], "stable-container");
@@ -538,6 +642,7 @@ enum CompactionJourney {
     Automatic,
     ContextRecovery,
     ExhaustionAfterRecovery,
+    OutputExhaustion,
 }
 
 async fn transaction_recovery(
@@ -545,8 +650,20 @@ async fn transaction_recovery(
     after_commit: bool,
     journey: CompactionJourney,
 ) -> usize {
-    let context_exhaustion = !matches!(journey, CompactionJourney::Automatic);
-    let repeated_exhaustion = matches!(journey, CompactionJourney::ExhaustionAfterRecovery);
+    let context_exhaustion = matches!(
+        journey,
+        CompactionJourney::ContextRecovery | CompactionJourney::ExhaustionAfterRecovery
+    );
+    let output_exhaustion = matches!(journey, CompactionJourney::OutputExhaustion);
+    let repeated_exhaustion = matches!(
+        journey,
+        CompactionJourney::ExhaustionAfterRecovery | CompactionJourney::OutputExhaustion
+    );
+    let terminal_error = if output_exhaustion {
+        "after 3 continuations"
+    } else {
+        "context window exhausted after recovery"
+    };
     use nanocodex_claude_tools::ClaudeTasks;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let directory = tempfile::tempdir().unwrap();
@@ -554,7 +671,7 @@ async fn transaction_recovery(
     let (client, requests, server) = server(move |_, request| {
         if request["tool_choice"]["type"] == "none" {
             return sse(
-                text("Retain the synthetic task and committed receipt."),
+                text("Retain the synthetic task and committed receipt. completed-fetch"),
                 "end_turn",
                 10,
             );
@@ -565,28 +682,29 @@ async fn transaction_recovery(
             .iter()
             .flat_map(|message| message["content"].as_array().unwrap())
             .any(|block| block["type"] == "tool_result");
+        let summarized_receipt = request["messages"]
+            .to_string()
+            .contains("Retain the synthetic task and committed receipt.");
         if context_exhaustion
             && has_receipt
-            && !request["messages"].to_string().contains("signed-exhaustion")
+            && !request["messages"].to_string().contains("completed-fetch")
         {
             sse(
                 vec![
                     json!({"type":"thinking","thinking":"partial reasoning","signature":"signed-exhaustion"}),
-                    json!({"type":"server_tool_use","id":"completed-fetch","name":"web_fetch","input":{"url":"https://example.org"}}),
-                    json!({"type":"web_fetch_tool_result","tool_use_id":"completed-fetch","content":{"type":"web_fetch_result","url":"https://example.org","content":"page"}}),
                     json!({"type":"text","text":"partial answer"}),
                 ],
                 "model_context_window_exceeded",
                 10,
             )
-        } else if has_receipt {
+        } else if has_receipt || summarized_receipt {
             sse(
                 text("completed exactly once"),
-                if repeated_exhaustion { "model_context_window_exceeded" } else { "end_turn" },
+                if output_exhaustion { "max_tokens" } else if repeated_exhaustion { "model_context_window_exceeded" } else { "end_turn" },
                 10,
             )
         } else {
-            sse(signed_round(), "tool_use", if context_exhaustion { 10 } else { 70_000 })
+            sse(signed_round(), if output_exhaustion { "max_tokens" } else { "tool_use" }, if context_exhaustion || output_exhaustion { 10 } else { 70_000 })
         }
     })
     .await;
@@ -611,8 +729,9 @@ async fn transaction_recovery(
         || PromptRequest::new("complete one synthetic effect").request_id("transaction-request");
     let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
         .auto_compact_window_tokens(100_000)
-        .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
         .tasks(board.clone())
+        // This fixture mutates only the restored, receipt-coupled task board.
+        .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe)
         .tool(tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
             let board = handler_board.clone();
@@ -640,12 +759,7 @@ async fn transaction_recovery(
             "injected write {fail_at:?}/{after_commit} must interrupt the first driver"
         );
     } else if repeated_exhaustion {
-        assert!(
-            first
-                .unwrap_err()
-                .to_string()
-                .contains("context window exhausted after recovery")
-        );
+        assert!(first.unwrap_err().to_string().contains(terminal_error));
     } else {
         first.unwrap();
     }
@@ -662,8 +776,9 @@ async fn transaction_recovery(
         .automatic_cache(true)
         .adaptive_thinking()
         .auto_compact_window_tokens(50_000)
-        .server_tool(nanocodex_claude::ServerToolDefinition::web_fetch_basic(1))
-        .tasks(board.clone());
+        .tasks(board.clone())
+        // This fixture mutates only the restored, receipt-coupled task board.
+        .tool_replay_safety("effect", nanocodex_agent::ReplaySafety::Safe);
     if !after_commit || effects.load(Ordering::SeqCst) == 0 {
         builder = builder.tool(tool(), move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -676,6 +791,12 @@ async fn transaction_recovery(
                     )
                     .await
             }
+        });
+    } else {
+        // Keep current declaration authority for fresh inference, without restoring
+        // the old handler: the committed receipt must bypass this sentinel.
+        builder = builder.tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
         });
     }
     let (agent, events) = builder
@@ -691,9 +812,7 @@ async fn transaction_recovery(
     if repeated_exhaustion {
         let error = result.unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("context window exhausted after recovery"),
+            error.to_string().contains(terminal_error),
             "recovery at {fail_at:?}/{after_commit}: {error}"
         );
     } else {
@@ -745,10 +864,24 @@ async fn transaction_recovery(
     if context_exhaustion {
         let log = requests.lock().unwrap();
         let continuation = log.last().unwrap()["messages"].to_string();
-        assert!(continuation.contains("signed-exhaustion"));
+        assert!(continuation.contains("Retain the synthetic task and committed receipt."));
+        assert!(!continuation.contains("signed-exhaustion"));
         assert!(continuation.contains("completed-fetch"));
         if after_commit || fail_at.is_none() {
             assert_eq!(log.len(), 4, "committed model responses must not repeat");
+        }
+    }
+    if output_exhaustion {
+        let log = requests.lock().unwrap();
+        let continuation = log.last().unwrap()["messages"].to_string();
+        assert!(continuation.contains("opaque-signature"));
+        assert!(continuation.contains("tool_result"));
+        if after_commit || fail_at.is_none() {
+            assert_eq!(
+                log.len(),
+                4,
+                "restart must retain the three-continuation cap and replay committed provider responses"
+            );
         }
     }
     let replay = match agent.prompt(request()).await {
@@ -790,6 +923,122 @@ async fn context_exhaustion_recovers_across_every_sqlite_write() {
             for ordinal in 0..count {
                 transaction_recovery(Some(ordinal), after_commit, journey).await;
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn image_receipt_stays_original_while_replayed_history_is_bounded() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = server(|index, _| match index {
+        1 => sse(signed_round(), "tool_use", 10),
+        _ => sse(text("image receipt restored"), "end_turn", 10),
+    })
+    .await;
+    let request = || PromptRequest::new("capture a synthetic image once").request_id("capture");
+    let receipt = vec![
+        json!({"type":"text","text":"capture committed"}),
+        png_block(9001, 1),
+    ];
+    let lost_ack = Arc::new(AtomicBool::new(false));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let state = DurableSession::open(
+        FaultStore {
+            inner: SqliteStore::open(&path).unwrap(),
+            writes: Arc::new(AtomicUsize::new(0)),
+            fail_at: None,
+            after_commit: true,
+            fail_when_armed: Some(lost_ack.clone()),
+        },
+        "claude-synthetic",
+    )
+    .await
+    .unwrap();
+    let build = |state| {
+        let arm = lost_ack.clone();
+        let counter = effects.clone();
+        let returned = receipt.clone();
+        Nanocodex::builder(Claude::new(client.clone(), "test"))
+            .tool_blocks(tool(), move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                // The next durability write records this completed receipt.
+                // Commit it, then lose its acknowledgement before batch advance.
+                arm.store(true, Ordering::SeqCst);
+                let returned = returned.clone();
+                async move { Ok(returned) }
+            })
+            .durability(state)
+    };
+    let (agent, events) = build(state).await.unwrap().build().unwrap();
+    assert!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .is_err()
+    );
+    let _ = agent.shutdown().await;
+    drop((agent, events));
+
+    let state = reopen(&path).await;
+    let retained = state.state().await.unwrap();
+    let StepStatus::Completed(output) =
+        &retained.operation("capture").unwrap().steps["tool-0-effect-once"].status
+    else {
+        panic!("the image receipt must commit before the lost acknowledgement");
+    };
+    let stored: Value = state.resolve(output).await.unwrap().decode().unwrap();
+    assert_eq!(
+        stored["result"]["content"],
+        json!(receipt),
+        "the durable receipt keeps the handler's exact output"
+    );
+    let (agent, events) = build(state).await.unwrap().build().unwrap();
+    assert_eq!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "image receipt restored"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+    let log = requests.lock().unwrap().clone();
+    assert_eq!(log.len(), 2);
+    let replayed = &log[1]["messages"][2]["content"][0]["content"];
+    assert_eq!(replayed[0], receipt[0]);
+    let prepared = STANDARD
+        .decode(replayed[1]["source"]["data"].as_str().unwrap())
+        .unwrap();
+    let prepared = image::load_from_memory(&prepared).unwrap();
+    assert_eq!(
+        (prepared.width(), prepared.height()),
+        (3000, 1),
+        "replayed provider history carries the bounded image"
+    );
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
+async fn output_exhaustion_cap_and_completed_effect_survive_every_sqlite_write() {
+    let count = transaction_recovery(None, false, CompactionJourney::OutputExhaustion).await;
+    for after_commit in [false, true] {
+        for ordinal in 0..count {
+            transaction_recovery(
+                Some(ordinal),
+                after_commit,
+                CompactionJourney::OutputExhaustion,
+            )
+            .await;
         }
     }
 }
@@ -855,7 +1104,11 @@ async fn completed_task_mutation_replays_without_handler_into_reconstructed_boar
 
     let restored_board = Arc::new(ClaudeTasks::new());
     let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
-        // The effect handler is intentionally absent from this fresh host.
+        // Fresh inference still requires current catalog authority. The original
+        // handler is gone; replay must bypass this replacement sentinel.
+        .tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
+        })
         .tasks(restored_board.clone())
         .durability(reopen(&path).await)
         .await
@@ -1280,6 +1533,9 @@ async fn recovery_missing_task_board_leaves_pending_operation_recoverable() {
     let board = Arc::new(ClaudeTasks::new());
     let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
         .tasks(board.clone())
+        .tool(tool(), |_| async {
+            panic!("committed task receipt must bypass replacement handler")
+        })
         .durability(state)
         .await
         .unwrap()
@@ -1693,7 +1949,10 @@ async fn manual_compaction_cancels_active_tool_then_preserves_safe_context_on_re
         .unwrap();
     let log = requests.lock().unwrap().clone();
     assert_eq!(log.len(), 3);
-    assert_eq!(log[2]["messages"][1]["content"], json!(signed_round()));
+    assert_eq!(
+        log[2]["messages"][1]["content"],
+        json!(&signed_round()[2..])
+    );
     let receipt = &log[2]["messages"][2]["content"][0];
     assert_eq!(receipt["tool_use_id"], "effect-once");
     assert_eq!(receipt["is_error"], true);
@@ -1915,7 +2174,7 @@ async fn uncertain_paused_server_turn_survives_compaction_cancellation_and_sqlit
             1,
             "uncertain effects must not repeat"
         );
-        assert_eq!(log[2]["messages"][1]["content"][1]["id"], "paused-mutation");
+        assert_eq!(log[2]["messages"][1]["content"][0]["id"], "paused-mutation");
         assert!(!log[1]["messages"].to_string().contains("paused-mutation"));
         for request in &log[3..] {
             assert!(
@@ -1935,7 +2194,7 @@ async fn uncertain_paused_server_turn_survives_compaction_cancellation_and_sqlit
                 .find(|text| text.contains("paused-mutation"))
                 .expect("prior server evidence");
             assert!(evidence.contains("outcome unknown"));
-            assert!(evidence.contains("opaque-paused-signature"));
+            assert!(!evidence.contains("opaque-paused-signature"));
             assert!(evidence.contains("retain-evidence"));
             assert!(evidence.contains("provider transcript truncated"));
             assert!(evidence.len() <= 66_000, "bounded UTF-8 evidence");
@@ -1962,7 +2221,9 @@ async fn uncertain_paused_server_turn_survives_compaction_cancellation_and_sqlit
 #[tokio::test]
 async fn paused_server_cursor_replays_across_store_failure_without_terminalizing() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    for after_commit in [false, true] {
+    for (after_commit, retain_authority) in
+        [(false, true), (true, true), (false, false), (true, false)]
+    {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("pending-server.sqlite");
         let armed = Arc::new(AtomicBool::new(false));
@@ -2021,48 +2282,47 @@ async fn paused_server_cursor_replays_across_store_failure_without_terminalizing
         let _ = agent.shutdown().await;
         drop((agent, events));
 
-        let (agent, events) = Nanocodex::builder(Claude::new(client, "different-model"))
-            .durability(reopen(&path).await)
-            .await
-            .unwrap()
-            .build()
-            .unwrap();
-        assert_eq!(
-            agent
-                .prompt(request())
+        for _ in 0..2 {
+            let builder = Nanocodex::builder(Claude::new(client.clone(), "different-model"));
+            let builder = if retain_authority {
+                builder
+                    .server_tool(nanocodex_claude::ServerToolDefinition::code_execution_current())
+            } else {
+                builder
+            };
+            let (agent, events) = builder
+                .durability(reopen(&path).await)
                 .await
                 .unwrap()
-                .result()
-                .await
-                .unwrap()
-                .final_message(),
-            "recovered prepared server turn"
-        );
-        let expected = if after_commit { 1 } else { 2 };
-        assert_eq!(effects.load(Ordering::SeqCst), expected);
-        assert_eq!(requests.lock().unwrap().len(), 1 + expected);
-        agent
-            .prompt(request())
-            .await
-            .unwrap()
-            .result()
-            .await
-            .unwrap();
-        assert_eq!(
-            requests.lock().unwrap().len(),
-            1 + expected,
-            "terminal replay must not execute again"
-        );
-        assert_eq!(effects.load(Ordering::SeqCst), expected);
-        agent.shutdown().await.unwrap();
-        drop((agent, events));
-        let log = requests.lock().unwrap();
-        if !after_commit {
+                .build()
+                .unwrap();
+            let result = agent.prompt(request()).await.unwrap().result().await;
+            if after_commit {
+                assert_eq!(
+                    result.unwrap().final_message(),
+                    "recovered prepared server turn"
+                );
+            } else {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("outcome is unknown"), "{error}");
+            }
             assert_eq!(
-                log[1], log[2],
-                "unfinished operation must replay its original frozen native request"
+                requests.lock().unwrap().len(),
+                2,
+                "unknown server effects and completed receipts must not redispatch HTTP, including revoked authority"
             );
+            assert_eq!(
+                effects.load(Ordering::SeqCst),
+                1,
+                "the provider mutation must execute exactly once"
+            );
+            let _ = agent.shutdown().await;
+            drop((agent, events));
         }
+        println!(
+            "Claude HTTP recovery after_commit={after_commit} retain_authority={retain_authority}: requests=2 effects=1"
+        );
+        let log = requests.lock().unwrap();
         assert!(
             log.iter()
                 .all(|request| request["model"] == "original-model")
@@ -2138,5 +2398,774 @@ async fn legacy_failed_server_snapshot_accepts_new_input_without_native_replay()
     assert!(messages.to_string().contains("outcome unknown"));
     assert_eq!(messages.to_string().matches("NEW_USER_REQUEST").count(), 1);
     assert_eq!(log[0]["container"], "legacy-container");
+    server.abort();
+}
+
+/// Tool-only host policies must not silently add lifecycle journal writes.
+/// Exercise public builders, SQLite journals, native dispatch and actual HTTP.
+#[tokio::test]
+async fn tool_only_policies_preserve_default_wire_and_durable_write_count() {
+    use nanocodex_claude::{
+        ClaudeHookFuture, ClaudeToolDecision, ClaudeToolHooks, ClaudeToolInvocation,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ToolPolicy(Arc<AtomicUsize>);
+    impl ClaudeToolHooks for ToolPolicy {
+        fn before<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a Value,
+            _: &'a ClaudeToolInvocation,
+        ) -> ClaudeHookFuture<'a, std::result::Result<ClaudeToolDecision, String>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ClaudeToolDecision::Allow)
+            })
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let (client, requests, server) = server(|index, _| {
+        if index % 2 == 1 {
+            sse(
+                vec![json!({"type":"tool_use","id":"default-effect","name":"effect","input":{}})],
+                "tool_use",
+                10,
+            )
+        } else {
+            sse(text("default-policy-answer"), "end_turn", 10)
+        }
+    })
+    .await;
+    let mut observations = Vec::new();
+    for policies in [0, 4] {
+        let session = DurableSession::open(
+            SqliteStore::open(directory.path().join(format!("policies-{policies}.sqlite")))
+                .unwrap(),
+            "default-policy-session",
+        )
+        .await
+        .unwrap();
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let mut builder = Nanocodex::builder(Claude::new(client.clone(), "test"))
+            .tool(tool(), |_| async { Ok("real-tool-receipt".into()) });
+        for _ in 0..policies {
+            builder = builder.tool_hooks(Arc::new(ToolPolicy(invoked.clone())));
+        }
+        let (agent, events) = builder
+            .durability(session.clone())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let result = agent
+            .prompt(PromptRequest::new("default host journey").request_id("default-request"))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        assert_eq!(result.final_message(), "default-policy-answer");
+        agent.shutdown().await.unwrap();
+        drop((agent, events));
+        let journal = session.state().await.unwrap();
+        assert_eq!(
+            journal.operations().len(),
+            1,
+            "tool-only host added a lifecycle operation"
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), policies);
+        observations.push(json!({"tool_policies":policies,"revision":journal.revision(),"operations":journal.operations().keys().collect::<Vec<_>>()}));
+    }
+    assert_eq!(
+        observations[0]["revision"], observations[1]["revision"],
+        "tool-only policies added lifecycle writes"
+    );
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[..2],
+        requests[2..],
+        "tool-only lifecycle defaults changed provider wire"
+    );
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../output/lifecycle-default-journal.json");
+    std::fs::write(&artifact, serde_json::to_vec_pretty(&json!({"observations":observations,"provider_requests":*requests,"observed":"identical wire and revision count; four before policies still executed"})).unwrap()).unwrap();
+    eprintln!("default lifecycle journal evidence: {}", artifact.display());
+    server.abort();
+}
+
+/// Public turn API + actual Messages HTTP + reopened SQLite receipt journey.
+#[tokio::test]
+async fn identified_steering_receipts_withdrawal_and_recovery() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("steering.sqlite");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let recovered_started = Arc::new(tokio::sync::Notify::new());
+    let recovered_release = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route("/v1/messages", post({
+        let recovered_started = recovered_started.clone();
+        let recovered_release = recovered_release.clone();
+        let started = started.clone(); let release = release.clone(); let requests = requests.clone();
+        move |Json(body): Json<Value>| {
+            let recovered_started = recovered_started.clone();
+            let recovered_release = recovered_release.clone();
+            let started = started.clone(); let release = release.clone(); let requests = requests.clone();
+            async move {
+                let index = { let mut log = requests.lock().unwrap(); log.push(body.clone()); log.len() };
+                eprintln!("{}", json!({"scenario":"identified-steering","request_index":index,"request":body}));
+                if index == 1 { started.notify_one(); release.notified().await; }
+                if index == 2 { recovered_started.notify_one(); recovered_release.notified().await; }
+                ([("content-type", "text/event-stream")], sse(text("steering completed"), "end_turn", 10)).into_response()
+            }
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(reqwest::Client::new(), endpoint, "synthetic");
+    let state = reopen(&path).await;
+    let (agent, mut events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .durability(state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let turn = agent
+        .prompt(PromptRequest::new("original").request_id("identified-turn"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    turn.steer_with_id("keep".into(), "keep constraint")
+        .await
+        .unwrap();
+    turn.steer_with_id("keep".into(), "keep constraint")
+        .await
+        .unwrap();
+    assert!(
+        turn.steer_with_id("keep".into(), "conflicting constraint")
+            .await
+            .is_err()
+    );
+    turn.steer_with_id("remove".into(), "withdraw constraint")
+        .await
+        .unwrap();
+    assert!(!turn.withdraw_steer("keep".into()).await.unwrap());
+    assert!(turn.withdraw_steer("remove".into()).await.unwrap());
+    assert!(
+        turn.steer_with_id("remove".into(), "withdraw constraint")
+            .await
+            .is_err()
+    );
+    // Fence the blocked owner and replay the unfinished operation with a real reopened store.
+    let recovered_state = reopen(&path).await;
+    let (recovered, mut recovered_events) = Nanocodex::builder(Claude::new(client, "test"))
+        .durability(recovered_state.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert!(
+        turn.steer_with_id("fenced-new".into(), "must not be accepted")
+            .await
+            .is_err(),
+        "fenced owner cannot accept fresh input"
+    );
+    let recovered_turn = recovered
+        .prompt(PromptRequest::new("original").request_id("identified-turn"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), recovered_started.notified())
+        .await
+        .unwrap();
+    recovered_turn
+        .steer_with_id("keep".into(), "keep constraint")
+        .await
+        .unwrap();
+    assert!(
+        recovered_turn
+            .steer_with_id("keep".into(), "different after restart")
+            .await
+            .is_err()
+    );
+    assert!(
+        recovered_turn
+            .steer_with_id("remove".into(), "withdraw constraint")
+            .await
+            .is_err()
+    );
+    recovered_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), recovered_turn.result())
+            .await
+            .unwrap()
+            .unwrap()
+            .final_message(),
+        "steering completed"
+    );
+    let journal = recovered_state.state().await.unwrap();
+    let operation = journal.operation("identified-turn").unwrap();
+    assert!(operation.steer_receipts.is_empty());
+    assert!(
+        !recovered_state
+            .steer_receipt("identified-turn", "keep")
+            .await
+            .unwrap()
+            .unwrap()
+            .withdrawn
+    );
+    assert!(
+        recovered_state
+            .steer_receipt("identified-turn", "remove")
+            .await
+            .unwrap()
+            .unwrap()
+            .withdrawn
+    );
+    let transcript = requests.lock().unwrap().clone();
+    assert_eq!(transcript.len(), 3);
+    let final_request = transcript.last().unwrap()["messages"].to_string();
+    assert_eq!(final_request.matches("keep constraint").count(), 1);
+    assert!(!final_request.contains("withdraw constraint"));
+    let mut markers = Vec::new();
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(50), recovered_events.next()).await
+    {
+        if event.kind == nanocodex_agent::events::AgentEventKind::RunSteered {
+            markers.push(serde_json::from_str::<Value>(event.payload.get()).unwrap());
+        }
+    }
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0]["message_id"], "keep");
+    eprintln!(
+        "{}",
+        json!({"scenario":"identified-steering","receipts":operation.steer_receipts,"consumed_markers":markers,"outcome":"dedup conflict withdrawal reopen all passed"})
+    );
+    release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), turn.result())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    recovered.shutdown().await.unwrap();
+    let _ = agent.shutdown().await;
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(10), events.next()).await {}
+    server.abort();
+}
+
+/// The native CLI uses this same public turn API without a durability policy.
+#[tokio::test]
+async fn native_identified_steering_without_durability_policy() {
+    use futures_util::StreamExt;
+    use std::time::Duration;
+    let (client, requests, server) = server(|index, _| {
+        if index == 1 {
+            sse(signed_round(), "tool_use", 10)
+        } else {
+            sse(text("native steer completed"), "end_turn", 10)
+        }
+    })
+    .await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (agent, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(tool(), {
+            let started = started.clone();
+            let release = release.clone();
+            move |_| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    Ok("native effect completed".into())
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let turn = agent.prompt("native original prompt").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    turn.steer_with_id("native-keep".into(), "native keep constraint")
+        .await
+        .unwrap();
+    turn.steer_with_id("native-keep".into(), "native keep constraint")
+        .await
+        .unwrap();
+    assert!(
+        turn.steer_with_id("native-keep".into(), "native conflicting input")
+            .await
+            .is_err()
+    );
+    turn.steer_with_id("native-remove".into(), "native withdraw constraint")
+        .await
+        .unwrap();
+    assert!(!turn.withdraw_steer("native-keep".into()).await.unwrap());
+    assert!(turn.withdraw_steer("native-remove".into()).await.unwrap());
+    assert!(
+        turn.steer_with_id("native-remove".into(), "native withdraw constraint")
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), turn.result())
+            .await
+            .unwrap()
+            .unwrap()
+            .final_message(),
+        "native steer completed"
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let final_input = requests[1]["messages"].to_string();
+    assert_eq!(final_input.matches("native keep constraint").count(), 1);
+    assert!(!final_input.contains("native withdraw constraint"));
+    let mut markers = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), events.next()).await
+    {
+        if event.kind == nanocodex_agent::events::AgentEventKind::RunSteered {
+            markers.push(serde_json::from_str::<Value>(event.payload.get()).unwrap());
+        }
+    }
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0]["message_id"], "native-keep");
+    eprintln!(
+        "{}",
+        json!({"scenario":"native-identified-steering-no-policy","requests":requests,"consumed_markers":markers,"outcome":"identified admission dedup conflict withdrawal marker all passed"})
+    );
+    agent.shutdown().await.unwrap();
+    server.abort();
+}
+
+/// Synthetic legacy continuation in the actual SQLite store, recovered through HTTP.
+#[tokio::test]
+async fn legacy_model_zero_steer_reaches_first_new_boundary_without_repeating_write() {
+    use futures_util::StreamExt;
+    use nanocodex_durability::{OwnerId, StateStore, StoreRecord};
+    use sha2::{Digest, Sha256};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy-steering.sqlite");
+    let old_started = Arc::new(tokio::sync::Notify::new());
+    let old_release = Arc::new(tokio::sync::Notify::new());
+    let resumed_started = Arc::new(tokio::sync::Notify::new());
+    let resumed_release = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/v1/messages",
+        post({
+            let old_started = old_started.clone();
+            let old_release = old_release.clone();
+            let resumed_started = resumed_started.clone();
+            let resumed_release = resumed_release.clone();
+            let requests = requests.clone();
+            move |Json(body): Json<Value>| {
+                let old_started = old_started.clone();
+                let old_release = old_release.clone();
+                let resumed_started = resumed_started.clone();
+                let resumed_release = resumed_release.clone();
+                let requests = requests.clone();
+                async move {
+                    let index = {
+                        let mut log = requests.lock().unwrap();
+                        log.push(body.clone());
+                        log.len()
+                    };
+                    eprintln!(
+                        "{}",
+                        json!({"scenario":"legacy-model-zero","request_index":index,"request":body})
+                    );
+                    if index == 3 {
+                        old_started.notify_one();
+                        old_release.notified().await;
+                    }
+                    if index == 4 {
+                        resumed_started.notify_one();
+                        resumed_release.notified().await;
+                    }
+                    let response = if index == 1 {
+                        sse(signed_round(), "tool_use", 10)
+                    } else {
+                        sse(text("legacy recovered"), "end_turn", 10)
+                    };
+                    ([("content-type", "text/event-stream")], response).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(reqwest::Client::new(), endpoint, "synthetic");
+    let writes = Arc::new(AtomicUsize::new(0));
+    let counter = writes.clone();
+    let (agent, _) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .tool(tool(), move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok("prior Write completed".into()) }
+        })
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    agent
+        .prompt(PromptRequest::new("perform prior Write").request_id("prior-write"))
+        .await
+        .unwrap()
+        .result()
+        .await
+        .unwrap();
+    let old_turn = agent
+        .prompt(PromptRequest::new("legacy active task").request_id("legacy-turn"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), old_started.notified())
+        .await
+        .unwrap();
+    // Convert only this fixture's current continuation and pending effect into
+    // the pre-receipt serialized format; prior completed Write history stays intact.
+    let mut store = SqliteStore::open(&path).unwrap();
+    let owned = store
+        .acquire("claude-synthetic", OwnerId::new())
+        .await
+        .unwrap();
+    let mut head: Value = serde_json::from_str(owned.state.payload.as_ref().unwrap()).unwrap();
+    let operation = &mut head["nanocodex_durable_state"]["operations"]["legacy-turn"];
+    let reference = operation["continuation"].as_str().unwrap();
+    let record = store
+        .read_record("claude-synthetic", reference)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut cursor: Value = serde_json::from_str(record.strip_prefix('=').unwrap()).unwrap();
+    cursor.as_object_mut().unwrap().remove("model_step_offset");
+    cursor
+        .as_object_mut()
+        .unwrap()
+        .remove("model_receipt_start");
+    let cursor_json = serde_json::to_string(&cursor).unwrap();
+    let key: String = Sha256::digest(cursor_json.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    operation["continuation"] = json!(key);
+    let mut pending = operation["steps"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model-1")
+        .unwrap();
+    pending["kind"] = json!("model");
+    operation["steps"]["model-0"] = pending;
+    store
+        .replace(
+            "claude-synthetic",
+            &owned.owner,
+            owned.state.revision,
+            &serde_json::to_string(&head).unwrap(),
+            &[StoreRecord {
+                key,
+                value: format!("={cursor_json}"),
+            }],
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let counter = writes.clone();
+    let (recovered, mut events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(tool(), move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok("unexpected repeated Write".into()) }
+        })
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let turn = recovered
+        .prompt(PromptRequest::new("legacy active task").request_id("legacy-turn"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), resumed_started.notified())
+        .await
+        .unwrap();
+    turn.steer_with_id("legacy-correction".into(), "correct the legacy task now")
+        .await
+        .unwrap();
+    resumed_release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), turn.result())
+            .await
+            .unwrap()
+            .unwrap()
+            .final_message(),
+        "legacy recovered"
+    );
+    let transcript = requests.lock().unwrap().clone();
+    assert_eq!(
+        transcript.len(),
+        5,
+        "one replay and exactly one corrected model call"
+    );
+    assert!(
+        transcript[4]["messages"]
+            .to_string()
+            .contains("correct the legacy task now")
+    );
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "prior Write must not be repeated"
+    );
+    let mut markers = Vec::new();
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), events.next()).await
+    {
+        if event.kind == nanocodex_agent::events::AgentEventKind::RunSteered {
+            markers.push(serde_json::from_str::<Value>(event.payload.get()).unwrap());
+        }
+    }
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0]["message_id"], "legacy-correction");
+    eprintln!(
+        "{}",
+        json!({"scenario":"legacy-model-zero","model_requests":transcript.len(),"prior_write_count":writes.load(Ordering::SeqCst),"markers":markers,"outcome":"first new boundary corrected; prior Write retained"})
+    );
+    old_release.notify_one();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), old_turn.result())
+            .await
+            .unwrap()
+            .is_err()
+    );
+    recovered.shutdown().await.unwrap();
+    let _ = agent.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn interrupted_unsafe_tool_returns_unknown_over_messages_without_redispatch() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state.sqlite");
+    let (client, requests, server) = server(|_, request| {
+        let receipt = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .find(|block| block["type"] == "tool_result");
+        if let Some(receipt) = receipt {
+            assert_eq!(receipt["is_error"], true);
+            assert!(receipt["content"].to_string().contains("outcome unknown"));
+            sse(text("reconciled outcome unknown"), "end_turn", 10)
+        } else {
+            sse(
+                vec![json!({"type":"tool_use","id":"one-effect","name":"effect","input":{}})],
+                "tool_use",
+                10,
+            )
+        }
+    })
+    .await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let armed = Arc::new(AtomicBool::new(false));
+    let store = FaultStore {
+        inner: SqliteStore::open(&path).unwrap(),
+        writes: Arc::new(AtomicUsize::new(0)),
+        fail_at: None,
+        after_commit: false,
+        fail_when_armed: Some(armed.clone()),
+    };
+    let state = DurableSession::open(store, "claude-synthetic")
+        .await
+        .unwrap();
+    let handler_count = count.clone();
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .tool(tool(), move |_| {
+            handler_count.fetch_add(1, Ordering::SeqCst);
+            armed.store(true, Ordering::SeqCst);
+            async { Ok("external action occurred".into()) }
+        })
+        .durability(state)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let request = || PromptRequest::new("perform one effect").request_id("unsafe-recovery");
+    assert!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .is_err()
+    );
+    let _ = agent.shutdown().await;
+    drop((agent, events));
+    let handler_count = count.clone();
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .tool(tool(), move |_| {
+            handler_count.fetch_add(1, Ordering::SeqCst);
+            async { Ok("must not run".into()) }
+        })
+        .durability(reopen(&path).await)
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent
+            .prompt(request())
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "reconciled outcome unknown"
+    );
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    server.abort();
+}
+
+#[tokio::test]
+async fn historical_document_fork_restores_native_claude_checkpoint_after_receipt_pruning() {
+    use nanocodex_durability::{DocumentForkPolicy as Policy, DocumentWrite};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("historical-documents.sqlite");
+    let (client, requests, server) =
+        server(|_, _| sse(text("document answer"), "end_turn", 12)).await;
+    let open = |id| {
+        DurableSession::open_with_terminal_receipt_limit(SqliteStore::open(&path).unwrap(), id, 1)
+    };
+    let writes = |version, value| {
+        [Policy::Initial, Policy::Current, Policy::AsOf]
+            .into_iter()
+            .zip(["initial", "current", "asOf"])
+            .map(|(fork, key)| DocumentWrite {
+                key: key.into(),
+                expected_version: version,
+                value: json!(value),
+                fork,
+            })
+            .collect()
+    };
+    let source = open("claude-parent").await.unwrap();
+    let (agent, events) = Nanocodex::builder(Claude::new(client.clone(), "test"))
+        .durability(source.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    source
+        .compare_exchange_documents(writes(0, 1))
+        .await
+        .unwrap();
+    for index in 0..5 {
+        let id = format!("claude-historical-{index}");
+        agent
+            .prompt(PromptRequest::new(format!("CLAUDE_BOUNDARY_{index}")).request_id(id))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap();
+        if index == 0 {
+            source
+                .compare_exchange_documents(writes(1, 2))
+                .await
+                .unwrap();
+        }
+    }
+    agent.shutdown().await.unwrap();
+    drop((agent, events, source));
+    let source = open("claude-parent").await.unwrap();
+    assert!(
+        source
+            .state()
+            .await
+            .unwrap()
+            .operation("claude-historical-0")
+            .is_none()
+    );
+    let (checkpoint, seed) = source.document_fork("claude-historical-0").await.unwrap();
+    assert_eq!(
+        ["initial", "current", "asOf"].map(|key| seed.documents[key].value.clone()),
+        [json!(1), json!(2), json!(1)]
+    );
+    let child = open("claude-child").await.unwrap();
+    child
+        .initialize_document_fork(seed, &checkpoint)
+        .await
+        .unwrap();
+    drop(child);
+    let child = open("claude-child").await.unwrap();
+    assert_eq!(
+        child.document("asOf").await.unwrap().unwrap().value,
+        json!(1)
+    );
+    child
+        .compare_exchange_documents(vec![DocumentWrite {
+            key: "asOf".into(),
+            expected_version: 1,
+            value: json!(42),
+            fork: Policy::AsOf,
+        }])
+        .await
+        .unwrap();
+    let (agent, events) = Nanocodex::builder(Claude::new(client, "test"))
+        .durability(child.clone())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(
+        agent
+            .prompt(PromptRequest::new("CLAUDE_CHILD_ONLY").request_id("child-next"))
+            .await
+            .unwrap()
+            .result()
+            .await
+            .unwrap()
+            .final_message(),
+        "document answer"
+    );
+    {
+        let log = requests.lock().unwrap();
+        let last = serde_json::to_string(log.last().unwrap()).unwrap();
+        assert!(last.contains("CLAUDE_BOUNDARY_0") && last.contains("CLAUDE_CHILD_ONLY"));
+        assert!(!last.contains("CLAUDE_BOUNDARY_4"));
+    }
+    assert_eq!(
+        source.document("asOf").await.unwrap().unwrap().value,
+        json!(2)
+    );
+    assert_eq!(
+        child.document("asOf").await.unwrap().unwrap().value,
+        json!(42)
+    );
+    agent.shutdown().await.unwrap();
+    drop((agent, events));
+    println!(
+        "Native Claude HTTP + cold SQLite: five completions retention1, historical first checkpoint and policies [1,2,1], cold branch history excludes later turns; child value42 parent2"
+    );
     server.abort();
 }

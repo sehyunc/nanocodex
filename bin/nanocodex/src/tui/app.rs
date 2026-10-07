@@ -28,6 +28,7 @@ use super::composer::ComposerLayout;
 use super::selection::{
     ScreenSelection, SelectionClick, SelectionScrollDirection, SelectionScrollRequest,
 };
+use super::slash_commands::{self, SlashCommand};
 use super::transcript::{InlineEdit, ToolStatus, Transcript, TranscriptItem};
 
 const MAX_TOOL_ARGUMENT_CHARS: usize = 180;
@@ -102,6 +103,7 @@ struct PendingPaste {
 pub(super) struct SubmittedPrompt {
     display: String,
     instruction: Option<String>,
+    pub(super) loop_iteration_token: Option<String>,
     local_images: Vec<PathBuf>,
 }
 
@@ -110,6 +112,7 @@ impl SubmittedPrompt {
         Self {
             display,
             instruction: None,
+            loop_iteration_token: None,
             local_images,
         }
     }
@@ -125,6 +128,7 @@ impl SubmittedPrompt {
     pub(super) fn set_display(&mut self, display: String) {
         self.display = display;
         self.instruction = None;
+        self.loop_iteration_token = None;
     }
 
     pub(super) const fn has_instruction(&self) -> bool {
@@ -271,7 +275,8 @@ pub(super) struct Conversation {
     streamed_this_turn: bool,
     first_response_pending: bool,
     first_response_redraw_pending: bool,
-    pending_run_error: Option<String>,
+    pending_run_error: Option<(Option<String>, String)>,
+    displayed_turn_errors: HashSet<(String, String)>,
     run_started_at: Option<Instant>,
     pending_code_execs: HashMap<String, PendingCodeExec>,
     hidden_terminal_calls: HashMap<String, i64>,
@@ -307,6 +312,7 @@ impl Conversation {
             first_response_pending: false,
             first_response_redraw_pending: false,
             pending_run_error: None,
+            displayed_turn_errors: HashSet::new(),
             run_started_at: None,
             pending_code_execs: HashMap::new(),
             hidden_terminal_calls: HashMap::new(),
@@ -397,11 +403,27 @@ impl Conversation {
         };
     }
 
-    fn turn_finished(&mut self, error: Option<String>) {
+    fn turn_finished(&mut self, turn_id: Option<&str>, error: Option<String>) {
         self.pending_turns = self.pending_turns.saturating_sub(1);
         if let Some(error) = error {
-            self.push_output(TranscriptItem::Error(error));
+            self.push_turn_error(turn_id, error);
         }
+    }
+
+    fn push_turn_error(&mut self, turn_id: Option<&str>, error: String) {
+        if let Some(turn_id) = turn_id {
+            // The lifecycle stream and result callback can describe the same failure
+            // in either order. Unidentified errors and other turns remain independent.
+            let duplicate = !self
+                .displayed_turn_errors
+                .insert((turn_id.to_owned(), error.clone()));
+            tracing::trace!(target: "nanocodex", turn_id = %turn_id, duplicate = duplicate,
+                "TUI turn error presentation");
+            if duplicate {
+                return;
+            }
+        }
+        self.push_output(TranscriptItem::Error(error));
     }
 
     fn on_agent_event(&mut self, event: &AgentEvent) -> bool {
@@ -471,13 +493,17 @@ impl Conversation {
             }
             AgentEventKind::RunError => {
                 if let Ok(AgentEventData::Run(RunEvent::Error(payload))) = event.data() {
-                    self.pending_run_error = Some(payload.message);
+                    let turn_id = event
+                        .decode_payload::<serde_json::Value>()
+                        .ok()
+                        .and_then(|payload| payload["turn_id"].as_str().map(str::to_owned));
+                    self.pending_run_error = Some((turn_id, payload.message));
                 }
             }
             AgentEventKind::RunCompleted => {
                 self.capture_terminal_cost(event);
-                if let Some(error) = self.pending_run_error.take() {
-                    self.push_output(TranscriptItem::Error(error));
+                if let Some((turn_id, error)) = self.pending_run_error.take() {
+                    self.push_turn_error(turn_id.as_deref(), error);
                 }
                 self.running = false;
                 self.run_started_at = None;
@@ -851,8 +877,8 @@ impl Conversation {
             self.pending_run_error = None;
             "Cancelled".clone_into(&mut self.status);
         } else {
-            if let Some(error) = self.pending_run_error.take() {
-                self.push_output(TranscriptItem::Error(error));
+            if let Some((turn_id, error)) = self.pending_run_error.take() {
+                self.push_turn_error(turn_id.as_deref(), error);
             }
             "Turn failed".clone_into(&mut self.status);
         }
@@ -1305,6 +1331,7 @@ fn append_branch_tree(
 }
 
 pub(super) struct App {
+    pub(super) claude_interaction: Option<super::interaction::PendingInteraction>,
     pub(super) voice: super::voice::VoiceUi,
     pub(super) cwd: PathBuf,
     pub(super) main: Conversation,
@@ -1335,9 +1362,12 @@ pub(super) struct App {
     tool_details_expanded: bool,
     fast_mode: bool,
     model: HarnessModel,
+    has_rejected_start_input: bool,
+    restored_thread: bool,
     thinking: Thinking,
     model_picker: Option<usize>,
     reasoning_picker: Option<ReasoningPicker>,
+    slash_suggestion: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1361,9 +1391,20 @@ impl App {
     pub(super) fn reject_external(&mut self, target: PaneId, id: u64, steer: bool, error: String) {
         if steer {
             self.steer_failed(target, id, error);
-        } else if let Some(conversation) = self.conversation_mut(target) {
-            conversation.remove_queued_prompt(id);
-            conversation.push_output(TranscriptItem::Error(error));
+        } else {
+            // Rejected input remains visible and in composer history, but is not
+            // a started conversation. Pending turns and run_generation still
+            // prevent model changes once any prompt is admitted.
+            if target == PaneId::Main && self.main.run_generation == 0 {
+                self.has_rejected_start_input = true;
+            }
+            if let Some(conversation) = self.conversation_mut(target) {
+                conversation.remove_queued_prompt(id);
+                conversation.push_output(TranscriptItem::Error(error));
+                if !conversation.running && conversation.pending_turns == 0 {
+                    "Ready".clone_into(&mut conversation.status);
+                }
+            }
         }
     }
 
@@ -1375,6 +1416,8 @@ impl App {
             Some("effort")
         } else if self.branch_navigator.is_some() {
             Some("branches")
+        } else if !self.slash_suggestions().is_empty() {
+            Some("slash")
         } else {
             None
         };
@@ -1397,6 +1440,7 @@ impl App {
             main_branches: Vec::new(),
             historical_editor: None,
             pending_historical_edit: None,
+            claude_interaction: None,
             pending_branch_switch: None,
             branch_navigator: None,
             btw: None,
@@ -1418,9 +1462,12 @@ impl App {
             tool_details_expanded: true,
             fast_mode: false,
             model: HarnessModel::default(),
+            has_rejected_start_input: false,
+            restored_thread: false,
             thinking: Thinking::default(),
             model_picker: None,
             reasoning_picker: None,
+            slash_suggestion: 0,
         }
     }
 
@@ -1428,6 +1475,7 @@ impl App {
         &mut self,
         transcript: impl IntoIterator<Item = RolloutTranscriptItem>,
     ) {
+        self.restored_thread = true;
         for activity in transcript {
             let item = match activity {
                 RolloutTranscriptItem::User(message) => TranscriptItem::User(message),
@@ -1788,6 +1836,43 @@ impl App {
 
     pub(super) const fn composer_scroll(&self) -> usize {
         self.composer_scroll
+    }
+
+    pub(super) fn slash_suggestions(&self) -> Vec<&'static SlashCommand> {
+        slash_commands::matching(&self.input, self.cursor, self.btw.is_some())
+    }
+
+    pub(super) fn selected_slash_suggestion(&self) -> usize {
+        self.slash_suggestion
+            .min(self.slash_suggestions().len().saturating_sub(1))
+    }
+
+    pub(super) fn move_slash_suggestion(&mut self, direction: isize) {
+        let count = self.slash_suggestions().len();
+        if count == 0 {
+            return;
+        }
+        self.slash_suggestion = self
+            .selected_slash_suggestion()
+            .saturating_add_signed(direction)
+            .min(count - 1);
+    }
+
+    pub(super) fn slash_suggestion_is_exact(&self) -> bool {
+        let suggestions = self.slash_suggestions();
+        suggestions
+            .get(self.selected_slash_suggestion())
+            .is_some_and(|command| command.name == self.input)
+    }
+
+    pub(super) fn accept_slash_suggestion(&mut self) -> bool {
+        let suggestions = self.slash_suggestions();
+        let Some(command) = suggestions.get(self.selected_slash_suggestion()).copied() else {
+            return false;
+        };
+        let suffix = if command.accepts_arguments { " " } else { "" };
+        self.replace_input(format!("{}{suffix}", command.name));
+        true
     }
 
     pub(super) fn replace_input(&mut self, input: String) {
@@ -2639,6 +2724,7 @@ impl App {
         &mut self,
         target: PaneId,
         main_branch_id: Option<u64>,
+        turn_id: Option<&str>,
         error: Option<String>,
     ) {
         match target {
@@ -2653,12 +2739,12 @@ impl App {
                         .map(|branch| &mut branch.conversation)
                 };
                 if let Some(conversation) = conversation {
-                    conversation.turn_finished(error);
+                    conversation.turn_finished(turn_id, error);
                 }
             }
             PaneId::Btw(_) => {
                 if let Some(conversation) = self.conversation_mut(target) {
-                    conversation.turn_finished(error);
+                    conversation.turn_finished(turn_id, error);
                 }
             }
         }
@@ -2975,9 +3061,10 @@ impl App {
     }
 
     pub(super) fn can_change_start_settings(&self) -> bool {
-        self.main.run_generation == 0
+        !self.restored_thread
+            && self.main.run_generation == 0
             && self.main.pending_turns == 0
-            && self.main.transcript.is_empty()
+            && (self.has_rejected_start_input || !self.main.transcript.has_conversation())
             && self.main_branches.is_empty()
             && self.btw.is_none()
     }
@@ -3013,12 +3100,14 @@ impl App {
     }
 
     pub(super) fn model_options(&self) -> Vec<(HarnessModel, &'static str)> {
-        match self.model.family() {
-            HarnessFamily::Codex => MODEL_OPTIONS.to_vec(),
-            HarnessFamily::Claude => HarnessModel::for_family(HarnessFamily::Claude)
-                .map(|model| (model, model.as_str()))
-                .collect(),
-        }
+        MODEL_OPTIONS
+            .iter()
+            .copied()
+            .chain(
+                HarnessModel::for_family(HarnessFamily::Claude)
+                    .map(|model| (model, model.as_str())),
+            )
+            .collect()
     }
 
     pub(super) fn open_model_picker(&mut self) {
@@ -3162,6 +3251,7 @@ impl App {
     }
 
     fn prepare_composer_edit(&mut self) {
+        self.slash_suggestion = 0;
         if self.historical_editor.is_none() && self.transcript_selection_active() {
             self.dismiss_transcript_selection();
         }
@@ -4383,7 +4473,7 @@ mod tests {
         app.toggle_focus();
         assert_eq!(app.focus, PaneId::Btw(id));
         assert!(app.btw_busy());
-        app.turn_finished(PaneId::Btw(id), None, None);
+        app.turn_finished(PaneId::Btw(id), None, None, None);
         assert!(!app.btw_busy());
         app.close_btw(id);
         assert_eq!(app.focus, PaneId::Main);
@@ -5008,7 +5098,7 @@ mod tests {
         assert_eq!(source.status, "Thinking");
 
         app.main.pending_turns = 1;
-        app.turn_finished(PaneId::Main, Some(0), None);
+        app.turn_finished(PaneId::Main, Some(0), None, None);
         assert_eq!(app.main.pending_turns, 1);
         assert_eq!(app.main_branches[0].conversation.pending_turns, 0);
     }
@@ -5130,7 +5220,7 @@ mod tests {
         let second = app.begin_btw();
         app.btw_failed(first, "stale".to_owned());
         assert_eq!(app.btw_id(), Some(second));
-        assert!(app.btw.as_ref().unwrap().conversation.transcript.is_empty());
+        assert_eq!(app.btw.as_ref().unwrap().conversation.transcript.len(), 0);
     }
 
     #[test]
@@ -5151,7 +5241,7 @@ mod tests {
 
         app.steer_admitted(PaneId::Main, steer_id);
         assert_eq!(app.main.pending_steers.len(), 1);
-        assert!(app.main.transcript.is_empty());
+        assert_eq!(app.main.transcript.len(), 0);
         assert_eq!(app.main.status, "Steer pending");
 
         app.main.on_agent_event(&event(
@@ -5178,7 +5268,7 @@ mod tests {
             &json!({ "steer_index": 1, "instruction_bytes": 15 }),
         ));
         assert_eq!(app.main.pending_steers.len(), 1);
-        assert!(app.main.transcript.is_empty());
+        assert_eq!(app.main.transcript.len(), 0);
 
         app.steer_admitted(PaneId::Main, steer_id);
         assert!(app.main.pending_steers.is_empty());
@@ -5362,7 +5452,7 @@ mod tests {
             ));
         }
 
-        assert!(app.main.transcript.is_empty());
+        assert_eq!(app.main.transcript.len(), 0);
         assert!(app.main.pending_code_execs.is_empty());
     }
 

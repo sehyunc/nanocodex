@@ -180,6 +180,16 @@ pub trait LifecycleBackend: Send + Sync + 'static {
         })
     }
 
+    /// Whether identified steering retains receipts in the execution journal.
+    fn durable_steering(&self) -> bool {
+        false
+    }
+
+    /// Reconciles identified input even after its native turn has settled.
+    fn has_steer_receipt(&self, _operation_id: String, _id: String) -> BackendFuture<Result<bool>> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Withdraws the latest steer if it has not reached a model boundary.
     fn withdraw_steer(&self, _key: BackendTurnKey, _id: String) -> BackendFuture<Result<bool>> {
         Box::pin(async {
@@ -212,6 +222,21 @@ pub trait LifecycleBackend: Send + Sync + 'static {
 
     /// Changes priority policy for later turns.
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>>;
+
+    /// Changes processing policy for later turns.
+    ///
+    /// Backends with only a priority switch reject Ultrafast unless they override this method.
+    fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
+        match service_tier {
+            ServiceTier::Standard => self.set_fast_mode(false),
+            ServiceTier::Priority | ServiceTier::Fast => self.set_fast_mode(true),
+            ServiceTier::Ultrafast => Box::pin(async {
+                Err(NanocodexError::InvalidRequest(
+                    "backend does not support ultrafast processing".into(),
+                ))
+            }),
+        }
+    }
 
     /// Compacts retained context.
     fn compact(&self) -> BackendFuture<Result<()>>;
@@ -348,11 +373,14 @@ impl BackendRuntime {
         B: LifecycleBackend,
     {
         Nanocodex {
+            caller_ownership: None,
             backend: Arc::new(backend),
             events: self.events,
             next_turn: Arc::new(AtomicU64::new(1)),
             agent_id: self.agent_id,
             session_id: self.session_id,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             #[cfg(feature = "openai")]
             local_session_id: self.local_session_id,
             #[cfg(all(feature = "openai", not(target_family = "wasm")))]
@@ -370,11 +398,14 @@ impl BackendRuntime {
         B: LifecycleBackend,
     {
         Nanocodex {
+            caller_ownership: None,
             backend: Arc::new(backend),
             events: self.events,
             next_turn: Arc::new(AtomicU64::new(1)),
             agent_id: self.agent_id,
             session_id: self.session_id,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             local_session_id: self.local_session_id,
             rollout,
         }
@@ -431,7 +462,7 @@ impl LifecycleBackend for LocalLifecycle {
                     accepted,
                     cancel_on_admission: request.cancel_on_admission,
                     thinking: None,
-                    fast_mode: None,
+                    service_tier: None,
                     parent,
                     events: EventSink::from_publisher(request.events),
                     result,
@@ -516,6 +547,15 @@ impl LifecycleBackend for LocalLifecycle {
         })
     }
 
+    fn durable_steering(&self) -> bool {
+        self.execution.durable_steering()
+    }
+
+    fn has_steer_receipt(&self, operation_id: String, id: String) -> BackendFuture<Result<bool>> {
+        let execution = self.execution.clone();
+        Box::pin(async move { execution.has_steer_receipt(operation_id, id).await })
+    }
+
     fn steer_with_id(
         &self,
         key: BackendTurnKey,
@@ -585,11 +625,15 @@ impl LifecycleBackend for LocalLifecycle {
     }
 
     fn set_fast_mode(&self, enabled: bool) -> BackendFuture<Result<()>> {
+        self.set_service_tier(ServiceTier::from_fast_mode(enabled))
+    }
+
+    fn set_service_tier(&self, service_tier: ServiceTier) -> BackendFuture<Result<()>> {
         let commands = self.commands.clone();
         let shutdown = self.shutdown.clone();
         Box::pin(async move {
-            request_command(&commands, &shutdown, |result| Command::SetFastMode {
-                enabled,
+            request_command(&commands, &shutdown, |result| Command::SetServiceTier {
+                service_tier,
                 result,
             })
             .await

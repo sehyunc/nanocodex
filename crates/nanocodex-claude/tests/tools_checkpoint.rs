@@ -43,6 +43,18 @@ impl ClaudeExecutionPolicy for CheckpointPolicy {
             Ok(())
         })
     }
+    fn begin_step_with_replay(
+        &self,
+        id: String,
+        step: String,
+        kind: String,
+        input: Value,
+        safety: nanocodex_agent::ReplaySafety,
+    ) -> PolicyFuture<'_, Step> {
+        // Session-local task mutations are reconstructed with their checkpoint.
+        assert_eq!(safety, nanocodex_agent::ReplaySafety::Safe);
+        self.begin_step(id, step, kind, input)
+    }
     fn begin_step(&self, _: String, _: String, _: String, _: Value) -> PolicyFuture<'_, Step> {
         Box::pin(async { Ok(Step::Execute) })
     }
@@ -220,7 +232,7 @@ async fn tools_only_task_checkpoint_reopens_and_retains_id_watermark() {
     let created: Value = serde_json::from_str(created["content"].as_str().unwrap()).unwrap();
     assert_eq!(created["task"]["id"], "2");
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../outputs/provider-managed-20261001/crates/tools-checkpoint");
+        .join("../../output/provider-managed-20261001/crates/tools-checkpoint");
     std::fs::create_dir_all(&artifact).unwrap();
     std::fs::write(
         artifact.join("requests.json"),
@@ -234,5 +246,93 @@ async fn tools_only_task_checkpoint_reopens_and_retains_id_watermark() {
     .unwrap();
     std::fs::write(artifact.join("scenario.txt"), "Command: cargo test --locked -p nanocodex-claude --no-default-features --features tools --test tools_checkpoint\nSynthetic loopback Messages/SSE and caller-owned filesystem policy; not SQLite fencing proof. Expected/observed: TaskCreate -> saved checkpoint, new builder+board -> TaskGet retains task, TaskCreate uses ID 2, 5 actual HTTP requests.\n").unwrap();
     drop(reopened);
+    server.abort();
+}
+
+/// Existing host policies need no new methods to keep plain steering working.
+#[tokio::test]
+async fn older_custom_policy_preserves_plain_steering() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let temp = tempfile::tempdir().unwrap();
+    let policy = Arc::new(CheckpointPolicy {
+        path: temp.path().join("checkpoint.json"),
+        cursors: Mutex::new(vec![]),
+    });
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/v1/messages",
+        post({
+            let started = started.clone();
+            let release = release.clone();
+            let requests = requests.clone();
+            move |Json(body): Json<Value>| {
+                let started = started.clone();
+                let release = release.clone();
+                let requests = requests.clone();
+                async move {
+                    let index = {
+                        let mut log = requests.lock().unwrap();
+                        log.push(body);
+                        log.len()
+                    };
+                    if index == 1 {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    (
+                        [("content-type", "text/event-stream")],
+                        sse(
+                            json!({"type":"text","text":"plain steer completed"}),
+                            "end_turn",
+                        ),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = ClaudeClient::new(reqwest::Client::new(), endpoint, "synthetic");
+    let (agent, _) = Nanocodex::builder(Claude::new(client, "test"))
+        .execution_policy(policy, None)
+        .unwrap()
+        .build()
+        .unwrap();
+    let turn = agent.prompt("older policy task").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    turn.steer("plain correction on older policy")
+        .await
+        .unwrap();
+    assert!(
+        turn.steer_with_id("requires-receipts".into(), "identified correction")
+            .await
+            .is_err()
+    );
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), turn.result())
+            .await
+            .unwrap()
+            .unwrap()
+            .final_message(),
+        "plain steer completed"
+    );
+    let transcript = requests.lock().unwrap().clone();
+    assert_eq!(transcript.len(), 2);
+    assert!(
+        transcript[1]["messages"]
+            .to_string()
+            .contains("plain correction on older policy")
+    );
+    eprintln!(
+        "{}",
+        json!({"scenario":"older-custom-policy-plain-steering","requests":transcript,"outcome":"plain steering retained; identified input not downgraded"})
+    );
+    agent.shutdown().await.unwrap();
     server.abort();
 }

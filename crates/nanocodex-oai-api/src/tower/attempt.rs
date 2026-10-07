@@ -9,6 +9,7 @@ use std::{
 use crate::{
     AgentEventKind, EventError, EventSink, Model, ResponseEvent, ResponseItem, ResponsesTransport,
     Thinking,
+    pricing::ServiceTier,
     responses::{RequestProfile, ResponseHistory, ResponsesInput, WarmupResponse},
     session::state::RequestHistory,
     tower::transport_policy::SessionTransport,
@@ -153,6 +154,7 @@ pub struct TransportStatsDelta {
 #[derive(Clone)]
 pub struct ResponsesAttempt {
     pub(crate) kind: ResponsesAttemptKind,
+    pub(crate) prepared_request: Option<Arc<serde_json::Value>>,
     pub(crate) call_index: Option<u32>,
     full_history: ResponseHistory,
     incremental_history: ResponseHistory,
@@ -161,13 +163,14 @@ pub struct ResponsesAttempt {
     previous_response_id: Option<String>,
     model: Model,
     thinking: Thinking,
-    fast_mode: bool,
+    service_tier: ServiceTier,
     pub(crate) profile: Arc<RequestProfile>,
     pub(crate) observer: ResponsesObserver,
     pub(crate) attempt: u32,
     pub(crate) max_attempts: u32,
     full_replay: bool,
     pub(crate) logical_turn: u64,
+    pub(crate) independent_connection: bool,
     session_transport: Arc<SessionTransport>,
 }
 
@@ -175,12 +178,13 @@ impl ResponsesAttempt {
     fn warmup(
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
         session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
+            prepared_request: None,
             kind: ResponsesAttemptKind::Warmup,
             call_index: None,
             full_history: ResponseHistory::default(),
@@ -190,13 +194,14 @@ impl ResponsesAttempt {
             previous_response_id: None,
             model,
             thinking,
-            fast_mode,
+            service_tier,
             profile,
             observer,
             attempt: 1,
             max_attempts: 1,
             full_replay: false,
             logical_turn: 0,
+            independent_connection: false,
             session_transport,
         }
     }
@@ -210,12 +215,13 @@ impl ResponsesAttempt {
         previous_response_id: Option<&str>,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
         session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
+            prepared_request: None,
             kind: ResponsesAttemptKind::Generation,
             call_index: Some(call_index),
             full_history,
@@ -225,13 +231,14 @@ impl ResponsesAttempt {
             previous_response_id: previous_response_id.map(str::to_owned),
             model,
             thinking,
-            fast_mode,
+            service_tier,
             profile,
             observer,
             attempt: 1,
             max_attempts: RESPONSE_MAX_ATTEMPTS.get(),
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
+            independent_connection: false,
             session_transport,
         }
     }
@@ -246,12 +253,13 @@ impl ResponsesAttempt {
         trigger: ResponseItem,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: ServiceTier,
         profile: Arc<RequestProfile>,
         observer: ResponsesObserver,
         session_transport: Arc<SessionTransport>,
     ) -> Self {
         Self {
+            prepared_request: None,
             kind: ResponsesAttemptKind::Compaction,
             call_index: Some(call_index),
             full_history,
@@ -261,13 +269,14 @@ impl ResponsesAttempt {
             previous_response_id: previous_response_id.map(str::to_owned),
             model,
             thinking,
-            fast_mode,
+            service_tier,
             profile,
             observer,
             attempt: 1,
             max_attempts: COMPACTION_MAX_ATTEMPTS,
             full_replay: previous_response_id.is_none(),
             logical_turn: 0,
+            independent_connection: false,
             session_transport,
         }
     }
@@ -290,6 +299,51 @@ impl ResponsesAttempt {
                 self.tail.as_ref(),
             )
         }
+    }
+
+    /// Builds the full native body used for a frozen durable request. Authentication
+    /// and connection-local continuation state are applied by the live transport.
+    #[doc(hidden)]
+    pub fn native_request(
+        &self,
+        config: &crate::ModelConfig,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(crate::responses::ResponseCreate::generation_with_policy(
+            config,
+            crate::responses::CreatePolicy::new(
+                crate::ResponsesTransport::Https,
+                self.model,
+                self.thinking,
+                self.service_tier,
+            ),
+            ResponsesInput::history(
+                self.profile.prefix(),
+                &self.full_history,
+                self.tail.as_ref(),
+            ),
+            None,
+            &self.profile,
+            None,
+        ))
+    }
+
+    /// Installs a previously prepared full native request for every retry.
+    #[doc(hidden)]
+    pub fn with_prepared_request(mut self, request: serde_json::Value, model: Model) -> Self {
+        self.prepared_request = Some(Arc::new(request));
+        self.model = model;
+        self.full_replay = true;
+        self
+    }
+
+    /// Runs a full replay on an owned connection beside foreground requests.
+    /// Sticky routing, cancellation and fallback remain local to this work.
+    #[must_use]
+    pub fn with_independent_connection(mut self) -> Self {
+        self.independent_connection = true;
+        self.session_transport = Arc::new(SessionTransport::new());
+        self.force_full_replay();
+        self
     }
 
     /// Returns the provider operation represented by this attempt.
@@ -316,10 +370,16 @@ impl ResponsesAttempt {
         self.model
     }
 
-    /// Returns whether this replayable attempt uses priority service.
+    /// Returns the effective processing tier fixed for this replayable attempt.
+    #[must_use]
+    pub const fn service_tier(&self) -> ServiceTier {
+        self.service_tier.effective_for_model(self.model)
+    }
+
+    /// Returns whether accelerated processing was requested for this attempt.
     #[must_use]
     pub const fn fast_mode(&self) -> bool {
-        self.fast_mode
+        !matches!(self.service_tier, ServiceTier::Standard)
     }
 
     /// Returns the current physical attempt number.
@@ -559,11 +619,16 @@ impl ResponsesAttemptFactory {
 
     /// Builds a WebSocket warmup attempt.
     #[must_use]
-    pub fn warmup(&self, model: Model, thinking: Thinking, fast_mode: bool) -> ResponsesAttempt {
+    pub fn warmup(
+        &self,
+        model: Model,
+        thinking: Thinking,
+        service_tier: impl Into<ServiceTier>,
+    ) -> ResponsesAttempt {
         let mut attempt = ResponsesAttempt::warmup(
             model,
             thinking,
-            fast_mode,
+            service_tier.into(),
             Arc::clone(&self.profile),
             self.observer.clone(),
             Arc::clone(&self.session_transport),
@@ -580,7 +645,7 @@ impl ResponsesAttemptFactory {
         history: &RequestHistory,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: impl Into<ServiceTier>,
     ) -> ResponsesAttempt {
         let mut attempt = ResponsesAttempt::generation(
             call_index,
@@ -590,7 +655,7 @@ impl ResponsesAttemptFactory {
             history.previous_response_id.as_deref(),
             model,
             thinking,
-            fast_mode,
+            service_tier.into(),
             Arc::clone(&self.profile),
             self.observer.clone(),
             Arc::clone(&self.session_transport),
@@ -608,7 +673,7 @@ impl ResponsesAttemptFactory {
         trigger: ResponseItem,
         model: Model,
         thinking: Thinking,
-        fast_mode: bool,
+        service_tier: impl Into<ServiceTier>,
     ) -> ResponsesAttempt {
         let mut attempt = ResponsesAttempt::compaction(
             call_index,
@@ -619,7 +684,7 @@ impl ResponsesAttemptFactory {
             trigger,
             model,
             thinking,
-            fast_mode,
+            service_tier.into(),
             Arc::clone(&self.profile),
             self.observer.clone(),
             Arc::clone(&self.session_transport),

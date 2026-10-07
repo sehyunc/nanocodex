@@ -68,7 +68,7 @@ async function modelsFromStatus(broker: Fetcher, userId: string, runtime: ModelR
     claudePartial = allowed.has_more === true;
     if (!Array.isArray(allowed.models)) throw new Error("invalid Claude model catalog");
     for (const [id, name] of [["claude-sonnet-4-6", "Claude Sonnet 4.6"], ["claude-opus-4-6", "Claude Opus 4.6"],
-      ["claude-sonnet-5-5", "Claude Sonnet 5.5"], ["claude-opus-5-5", "Claude Opus 5.5"]] as const) {
+      ["claude-sonnet-5-5", "Claude Sonnet 5.5"], ["claude-opus-5-5", "Claude Opus 5.5"], ["claude-fable-5-1", "Claude Fable 5.1"]] as const) {
       if (allowed.models.some(model => model.id === id)) data.push({ id, name, provider: "claude", thinking: ["low", "medium", "high"], fast_mode: false, reasoning_modes: ["standard"] });
     }
     } catch { claudeUnavailable = true; if (!data.length) throw new Error("Claude model catalog is unavailable"); }

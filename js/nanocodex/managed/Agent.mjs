@@ -38,7 +38,7 @@ const TURN_STATE_READ_TIMEOUT_MS = 2_000;
 const ALLOWED_OPTIONS = new Set(["apiKey", "baseUrl", "fetch", "toolsTransport", "requestOrigin"]);
 const CREATE_SETTINGS = new Set(["model", "thinking", "reasoningMode", "fastMode"]);
 const SETTINGS_PATCH = CREATE_SETTINGS;
-const MODELS = new Set(["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro", "claude-sonnet-4-6", "claude-opus-4-6", "claude-sonnet-5-5", "claude-opus-5-5"]);
+const MODELS = new Set(["gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "@cf/zai-org/glm-5.3", "kimi-k3", "mimo-v2.6-pro", "claude-sonnet-4-6", "claude-opus-4-6", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1"]);
 const THINKING = new Set(["none", "low", "medium", "high", "xhigh", "max"]);
 const REASONING_MODES = new Set(["standard", "pro"]);
 const eventEncoder = new TextEncoder();
@@ -297,15 +297,17 @@ function agentHandle(client, id, summary, retainedEventStream) {
     events,
     fork: async (options) => {
       if (!options || typeof options !== "object" || Array.isArray(options)
-        || Object.keys(options).some(key => !["idempotencyKey", "signal"].includes(key))
+        || Object.keys(options).some(key => !["idempotencyKey", "signal", "at"].includes(key))
         || typeof options.idempotencyKey !== "string"
         || !IDEMPOTENCY_KEY.test(options.idempotencyKey)) {
         throw new TypeError("managed fork requires a valid idempotency key");
       }
       if (options.signal !== undefined && !(options.signal instanceof AbortSignal))
         throw new TypeError("managed fork signal must be an AbortSignal");
+      if (options.at !== undefined && (typeof options.at !== "string" || !IDEMPOTENCY_KEY.test(options.at)))
+        throw new TypeError("managed fork at must identify a completed turn");
       const receipt = await retryCreateMutation(client, `${agentPath(id)}/forks`,
-        options.idempotencyKey, undefined, options.signal);
+        options.idempotencyKey, options.at === undefined ? undefined : JSON.stringify({ at: options.at }), options.signal);
       const childId = requiredString(receipt, "agent_id");
       if (!SESSION_ID.test(childId) || childId === id || receipt.parent_agent_id !== id)
         throw new ManagedError("invalid_response", "managed fork response did not identify a separate child");

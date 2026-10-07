@@ -1,3 +1,4 @@
+import { createCodeDiscovery } from "nanocodex-tools/runtime/code-discovery";
 import { createCodeTools } from "nanocodex-tools/runtime/code-tools";
 import { guestValueHelpers } from "nanocodex-tools/runtime/code-values";
 const DEFAULT_MEMORY_LIMIT_BYTES = 64 * 1024 * 1024;
@@ -12,11 +13,19 @@ export function createQuickJsEvaluator(quickJs, options = {}) {
   if (!quickJs || typeof quickJs.newContext !== "function") {
     throw new TypeError("quickJs must be an asyncified QuickJS WASM module");
   }
-  let queue = Promise.resolve();
-
+  // One agent's waiting cell must not prevent its child from running. Keep
+  // cell ordering within each session while giving other sessions a context.
+  const queues = new Map();
+  const anonymousSession = Symbol("anonymous evaluator session");
   return (source, environment) => {
-    const evaluation = queue.then(() => evaluate(quickJs, source, environment, options));
-    queue = evaluation.catch(() => {});
+    const session = environment.sessionId ?? anonymousSession;
+    const evaluation = (queues.get(session) ?? Promise.resolve())
+      .then(() => evaluate(quickJs, source, environment, options));
+    const settled = evaluation.catch(() => {});
+    queues.set(session, settled);
+    void settled.then(() => {
+      if (queues.get(session) === settled) queues.delete(session);
+    });
     return evaluation;
   };
 }
@@ -197,6 +206,7 @@ const tools = (${createCodeTools.toString()})(
   (name, input) => __nanocodex_call_tool(name, JSON.stringify(input ?? null)).then(__nanocodex_decode),
 );
 const ALL_TOOLS = Object.freeze(typeof __nanocodex_catalog === "undefined" ? undefined : JSON.parse(__nanocodex_catalog));
+const { searchTools, describeTool, describeNamespace } = (${createCodeDiscovery.toString()})(ALL_TOOLS);
 const text = (value) => __nanocodex_emit("text", JSON.stringify(__nanocodex_stringify(value)));
 const image = (value, detail) => {
   const item = normalizeImage(value, detail);

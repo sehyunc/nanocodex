@@ -3,7 +3,13 @@
 //! Authentication uses an explicit Console API key, a host header provider, or
 //! the Rust subscription manager with private host storage and HTTP capabilities.
 //! The crate never reads Claude Code credentials.
-use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
+//!
+//! Agent sessions retry transient model failures before publishing text or risking
+//! repeated server effects, with five attempts per model call and three per compaction.
+//! Cancellable backoff grows through 1, 2, 4, and 8 seconds with 90–110% jitter.
+//! `Retry-After` is a minimum delay; hints over 60 seconds end the call.
+//! Direct [`ClaudeClient`] calls leave transient retry policy to their caller.
+use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use futures_util::{Stream, StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -11,6 +17,12 @@ use serde_json::Value;
 use thiserror::Error;
 
 mod auth;
+mod hooks;
+mod prompt;
+pub use hooks::{
+    ClaudeHookFuture, ClaudeLifecycleDecision, ClaudeLifecycleEvent, ClaudeLifecycleInvocation,
+    ClaudeLifecycleOutcome, ClaudeToolDecision, ClaudeToolHooks,
+};
 mod subscription_wire;
 pub use subscription_wire::SubscriptionIdentity;
 pub mod subscription;
@@ -27,7 +39,12 @@ const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
 #[derive(Debug, Error)]
 pub enum ClaudeError {
     #[error("Messages HTTP {status}: {body}")]
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+        /// Provider delay from a valid `Retry-After` header.
+        retry_after: Option<Duration>,
+    },
     #[error("Messages transport: {0}")]
     Transport(#[from] reqwest::Error),
     #[error("Messages JSON: {0}")]
@@ -42,6 +59,41 @@ pub enum ClaudeError {
     AuthUnavailable,
 }
 
+impl ClaudeError {
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Http { status, .. } => *status == 429 || (500..600).contains(status),
+            Self::Transport(error) => error.is_timeout() || error.is_request() || error.is_body(),
+            Self::StreamError { kind, .. } => matches!(
+                kind.as_str(),
+                "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+            ),
+            Self::IncompleteStream => true,
+            Self::Json(_) | Self::Protocol(_) | Self::AuthUnavailable => false,
+        }
+    }
+}
+
+/// Parses delta-seconds or an HTTP-date; a past date means no extra delay.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    let deadline = httpdate::parse_http_date(value)
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .ok()?;
+    Some(deadline.saturating_sub(now))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -52,6 +104,16 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
+    Image {
+        source: Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
+    Document {
+        source: Value,
+        #[serde(flatten)]
+        extra: BTreeMap<String, Value>,
+    },
     Text {
         text: String,
         #[serde(flatten)]
@@ -519,7 +581,9 @@ impl MessagesRequest {
                     | ContentBlock::RedactedThinking { extra, .. } => {
                         (extra.get("cache_control"), false)
                     }
-                    ContentBlock::ToolResult { extra, .. } => (extra.get("cache_control"), true),
+                    ContentBlock::Image { extra, .. }
+                    | ContentBlock::Document { extra, .. }
+                    | ContentBlock::ToolResult { extra, .. } => (extra.get("cache_control"), true),
                     ContentBlock::ToolUse { extra, .. }
                     | ContentBlock::ServerToolUse { extra, .. }
                     | ContentBlock::WebSearchToolResult { extra, .. }
@@ -1120,9 +1184,9 @@ impl ClaudeClient {
                 .body(wire_body.clone())
                 .send()
                 .await?;
-            // Only an explicit HTTP authentication rejection is recoverable. Do
-            // not replay requests after transport errors, 403/429/5xx, or any
-            // accepted stream (including an error partway through that stream).
+            // Only an explicit HTTP authentication rejection is recovered here.
+            // Agent sessions own transient retries because they track published
+            // text and possible server effects.
             if response.status() == reqwest::StatusCode::UNAUTHORIZED
                 && !retried
                 && let (ClientAuth::Provider(provider), Some(headers)) =
@@ -1137,12 +1201,17 @@ impl ClaudeClient {
             }
             if !response.status().is_success() {
                 let status = response.status().as_u16();
+                let retry_after = retry_after(response.headers());
                 let mut body = response.text().await?;
                 credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
                 for credential in &credentials {
                     body = body.replace(credential, "[redacted]");
                 }
-                return Err(ClaudeError::Http { status, body });
+                return Err(ClaudeError::Http {
+                    status,
+                    body,
+                    retry_after,
+                });
             }
             credentials.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
             return Ok((response, credentials));
@@ -1159,6 +1228,19 @@ impl ClaudeClient {
 
     pub async fn stream(&self, request: &MessagesRequest) -> Result<ClaudeStream, ClaudeError> {
         let (response, credentials) = self.post(request, true).await?;
+        // A successful non-SSE response (for example an upstream JSON gateway
+        // response) must not masquerade as a truncated Messages stream.
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
+        if !is_sse {
+            return Err(ClaudeError::Protocol(
+                "expected text/event-stream response".into(),
+            ));
+        }
         let decode_subscription = self.subscription_compatibility;
         Ok(Box::pin(stream::unfold(
             SseState::new(response, credentials),
@@ -1175,14 +1257,6 @@ impl ClaudeClient {
                         }
                     };
                     if let Some(line) = line {
-                        state.frame_bytes += line.len() + 1;
-                        if state.frame_bytes > MAX_SSE_FRAME_BYTES {
-                            state.done = true;
-                            return Some((
-                                Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into())),
-                                state,
-                            ));
-                        }
                         if line.is_empty() {
                             state.frame_bytes = 0;
                             let event_name = state.event_name.take();
@@ -1247,25 +1321,25 @@ impl ClaudeClient {
                                     }
                                 }
                             }
-                        } else if let Some(name) = line.strip_prefix("event:") {
-                            state.event_name = Some(name.trim_start().to_owned());
-                        } else if let Some(data) = line.strip_prefix("data:") {
-                            state
-                                .data
-                                .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
+                        } else {
+                            // SSE removes exactly one ASCII space after the colon,
+                            // not arbitrary whitespace. A field without a colon has
+                            // an empty value; comments and unknown fields are ignored.
+                            let (field, value) = line.split_once(':').unwrap_or((&line, ""));
+                            let value = value.strip_prefix(' ').unwrap_or(value);
+                            match field {
+                                "event" => {
+                                    state.event_name = (!value.is_empty()).then(|| value.to_owned())
+                                }
+                                "data" => state.data.push(value.to_owned()),
+                                _ => {}
+                            }
                         }
                         continue;
                     }
                     match state.response.next().await {
                         Some(Ok(chunk)) => {
                             state.bytes.extend_from_slice(&chunk);
-                            if state.bytes.len() + state.frame_bytes > MAX_SSE_FRAME_BYTES {
-                                state.done = true;
-                                return Some((
-                                    Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into())),
-                                    state,
-                                ));
-                            }
                         }
                         None => {
                             state.done = true;
@@ -1342,6 +1416,9 @@ struct SseState {
     done: bool,
     frame_bytes: usize,
     event_name: Option<String>,
+    first_line: bool,
+    skip_lf: bool,
+    scan_start: usize,
 }
 
 impl SseState {
@@ -1358,22 +1435,54 @@ impl SseState {
             done: false,
             frame_bytes: 0,
             event_name: None,
+            first_line: true,
+            skip_lf: false,
+            scan_start: 0,
         }
     }
 
     fn pop_line(&mut self) -> Result<Option<String>, ClaudeError> {
-        let Some(index) = self.bytes.iter().position(|byte| *byte == b'\n') else {
+        // SSE permits LF, CRLF and bare CR. Consume a CR immediately and skip
+        // only its optional following LF, even when those bytes arrive in
+        // different HTTP chunks. Waiting for LF loses a valid CR-only terminal.
+        if self.skip_lf {
+            if self.bytes.is_empty() {
+                return Ok(None);
+            }
+            if self.bytes[0] == b'\n' {
+                self.bytes.remove(0);
+            }
+            self.skip_lf = false;
+        }
+        let delimiter = self.bytes[self.scan_start..]
+            .iter()
+            .position(|byte| matches!(byte, b'\n' | b'\r'))
+            .map(|offset| self.scan_start + offset);
+        let pending = delimiter.map_or(self.bytes.len(), |index| index + 1);
+        if pending + self.frame_bytes > MAX_SSE_FRAME_BYTES {
+            return Err(ClaudeError::Protocol("SSE frame exceeds 32 MiB".into()));
+        }
+        let Some(index) = delimiter else {
+            // Do not repeatedly scan the entire unfinished line for each chunk.
+            self.scan_start = self.bytes.len();
             return Ok(None);
         };
+        self.frame_bytes += index + 1;
+        self.skip_lf = self.bytes[index] == b'\r';
+        self.scan_start = 0;
         let mut line = self.bytes.drain(..=index).collect::<Vec<_>>();
         line.pop();
-        if line.last() == Some(&b'\r') {
-            line.pop();
+        // SSE is UTF-8; malformed lines must not be silently altered. Only one
+        // leading BOM is optional, at the start of the stream, not every frame.
+        let mut line = String::from_utf8(line)
+            .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))?;
+        if self.first_line {
+            self.first_line = false;
+            if line.starts_with('\u{feff}') {
+                line.drain(..'\u{feff}'.len_utf8());
+            }
         }
-        // SSE is UTF-8; malformed lines must not be silently altered.
-        String::from_utf8(line)
-            .map(Some)
-            .map_err(|_| ClaudeError::Protocol("invalid UTF-8 SSE line".into()))
+        Ok(Some(line))
     }
 
     fn take_data(&mut self) -> Option<String> {
@@ -1421,6 +1530,108 @@ enum BlockAccumulator {
     Other(ContentBlock),
 }
 
+impl BlockAccumulator {
+    fn finish(self, truncated: bool) -> Result<ContentBlock, ClaudeError> {
+        let block = match self {
+            BlockAccumulator::Text { text, extra } => ContentBlock::Text { text, extra },
+            BlockAccumulator::ToolUse {
+                id,
+                name,
+                initial,
+                fragments,
+                extra,
+            } => {
+                let input = if fragments.is_empty() {
+                    Ok(initial)
+                } else {
+                    serde_json::from_str::<Value>(&fragments)
+                };
+                let input = match input {
+                    Ok(input) if input.is_object() => input,
+                    _ if truncated => {
+                        return Ok(ContentBlock::text(format!(
+                            "Incomplete tool input for {name} ({id}) was not executed because the output token limit was reached. Issue a fresh complete call if needed."
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                    _ => {
+                        return Err(ClaudeError::Protocol(
+                            "tool input must be a JSON object".into(),
+                        ));
+                    }
+                };
+                ContentBlock::ToolUse {
+                    id,
+                    name,
+                    input,
+                    extra,
+                }
+            }
+            BlockAccumulator::ServerToolUse {
+                id,
+                name,
+                initial,
+                fragments,
+                extra,
+            } => {
+                let input = if fragments.is_empty() {
+                    initial
+                } else {
+                    serde_json::from_str(&fragments)?
+                };
+                if !input.is_object() {
+                    return Err(ClaudeError::Protocol(
+                        "server tool input must be a JSON object".into(),
+                    ));
+                }
+                ContentBlock::ServerToolUse {
+                    id,
+                    name,
+                    input,
+                    extra,
+                }
+            }
+            BlockAccumulator::Thinking {
+                thinking,
+                signature,
+                extra,
+            } => ContentBlock::Thinking {
+                thinking,
+                signature,
+                extra,
+            },
+            BlockAccumulator::McpToolUse {
+                id,
+                name,
+                server_name,
+                initial,
+                fragments,
+                extra,
+            } => {
+                let input = if fragments.is_empty() {
+                    initial
+                } else {
+                    serde_json::from_str(&fragments)?
+                };
+                if !input.is_object() {
+                    return Err(ClaudeError::Protocol(
+                        "MCP tool input must be a JSON object".into(),
+                    ));
+                }
+                ContentBlock::McpToolUse {
+                    id,
+                    name,
+                    server_name,
+                    input,
+                    extra,
+                }
+            }
+            BlockAccumulator::Other(block) => block,
+        };
+        Ok(block)
+    }
+}
+
 /// Assemble streaming deltas into the same typed response as `create`.
 /// A partial tool JSON object or a missing terminal event is never returned as
 /// a usable tool call.
@@ -1435,7 +1646,7 @@ where
         return Err(ClaudeError::Protocol("expected message_start".into()));
     };
     let mut active = BTreeMap::<usize, BlockAccumulator>::new();
-    let mut completed = BTreeMap::<usize, ContentBlock>::new();
+    let mut completed = BTreeMap::<usize, BlockAccumulator>::new();
     while let Some(event) = events.next().await {
         match event? {
             StreamEvent::ContentBlockStart {
@@ -1552,93 +1763,6 @@ where
                 let block = active.remove(&index).ok_or_else(|| {
                     ClaudeError::Protocol(format!("unknown content block {index}"))
                 })?;
-                let block = match block {
-                    BlockAccumulator::Text { text, extra } => ContentBlock::Text { text, extra },
-                    BlockAccumulator::ToolUse {
-                        id,
-                        name,
-                        initial,
-                        fragments,
-                        extra,
-                    } => {
-                        let input = if fragments.is_empty() {
-                            initial
-                        } else {
-                            serde_json::from_str(&fragments)?
-                        };
-                        if !input.is_object() {
-                            return Err(ClaudeError::Protocol(
-                                "tool input must be a JSON object".into(),
-                            ));
-                        }
-                        ContentBlock::ToolUse {
-                            id,
-                            name,
-                            input,
-                            extra,
-                        }
-                    }
-                    BlockAccumulator::ServerToolUse {
-                        id,
-                        name,
-                        initial,
-                        fragments,
-                        extra,
-                    } => {
-                        let input = if fragments.is_empty() {
-                            initial
-                        } else {
-                            serde_json::from_str(&fragments)?
-                        };
-                        if !input.is_object() {
-                            return Err(ClaudeError::Protocol(
-                                "server tool input must be a JSON object".into(),
-                            ));
-                        }
-                        ContentBlock::ServerToolUse {
-                            id,
-                            name,
-                            input,
-                            extra,
-                        }
-                    }
-                    BlockAccumulator::Thinking {
-                        thinking,
-                        signature,
-                        extra,
-                    } => ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                        extra,
-                    },
-                    BlockAccumulator::McpToolUse {
-                        id,
-                        name,
-                        server_name,
-                        initial,
-                        fragments,
-                        extra,
-                    } => {
-                        let input = if fragments.is_empty() {
-                            initial
-                        } else {
-                            serde_json::from_str(&fragments)?
-                        };
-                        if !input.is_object() {
-                            return Err(ClaudeError::Protocol(
-                                "MCP tool input must be a JSON object".into(),
-                            ));
-                        }
-                        ContentBlock::McpToolUse {
-                            id,
-                            name,
-                            server_name,
-                            input,
-                            extra,
-                        }
-                    }
-                    BlockAccumulator::Other(block) => block,
-                };
                 completed.insert(index, block);
             }
             StreamEvent::MessageDelta { delta, usage } => {
@@ -1665,8 +1789,24 @@ where
                 if message.stop_reason.is_none() {
                     return Err(ClaudeError::Protocol("missing final stop_reason".into()));
                 }
-                if !active.is_empty() {
-                    return Err(ClaudeError::IncompleteStream);
+                let truncated = message.stop_reason == Some(StopReason::MaxTokens);
+                for (index, block) in active {
+                    // Only an explicit output cutoff explains an open text/client
+                    // block. Never synthesize a signature or a server-tool receipt.
+                    let block = match block {
+                        BlockAccumulator::Text { .. } if truncated => block,
+                        BlockAccumulator::ToolUse { id, name, .. } if truncated => {
+                            BlockAccumulator::Other(ContentBlock::text(format!(
+                                "Incomplete tool input for {name} ({id}) was not executed because the output token limit was reached. Issue a fresh complete call if needed."
+                            )))
+                        }
+                        _ => {
+                            return Err(ClaudeError::Protocol(
+                                "message_stop before content_block_stop".into(),
+                            ));
+                        }
+                    };
+                    completed.insert(index, block);
                 }
                 let count = completed.len();
                 if completed.keys().copied().ne(0..count) {
@@ -1674,7 +1814,10 @@ where
                         "non-contiguous content block indices".into(),
                     ));
                 }
-                message.content = completed.into_values().collect();
+                message.content = completed
+                    .into_values()
+                    .map(|block| block.finish(truncated))
+                    .collect::<Result<Vec<_>, _>>()?;
                 return Ok(message);
             }
             StreamEvent::Error { error } => {
@@ -1714,7 +1857,9 @@ impl CompactedHistory {
 }
 
 /// Retain recent messages without severing an assistant tool use and its user
-/// tool result. Rewind to the beginning of the containing user turn.
+/// tool result. Rewind to the beginning of the containing user turn. Truncating
+/// history or supplying a summary invalidates retained thinking's prefix binding,
+/// so remove that thinking and any messages left empty by its removal.
 pub fn compact_history(
     history: &[Message],
     keep_recent: usize,
@@ -1726,11 +1871,28 @@ pub fn compact_history(
             start -= 1;
         }
     }
-    CompactedHistory {
-        messages: history[start..].to_vec(),
-        summary: summary.into(),
-        dropped_messages: start,
+    let summary = summary.into();
+    let mut messages = history[start..].to_vec();
+    if start > 0 || !summary.is_empty() {
+        strip_thinking(&mut messages);
     }
+    CompactedHistory {
+        dropped_messages: history.len() - messages.len(),
+        messages,
+        summary,
+    }
+}
+
+fn strip_thinking(messages: &mut Vec<Message>) {
+    messages.retain_mut(|message| {
+        message.content.retain(|block| {
+            !matches!(
+                block,
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+            )
+        });
+        !message.content.is_empty()
+    });
 }
 
 fn is_user_turn_start(message: &Message) -> bool {
@@ -1742,7 +1904,80 @@ fn is_user_turn_start(message: &Message) -> bool {
 }
 
 mod agent;
-pub use agent::{Claude, ClaudeBuilder, ClaudeToolInvocation, ClaudeToolReply, ClaudeTools};
+pub use agent::{
+    Claude, ClaudeBuilder, ClaudeToolInvocation, ClaudeToolReply, ClaudeTools, rewind_checkpoint,
+};
 
 /// Portable durability integration with provider-native state.
 pub mod execution;
+
+#[cfg(test)]
+mod sse_framing_tests {
+    use super::*;
+
+    fn state() -> SseState {
+        SseState {
+            credentials: Vec::new(),
+            response: Box::pin(stream::empty()),
+            bytes: Vec::new(),
+            data: Vec::new(),
+            done: false,
+            frame_bytes: 0,
+            event_name: None,
+            first_line: true,
+            skip_lf: false,
+            scan_start: 0,
+        }
+    }
+
+    #[test]
+    fn every_byte_boundary_preserves_crlf_bom_and_unicode() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let input =
+                format!("\u{feff}data: 日本語 😀{ending}{ending}data: done{ending}{ending}");
+            let mut state = state();
+            let mut lines = Vec::new();
+            for byte in input.bytes() {
+                state.bytes.push(byte);
+                while let Some(line) = state.pop_line().unwrap() {
+                    if line.is_empty() {
+                        state.frame_bytes = 0;
+                    }
+                    lines.push(line);
+                }
+            }
+            assert_eq!(lines, ["data: 日本語 😀", "", "data: done", ""]);
+            assert!(state.bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn coalesced_small_frames_are_not_one_oversize_frame() {
+        let mut state = state();
+        // This whole HTTP chunk is larger than a single allowed SSE frame.
+        let frame = format!(": {}\n\n", "x".repeat(1024 * 1024));
+        state.bytes = frame.repeat(33).into_bytes();
+        let mut frames = 0;
+        while let Some(line) = state.pop_line().unwrap() {
+            if line.is_empty() {
+                state.frame_bytes = 0;
+                frames += 1;
+            }
+        }
+        assert_eq!(frames, 33);
+    }
+
+    #[test]
+    fn unfinished_line_still_has_a_byte_bound() {
+        let mut state = state();
+        state.bytes = vec![b'x'; MAX_SSE_FRAME_BYTES + 1];
+        assert!(matches!(state.pop_line(), Err(ClaudeError::Protocol(_))));
+    }
+
+    #[test]
+    fn invalid_utf8_is_not_replaced_or_accepted() {
+        let mut state = state();
+        state.bytes = vec![b'd', b'a', b't', b'a', b':', 0xff, b'\n'];
+        assert!(matches!(state.pop_line(), Err(ClaudeError::Protocol(_))));
+    }
+}

@@ -107,6 +107,7 @@ impl CommittedSession {
             return snapshot.clone();
         }
         SessionSnapshot {
+            request_policy: self.model.request_policy().clone(),
             version: SESSION_SNAPSHOT_VERSION,
             model: self.selected_model.as_str().to_owned(),
             lineage_id: self.lineage_id.to_string(),
@@ -119,6 +120,7 @@ impl CommittedSession {
             client_authored: self.model.client_authored().clone(),
             context_snapshot: Some(self.model.context_baseline().clone()),
             context_usage: Some(self.model.context_usage()),
+            reasoning: self.model.reasoning().clone(),
         }
     }
 }
@@ -145,6 +147,8 @@ pub(crate) struct ContextUsage {
 /// history and cache lineage.
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct SessionSnapshot {
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    request_policy: serde_json::Value,
     version: u32,
     model: String,
     lineage_id: String,
@@ -162,6 +166,8 @@ pub struct SessionSnapshot {
     context_snapshot: Option<ContextBaseline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     context_usage: Option<ContextUsage>,
+    #[serde(default)]
+    reasoning: crate::reasoning::ReasoningState,
 }
 
 /// Session metadata separated from independently persisted conversation items.
@@ -220,6 +226,7 @@ impl SessionSnapshot {
         history: Vec<ResponseItem>,
         client_authored: std::collections::BTreeSet<String>,
         context_snapshot: Option<ContextBaseline>,
+        reasoning: crate::reasoning::ReasoningState,
     ) -> Result<Self> {
         let canonical_context = history
             .iter()
@@ -243,6 +250,8 @@ impl SessionSnapshot {
             client_authored,
             context_snapshot,
             context_usage: None,
+            request_policy: serde_json::Value::Null,
+            reasoning,
         })
     }
 
@@ -305,6 +314,7 @@ impl SessionSnapshot {
                 "request prefix does not match the supported model contract".to_owned(),
             ));
         }
+        self.reasoning.validate(&self.history)?;
         let lineage_id = Arc::<str>::from(self.lineage_id);
         let prompt_cache_key = Arc::<str>::from(self.prompt_cache_key);
         let checkpoint = self
@@ -321,6 +331,8 @@ impl SessionSnapshot {
                     None,
                     self.context_snapshot.clone(),
                 )?;
+                checkpoint.restore_request_policy(self.request_policy.clone());
+                checkpoint.restore_reasoning(self.reasoning.clone());
                 if let Some(usage) = self.context_usage.as_ref() {
                     checkpoint.restore_context_usage(usage);
                 }
@@ -336,6 +348,7 @@ impl SessionSnapshot {
             history: self.history,
             client_authored: self.client_authored,
             context_baseline: self.context_snapshot,
+            reasoning: self.reasoning,
             checkpoint,
         })
     }
@@ -351,5 +364,6 @@ pub(crate) struct SessionResume {
     pub(crate) history: Vec<ResponseItem>,
     pub(crate) client_authored: std::collections::BTreeSet<String>,
     pub(crate) context_baseline: Option<ContextBaseline>,
+    pub(crate) reasoning: crate::reasoning::ReasoningState,
     pub(crate) checkpoint: Option<ModelCheckpoint>,
 }

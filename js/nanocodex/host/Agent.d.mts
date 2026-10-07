@@ -16,8 +16,8 @@ import type { Tools } from "../tools/Tools.mjs";
 
 export type Agent = DefaultAgent;
 type ToolExposureOptions =
-  | { mcp?: false | undefined; toolMode?: "code" | "direct" | undefined }
-  | { mcp: McpServers; toolMode?: "code" | undefined };
+  | { mcp?: false | undefined; toolMode?: "code" | "code-only" | "direct" | undefined }
+  | { mcp: McpServers; toolMode?: "code" | "code-only" | undefined };
 
 /** Creates Rust/WASM in the current Web API host isolate. */
 export function create(options: import('../runtime/claude.mjs').Options & { harness: 'claude' }): Promise<import('../runtime/claude.mjs').Agent>;
@@ -51,7 +51,7 @@ export declare namespace create {
     | {
       durability: DurabilityStore;
       durabilityId: string;
-      /** The root remains durable; all subagent children are ephemeral. */
+      /** Subagent identities, mailboxes, and execution recover on this durability store. */
       tools?: ToolConfiguration<SubagentTool> | undefined;
     }
   );

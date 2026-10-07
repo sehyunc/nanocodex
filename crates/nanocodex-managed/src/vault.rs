@@ -18,6 +18,30 @@ pub struct VaultLogin {
     pub browser_origin: Option<String>,
 }
 
+/// Public metadata for a saved SSH target; never contains private key material.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultSshTarget {
+    /// Opaque identity reference used to select the saved target.
+    pub reference: String,
+    /// Saved destination hostname.
+    pub hostname: String,
+    /// Saved SSH port.
+    pub port: u16,
+    /// Saved SSH username.
+    pub username: String,
+    /// Pinned server host-key SHA-256 fingerprint.
+    pub host_key_sha256: String,
+    /// Public key for installation on the server, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SshCredentials {
+    // Deserialize only the public SSH projection, ignoring all other credentials.
+    ssh: Vec<VaultSshTarget>,
+}
+
 #[derive(Deserialize)]
 struct VaultEntry {
     id: String,
@@ -32,6 +56,19 @@ struct Credentials {
 }
 
 impl ManagedClient {
+    /// Lists saved SSH targets using only the account endpoint's public metadata.
+    ///
+    /// # Errors
+    /// Rejects unsuccessful requests or malformed metadata without reflecting
+    /// arbitrary response bodies. An absent public key is omitted from output.
+    pub async fn vault_ssh_targets(&self) -> Result<Vec<VaultSshTarget>, ManagedError> {
+        let response = self
+            .request(Method::GET, "v1/credentials", None, None)
+            .await?;
+        let credentials: SshCredentials = decode(response).await?;
+        Ok(credentials.ssh)
+    }
+
     /// Returns the configured account website's Vault page for secure browser handoff.
     pub fn vault_url(&self) -> String {
         let mut url = self.base_url.clone();
@@ -174,6 +211,7 @@ pub struct VaultRequest {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Public body template, never a resolved credential.
+    /// `{{NANOCODEX_VAULT_TOTP}}` is resolved only by the broker at the item’s saved origin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
     /// Escaping applied to substituted body values by the broker.
@@ -320,6 +358,14 @@ impl ManagedClient {
         &self,
         request: &VaultRequest,
     ) -> Result<VaultRequestReceipt, ManagedError> {
+        self.vault_request_at("v1/vault/request", request).await
+    }
+
+    pub(crate) async fn vault_request_at(
+        &self,
+        path: &str,
+        request: &VaultRequest,
+    ) -> Result<VaultRequestReceipt, ManagedError> {
         validate_id(&request.vault_id)?;
         let invalid = || ManagedError::Configuration("invalid_vault_request".into());
         if request.url.len() > 8 * 1024
@@ -366,7 +412,7 @@ impl ManagedClient {
         // This endpoint is not eligible for the client's agent access-token
         // refresh/retry path. Never retry a potentially consequential dispatch.
         let mut response = self
-            .request(Method::POST, "v1/vault/request", Some(&body), None)
+            .request(Method::POST, path, Some(&body), None)
             .await
             .map_err(|_| vault_outcome_unknown())?;
         let status = response.status();

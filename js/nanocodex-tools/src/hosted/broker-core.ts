@@ -121,6 +121,7 @@ type HostedToolsSocketAttachment = {
   machines?: readonly HostedMachine[];
   runtimeId?: string;
   commandRecovery?: true;
+  turnLifecycle?: true;
   hostConnectionId?: string;
   diagnostics?: true;
   last_heartbeat_at?: number;
@@ -128,6 +129,13 @@ type HostedToolsSocketAttachment = {
   last_heartbeat_observation_at?: number;
   lease_expires_at?: number;
 };
+
+type HostFrameTiming = Readonly<{
+  receivedAt: number;
+  frame_decode_ms: number;
+  lease_validation_ms: number;
+  message_to_handler_ms: number;
+}>;
 
 type PendingCall = {
   threadId?: string;
@@ -217,6 +225,8 @@ export type HostedToolsCodeTool = Readonly<{
   definition?: HostedToolsCodeDefinition;
   /** Opaque immutable route identity for trusted broker-to-broker relays. */
   routeToken?: string;
+  processSessionKey?: string;
+  endTurn?(sessionId: string, turnId: string, event: "Stop" | "Interrupt" | "SubagentStop"): Promise<void>;
   handler(
     input: unknown,
     context: HostedToolsInvocationContext,
@@ -234,6 +244,7 @@ export type HostedToolsAuthorizationContext = Pick<ToolContext, "sessionId" | "s
 export type HostedMachineToolName = (typeof HOSTED_MACHINE_TOOL_NAMES)[number] | `mcp__cua_repl__${string}`;
 
 export interface HostedToolsDynamicProvider {
+  endTurn?(sessionId: string, turnId: string, event: "Stop" | "Interrupt" | "SubagentStop"): Promise<void>;
   definitions(): readonly HostedToolsCodeDefinition[];
   resolve(name: string): HostedToolsCodeTool | undefined;
   /** Installed by the owning ToolRouter to reject non-parity catalogs before ACK. */
@@ -314,6 +325,11 @@ export type HostedToolsCallObservation = Readonly<{
   admission_ms?: number;
   roundtrip_ms?: number;
   settlement_ms?: number;
+  /** Broker handler entry is not a transport-level arrival timestamp. */
+  dispatch_to_message_ms?: number;
+  frame_decode_ms?: number;
+  lease_validation_ms?: number;
+  message_to_handler_ms?: number;
   host_timing?: HostedToolReceiptTiming;
   /** Combined transit, return, and unmeasured socket/serialization overhead. */
   transit_return_overhead_ms?: number;
@@ -400,6 +416,7 @@ export type HostedToolsLeasedAttachmentRenewal = Readonly<{
 export class HostedToolsBrokerCore {
   readonly #provider: HostedToolsDynamicProvider;
   readonly #pending = new Map<string, PendingCall>();
+  readonly #turnSockets = new Map<string, Set<HostedToolsSocket>>();
   readonly #now: () => number;
   readonly #onCallTiming: HostedToolsBrokerCoreOptions["onCallTiming"];
   readonly #onCallObservation: HostedToolsBrokerCoreOptions["onCallObservation"];
@@ -498,6 +515,7 @@ export class HostedToolsBrokerCore {
       }
     }
     this.#provider = Object.freeze({
+      endTurn: (session: string, turn: string, event: "Stop" | "Interrupt" | "SubagentStop") => this.endTurn(session, turn, event),
       // ToolRouter owns the one aggregate tool_search. This provider exposes
       // only the current attached definitions, which stay deferred and can be
       // overlaid onto exact cloud contracts by that router.
@@ -827,6 +845,7 @@ export class HostedToolsBrokerCore {
   }
 
   async webSocketMessage(socket: HostedToolsSocket, message: string | ArrayBuffer): Promise<void> {
+    const receivedAt = performance.now();
     if (!this.handles(socket)) return;
     if (typeof message !== "string") {
       this.#fence(socket, "Hosted Tools requires bounded text frames", 1003);
@@ -834,8 +853,10 @@ export class HostedToolsBrokerCore {
     }
     let frame: HostedToolsHostFrame;
     try {
+      const decodeStarted = performance.now();
       frame = parseHostedToolsHostFrame(message);
-      await this.#dispatchHostFrame(socket, frame);
+      const frameDecodeMs = Math.max(0, performance.now() - decodeStarted);
+      await this.#dispatchHostFrame(socket, frame, receivedAt, frameDecodeMs);
     } catch (error) {
       const protocol = error instanceof HostedToolsProtocolError
         ? error
@@ -884,6 +905,20 @@ export class HostedToolsBrokerCore {
     }
   }
 
+  async endTurn(sessionId: string, turnId: string, hookEventName: "Stop" | "Interrupt" | "SubagentStop"): Promise<void> {
+    const key = JSON.stringify([sessionId, turnId]);
+    const sockets = this.#turnSockets.get(key) ?? new Set<HostedToolsSocket>();
+    this.#turnSockets.delete(key);
+    // Only the original live socket may receive cleanup; a restored broker has
+    // no such ownership and must not reconstruct it from a reconnectable ledger.
+    for (const socket of sockets) {
+      const attachment = this.#attachment(socket);
+      // Never move cleanup to a replacement runtime, reconnect, or unadvertised host.
+      if (!attachment?.active || !attachment.turnLifecycle || socket.readyState !== OPEN) continue;
+      this.#send(socket, { type: "turn_ended", session_id: sessionId, turn_id: turnId, hook_event_name: hookEventName });
+    }
+  }
+
   cancel(callId: string): boolean {
     const row = this.#persistence.call(callId);
     if (!row || row.state !== "dispatched") return false;
@@ -911,14 +946,21 @@ export class HostedToolsBrokerCore {
     }
   }
 
-  async #dispatchHostFrame(socket: HostedToolsSocket, frame: HostedToolsHostFrame): Promise<void> {
+  async #dispatchHostFrame(
+    socket: HostedToolsSocket, frame: HostedToolsHostFrame, receivedAt: number, frameDecodeMs: number,
+  ): Promise<void> {
     if (frame.type === "catalog") {
       const publication = this.#catalogPublication.then(() => this.#publishCatalog(socket, frame));
       this.#catalogPublication = publication.catch(() => {});
       await publication;
       return;
     }
+    const validationStarted = performance.now();
     await this.#validateLeasedAttachment(socket);
+    const handlerStarted = performance.now();
+    const timing: HostFrameTiming = { receivedAt, frame_decode_ms: frameDecodeMs,
+      lease_validation_ms: Math.max(0, handlerStarted - validationStarted),
+      message_to_handler_ms: Math.max(0, handlerStarted - receivedAt) };
     if (frame.type === "ping") {
       // Older publishers do not advertise command recovery and still expect
       // JSON pongs. Preserve ownership/authority checks without a liveness TTL.
@@ -926,11 +968,13 @@ export class HostedToolsBrokerCore {
       this.#send(socket, { type: "pong", nonce: frame.nonce });
     } else if (frame.type === "status") this.#recoverStatus(socket, frame);
     else if (frame.type === "drain") this.#drain(socket);
-    else if (frame.type === "diagnostic") this.#hostProgress(socket, frame);
-    else this.#completeResult(socket, frame);
+    else if (frame.type === "diagnostic") this.#hostProgress(socket, frame, timing);
+    else this.#completeResult(socket, frame, timing);
   }
 
-  #hostProgress(socket: HostedToolsSocket, frame: Extract<HostedToolsHostFrame, { type: "diagnostic" }>): void {
+  #hostProgress(
+    socket: HostedToolsSocket, frame: Extract<HostedToolsHostFrame, { type: "diagnostic" }>, timing: HostFrameTiming,
+  ): void {
     const attachment = this.#activeAttachment(socket);
     if (attachment.diagnostics !== true) {
       throw new HostedToolsProtocolError("diagnostics_not_advertised", "host diagnostics require catalog opt-in");
@@ -941,7 +985,16 @@ export class HostedToolsBrokerCore {
     }
     // A result can settle before queued progress arrives. Same-generation terminal
     // rows retain identity and remain observable without changing their outcome.
-    this.#observe("host_progress", row, { host_stage: frame.stage, host_elapsed_ms: frame.elapsed_ms });
+    this.#observe("host_progress", row, { host_stage: frame.stage, host_elapsed_ms: frame.elapsed_ms,
+      ...this.#frameObservation(frame.call_id, timing) });
+  }
+
+  #frameObservation(callId: string, timing?: HostFrameTiming): Partial<HostedToolsCallObservation> {
+    if (!timing) return {};
+    const { receivedAt, ...durations } = timing;
+    const pending = this.#pending.get(callId);
+    return { ...durations, ...(pending && !pending.restored
+      ? { dispatch_to_message_ms: Math.max(0, receivedAt - pending.dispatchedAt) } : {}) };
   }
 
   #activeAttachment(socket: HostedToolsSocket): HostedToolsSocketAttachment {
@@ -1139,6 +1192,7 @@ export class HostedToolsBrokerCore {
       lease_expires_at: expiresAt,
       ...(frame.runtime_id === undefined ? {} : { runtimeId: frame.runtime_id }),
       ...(frame.command_recovery === true ? { commandRecovery: true as const } : {}),
+      ...(frame.turn_lifecycle === true ? { turnLifecycle: true as const } : {}),
       ...(frame.connection_id === undefined ? {} : { hostConnectionId: frame.connection_id }),
       ...(frame.diagnostics === true ? { diagnostics: true as const } : {}),
     } satisfies HostedToolsSocketAttachment;
@@ -1381,8 +1435,10 @@ export class HostedToolsBrokerCore {
   #completeResult(
     socket: HostedToolsSocket,
     frame: Extract<HostedToolsHostFrame, { type: "result" }>,
+    timing?: HostFrameTiming,
   ): void {
     const resultAt = performance.now();
+    const receiveTiming = this.#frameObservation(frame.call_id, timing);
     const attachment = this.#activeAttachment(socket);
     const row = this.#persistence.call(frame.call_id);
     const stored = JSON.stringify(frame.outcome);
@@ -1400,13 +1456,13 @@ export class HostedToolsBrokerCore {
         throw new HostedToolsProtocolError("result_conflict", "late terminal receipt conflicts with retained proof");
       }
       this.#ackResult(socket, frame);
-      this.#observe("late_receipt", row, { outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
+      this.#observe("late_receipt", row, { ...receiveTiming, outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
       return;
     }
     if (row.state !== "dispatched") {
       if (row.result_json === stored && row.state === outcomeState(frame.outcome)) {
         this.#ackResult(socket, frame);
-        this.#observe("receipt_replay", row, { outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
+        this.#observe("receipt_replay", row, { ...receiveTiming, outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
         return;
       }
       throw new HostedToolsProtocolError("result_conflict", "terminal call result cannot be changed");
@@ -1419,7 +1475,7 @@ export class HostedToolsBrokerCore {
         throw new HostedToolsProtocolError("result_conflict", "late terminal receipt conflicts with retained proof");
       }
       this.#ackResult(socket, frame);
-      this.#observe("late_receipt", row, { outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
+      this.#observe("late_receipt", row, { ...receiveTiming, outcome: frame.outcome.status, ...(frame.timing ? { host_timing: frame.timing } : {}) });
       return;
     }
     if (frame.outcome.status === "completed"
@@ -1443,6 +1499,7 @@ export class HostedToolsBrokerCore {
     this.#ackResult(socket, frame);
     pending?.resolve(frame.outcome);
     this.#observe("receipt", { ...row, thread_id: row.thread_id ?? pending?.threadId }, {
+      ...receiveTiming,
       outcome: frame.outcome.status,
       ...(frame.outcome.status === "completed" ? { success: frame.outcome.output.success } : {}),
       ...(frame.timing ? { host_timing: frame.timing } : {}),
@@ -1515,6 +1572,7 @@ export class HostedToolsBrokerCore {
       parallelSafe: prepared.entry.parallel_safe,
       definition: { ...prepared.providerDefinition, defer_loading: true as const },
       routeToken: prepared.routeToken,
+      ...(prepared.canonicalName === "write_stdin" ? { processSessionKey: prepared.routeToken } : {}),
       provider: prepared.entry.provider,
       remoteName: prepared.entry.remote_name,
       summary: prepared.entry.summary,
@@ -1869,6 +1927,12 @@ export class HostedToolsBrokerCore {
     try {
       this.#observe("send_started", proposed);
       this.#send(socket, call);
+      if (call.turn_id !== undefined && this.#attachment(socket)?.turnLifecycle) {
+        const key = JSON.stringify([call.session_id, call.turn_id]);
+        let sockets = this.#turnSockets.get(key);
+        if (!sockets) { sockets = new Set(); this.#turnSockets.set(key, sockets); }
+        sockets.add(socket);
+      }
       this.#observe("sent", proposed);
     } catch {
       this.#observe("send_failed", proposed, { reason_code: "call_send_failed" });
@@ -2017,6 +2081,10 @@ export class HostedToolsBrokerCore {
   }
 
   #retire(socket: HostedToolsSocket, reason: string, reasonCode: HostedToolsDiagnosticReason = "transport_closed"): void {
+    for (const [key, sockets] of this.#turnSockets) {
+      sockets.delete(socket);
+      if (!sockets.size) this.#turnSockets.delete(key);
+    }
     const attachment = this.#attachment(socket);
     if (reasonCode === "call_send_failed" || reasonCode === "cancel_send_failed"
       || reasonCode === "ack_send_failed" || reasonCode === "lease_validation_unavailable") {

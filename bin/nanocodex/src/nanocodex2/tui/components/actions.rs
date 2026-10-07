@@ -20,11 +20,12 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const ACTIONS: [Action; 19] = [
+const ACTIONS: [Action; 22] = [
     Action::Effort,
     Action::FastMode,
     Action::Goal,
     Action::Share,
+    Action::Copy,
     Action::Theme,
     Action::NewSession,
     Action::ResumeSession,
@@ -33,9 +34,11 @@ const ACTIONS: [Action; 19] = [
     Action::DebugContext,
     Action::Bug,
     Action::Reflection,
+    Action::Review,
     Action::Model,
     Action::AutoRoute,
     Action::AgentId,
+    Action::Subagents,
     Action::Voice,
     Action::Screen,
     Action::Zoom,
@@ -64,11 +67,13 @@ pub(super) struct ActionAvailability {
 pub(super) enum Action {
     Goal,
     Share,
+    Copy,
     Bug,
     Screen,
     Zoom,
     Voice,
     AgentId,
+    Subagents,
     Handoff,
     Review,
     Effort,
@@ -200,8 +205,11 @@ impl ActionsMenu {
 
     fn trigger_selected(&self) -> ComponentUpdate<ActionsEffect> {
         // Preserve typed arguments for managed goal commands and local share
-        // commands. The root classifies these before any agent submission.
-        if matches!(self.query.split_whitespace().next(), Some("goal" | "share")) {
+        // and copy commands. The root classifies these before any agent submission.
+        if matches!(
+            self.query.split_whitespace().next(),
+            Some("goal" | "share" | "copy")
+        ) {
             return ComponentUpdate {
                 effects: vec![ActionsEffect::Submit(format!("/{}", self.query))],
                 render: RenderRequest::Immediate,
@@ -311,7 +319,7 @@ impl ActionsMenu {
             Action::ReloadConfig => true,
             Action::EditConfig => true,
             Action::DebugContext => true,
-            Action::Bug | Action::Goal | Action::Share => true,
+            Action::Bug | Action::Goal | Action::Share | Action::Copy | Action::Subagents => true,
         }
     }
 
@@ -357,11 +365,13 @@ impl Action {
         match self {
             Self::Goal => "Goal",
             Self::Share => "Share thread · view or write link",
+            Self::Copy => "Copy response",
             Self::Bug => "Debug a bug",
             Self::Screen => "Watch Hand screen",
             Self::Zoom => "Zoom focused pane",
             Self::Voice => "Voice menu · providers and cloning",
             Self::AgentId => "Show agent ID",
+            Self::Subagents => "Subagents",
             Self::Handoff => "Prepare handoff",
             Self::Review => "Review changes",
             Self::Effort => "Change effort",
@@ -385,11 +395,13 @@ impl Action {
         match self {
             Self::Goal => Some("goal"),
             Self::Share => Some("share"),
+            Self::Copy => Some("copy"),
             Self::Bug => Some("bug"),
             Self::Screen => Some("screen"),
             Self::Zoom => Some("zoom"),
             Self::Voice => Some("voice"),
             Self::AgentId => Some("id"),
+            Self::Subagents => Some("agents"),
             Self::Handoff => Some("handoff"),
             Self::Review => Some("review"),
             Self::Effort => Some("thinking"),
@@ -408,7 +420,8 @@ impl Action {
     }
 
     fn matches(self, query: &str) -> bool {
-        contains_ignore_ascii_case(self.label(), query)
+        (self == Self::Copy && query.split_whitespace().next() == Some("copy"))
+            || contains_ignore_ascii_case(self.label(), query)
             || self
                 .alias()
                 .is_some_and(|alias| contains_ignore_ascii_case(alias, query))

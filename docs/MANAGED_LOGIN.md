@@ -30,6 +30,19 @@ inspecting services independently of a CLI request. A CLI connect page is the
 focused form of the same UI and shows only the connector named by the signed
 request.
 
+Figma is available in the account catalog as an **Add connection** preset for
+`https://mcp.figma.com/mcp`. Add it, then choose **Connect** on the new Figma row
+to authorize through the existing remote MCP OAuth flow. Connected rows support
+**Revoke**; expired authorization uses **Reconnect**. Adding a connection does
+not grant an installation access automatically. Use `nanocodex connect figma`
+(or `nanocodex connect mcp.figma.com`) to authorize Figma for an installation.
+Creation and OAuth failures leave the existing retry controls available.
+
+[Figma's remote server documentation](https://developers.figma.com/docs/figma-mcp-server/remote-server-installation/)
+requires Figma OAuth and says clients must be approved in its MCP catalog.
+Provider approval failures are reported through the existing MCP error flow;
+adding this preset does not bypass Figma's client approval policy.
+
 The interactive CLI receives a scoped Nanocodex Connect grant. It must not
 silently mint a general-purpose Nanocodex API key. API keys remain an explicit
 operation for CI, curl, or another machine.
@@ -158,15 +171,15 @@ wallet, not a browser wallet.
 
 ## Capability and storage boundaries
 
-- The managed Cloudflare Worker owns HMAC phone identity, local abuse limits,
+- The managed Cloudflare Worker owns HMAC phone identity,
   browser-bound challenges, account sessions, and the one-time hosted
   authorization. Twilio Verify owns OTP generation, delivery, attempt limits,
   expiry, and checking. Tempo Accounts/Wata owns the device-code transport and
   PKCE exchange. The private egress broker owns persistent SMS-account root
   wallets and signs only bounded `wallet_connect` access-key authorizations and
   `wallet_revokeAccessKey` operations.
-- The Worker retains each browser challenge for five minutes, enforces a
-  60-second resend delay, and caps starts per phone and Cloudflare client IP.
+- The Worker retains each browser challenge for five minutes. SMS starts have no
+  local resend delay or per-phone/IP request caps; `resend_after` is zero.
   The Verify Service must use six-digit codes with a validity window compatible
   with that local lifetime. The Worker stores only keyed HMAC phone digests and
   opaque Verify identifiers; it never stores an OTP.
@@ -259,3 +272,56 @@ has been validated, `/v1/connections` receives `chatgpt_credential_import` with
 exactly `access_token`, `refresh_token`, `account_id`, `expires_at`, and
 `fedramp`. These credentials are ephemeral request material and are never
 written to `connect.json` or returned in CLI diagnostics.
+
+### Explicit SSH private-key import
+
+The legacy CLI can import one existing SSH identity into the account Vault:
+
+```sh
+nanocodex connect ssh --key-file /path/to/key.pem --reference my-server \
+  --hostname server.example.com --port 22 --username deploy \
+  --host-key-sha256 'SHA256:<unpadded-base64-fingerprint>'
+```
+
+All six SSH options require the `ssh` target; port defaults to 22. The CLI
+validates the reference, canonical public lowercase DNS/IPv4 host, username,
+port, and host-key fingerprint before reading the file. References start with
+an alphanumeric character, contain at most 64 letters, digits, dots,
+underscores or hyphens, and cannot use reserved object-property names. Pins
+use the canonical unpadded `SHA256:` form. Encoded target resources must fit
+within 512 bytes. Private, loopback, link-local and local-only targets are
+rejected under the same destination policy as the Connect API.
+
+The key file must be a regular non-symlink file no larger than 64 KiB. The CLI
+opens and reads it once, with final-component no-follow protection on Unix
+and Windows. It checks the PEM envelope and DER structure for unencrypted RSA
+PKCS1, NIST P-256/P-384/P-521 EC SEC1, or RSA/EC PKCS8 keys. OpenSSH,
+encrypted, malformed and other key formats are rejected locally. Extra
+whitespace around the PEM envelope is rejected. These local checks validate
+the supported encoding; the broker performs cryptographic key import.
+
+The approval displays the SSH reference, host, port, username and host-key pin.
+Its signed resources contain one commitment and one target descriptor:
+
+```text
+urn:nanocodex:credential-import:ssh:pem-v1:sha256:<base64url-sha256>
+urn:nanocodex:ssh-target:<reference>:<hostname>:<port>:<username>:<host-key-sha256>
+```
+
+Each text component in the target uses JavaScript `encodeURIComponent`
+encoding. The commitment hashes UTF-8 `nanocodex/ssh-credential-import/v1\0`,
+then reference, hostname, username, host-key fingerprint and exact PEM, each
+with a big-endian `u32` UTF-8 length followed by its bytes, then the port as a
+big-endian `u32`. Only after approval does the CLI post the six-field
+`ssh_credential_import` object to the pinned Connect origin. The PEM never
+enters browser resources, prompts, local grant storage or diagnostics.
+
+Existing connector/MCP grants are preserved. SSH is a separate Connect target,
+not a service connector or generic API-key update. Fresh SSH and ChatGPT
+imports require separate commands. An ambiguous or rejected SSH connection
+POST is never automatically repeated, including transport retries; check the
+account's saved identity status before starting another import.
+
+The executable regression journey is
+`node bin/nanocodex/tests/ssh_import_cli_e2e.mjs /absolute/path/to/nanocodex`.
+It generates synthetic keys and uses only a local HTTP approval fixture.

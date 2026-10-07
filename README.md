@@ -119,6 +119,34 @@ curl -fsSL https://nanocodex.paradigm.xyz | bash
 nanocodex
 ```
 
+Nix users can run or install the package directly on x86-64 Linux and Apple
+Silicon macOS:
+
+```sh
+nix run github:gakonst/nanocodex
+nix profile install github:gakonst/nanocodex
+```
+
+The flake also provides optional NixOS and nix-darwin modules. Add the input and
+the module matching your system:
+
+```nix
+{
+  inputs.nanocodex.url = "github:gakonst/nanocodex";
+
+  imports = [
+    inputs.nanocodex.nixosModules.default
+    # For nix-darwin, use inputs.nanocodex.darwinModules.default instead.
+  ];
+
+  programs.nanocodex.enable = true;
+}
+```
+
+The NixOS module also enables the dynamic loader required by verified Linux
+runtime components that Nanocodex downloads itself. Intel macOS is not included
+because the upstream release does not currently publish an x86-64 macOS binary.
+
 On x86-64 Windows 10 or 11, the equivalent checksum-verified bootstrap is:
 
 ```powershell
@@ -126,10 +154,25 @@ irm https://nanocodex.paradigm.xyz/install.ps1 | iex
 nanocodex
 ```
 
-With an interactive terminal, the installer immediately runs `nanocodex setup`:
-account SMS login, platform CUA setup, the persistent Hand on that machine, and
-the official browser-extension prompt where applicable. The flow is idempotent
-and resumable.
+On macOS and Linux, the installer prepares the persistent Hand before sign-in,
+even without an interactive terminal. Sign in once with `nanocodex account login`
+or `nanocodex2 login`; the Hand connects automatically using that saved login.
+There is no separate Hand setup command. An existing service keeps its account
+configuration. Desktop components prepare in the background while you use
+Nanocodex. Linux preparation requires sudo and runs component installation in a
+root-owned systemd oneshot; the Hand itself runs as a non-root user.
+`--no-setup` explicitly opts out of automatic preparation.
+
+`nanocodex2`, `run`, and `attach` use this persistent computer Hand. Opening a
+terminal or changing projects does not publish another Hand or reconnect its
+tools. Closing a terminal releases only that client's local lease; the service
+and its processes remain available. The current directory travels as descriptive
+request context, independently of the Hand's identity and connection. If the
+service is unavailable, the client does not substitute a workspace publisher.
+
+On Windows, the installer runs guided setup when a terminal or saved
+account login is available; unattended installs print the command to resume.
+Setup remains idempotent and resumable.
 
 The POSIX or PowerShell script only selects and checksum-verifies one platform
 bootstrap.
@@ -146,14 +189,17 @@ files and repairs missing or corrupt resources before activating that release.
 For upgrades performed by an older updater, the CLI repairs its matching runtime
 automatically on first voice use.
 
-On macOS and Windows, current native CLIs and Hands automatically provision
-OpenAI's signed CUA runtime and select its upstream MCP tools. macOS range-fetches
-only the signed upstream CUA and browser-bridge components; Windows uses its official Microsoft Store package.
-Every macOS, Linux, or Windows Hand also publishes a native controllable screen.
-When no upstream provider is attached, VM and Cloudflare desktop Hands expose
-that native action schema through the same workdir-routed CUA entry point.
-Use `nanocodex2 computer setup --refresh`
-to update or repair the runtime, or `NANOCODEX_COMPUTER=off` to disable it.
+On macOS, current native CLIs prepare OpenAI's signed CUA runtime in the
+background. The downloader fetches only the required archive ranges. Every
+macOS, Linux, or Windows Hand also publishes its native controllable screen,
+subject to the operating system's permissions. The native screen is available
+while optional upstream components prepare. A newly prepared upstream provider
+is selected on the next attachment; running tool catalogs remain pinned.
+Windows upstream provisioning is currently unavailable; its Hand uses native
+screen controls. Use `nanocodex computer setup` to wait for preparation or
+`nanocodex computer setup --refresh` to repair/update it. Background setup writes
+progress and errors to `~/.nanocodex/runtimes/openai-cua/setup.log` (under
+`NANOCODEX_DIR` when set). `NANOCODEX_COMPUTER=off` disables upstream provisioning.
 See [runtime installation and platform limits](docs/computer/upstream-provider.md).
 
 The CLI is a production consumer and a useful way to try the agent, not a
@@ -241,7 +287,7 @@ refresh/recovery, supported tools, current limits and deployment acceptance.
 
 ### Native Linux Hands
 
-Install or repair the Hand on the current Linux machine after the curl login:
+Install or repair the Hand on the current Linux machine after account login:
 
 ```sh
 nanocodex hand install
@@ -256,7 +302,7 @@ nanocodex hand install --target ubuntu@your-server --port 2222
 ```
 
 Both commands install the same native Hand and private controllable desktop.
-Setup currently supports x86-64 Debian/Ubuntu with systemd and sudo. On-device
+Setup supports x86-64 Debian/Ubuntu and Arch/Omarchy with systemd and sudo. On-device
 setup can prompt for your administrator password; SSH enrollment uses your
 existing SSH keys/configuration and requires passwordless sudo.
 
@@ -267,7 +313,15 @@ catalog; no Python, Bash installer, or remote interactive login is involved.
 `nanocodex-hand.service` starts at boot and reconnects independently of SSH.
 Re-running setup reuses the identity and private workspace under
 `/srv/nanocodex`; an installation enrolled to another account or origin is
-rejected.
+rejected. A fresh sudo installation runs the service as the invoking non-root
+user; existing installations retain their service owner. Only that owner can
+observe the daemon through private IPC, including from terminals with different
+`HOME` values. Account credentials stay in the root-owned mode-0600
+`/opt/nanocodex/account.env`.
+
+`nanocodex hand install --prepare` prepares the local service before login.
+It starts `nanocodex-hand-components.service` asynchronously and leaves the Hand
+unpublished until sign-in supplies the saved account login.
 
 The same lifecycle commands work for the local LaunchAgent, systemd service, or
 Windows scheduled task:
@@ -303,6 +357,12 @@ nanocodex --claude --model sonnet
 nanocodex run "inspect the repository" --harness claude --model opus
 nanocodex run "inspect the repository" --harness codex --model sol
 ```
+
+In the interactive local CLI, `/model` lists both Codex and Claude models before
+the first prompt. Select one from the picker, or enter `/model sonnet`, `/model opus`,
+`/model fable`, or `/model haiku` directly. Selecting another family creates its
+native harness with that family's credentials and default reasoning settings.
+The model is fixed once the thread starts; start a new thread to use another model.
 
 Use `nanocodex --claude auth status` or `nanocodex --claude auth logout` to manage
 that subscription.
@@ -891,6 +951,11 @@ client projection, and sandbox policy while reusing one agent lifecycle:
 These are reference consumers, not portability promises. Cloudflare, Rivet,
 Vercel, exe.dev, and the native VM layer each keep their platform policy above
 the stable crates.
+
+External products built on the published crates include
+[popcorn-nanocodex](https://github.com/sriharshakaramchati/popcorn-nanocodex),
+which drives a rented [Popcorn](https://popcorn.reclaimprotocol.org) TEE
+browser session from a Nanocodex agent over CDP.
 
 ## What is stable
 

@@ -1,3 +1,5 @@
+import { normalizeHandResources } from "nanocodex-tools/internal/hosted-machine";
+
 /** Present an already-authorized, sanitized account projection to the model.
  * Authorization and secret filtering remain the responsibility of the host. */
 export function projectEnvironment(info, { runtime, default_cwd }) {
@@ -8,6 +10,7 @@ export function projectEnvironment(info, { runtime, default_cwd }) {
   return {
     runtime, default_cwd, status: info.status,
     hands: Object.fromEntries((info.machines ?? []).map((hand) => [hand.id, {
+      resources: projectHandResources(hand.resources, hand.online),
       name: hand.name, path: hand.mount, capabilities: [...hand.capabilities],
       ...(hand.kind === undefined ? {} : { kind: hand.kind }),
       ...(hand.online === undefined ? {} : { online: hand.online }),
@@ -39,7 +42,7 @@ export function contextData(tag, value) {
 /** Client-reported context is descriptive data, never identity or authorization. */
 export function requestOriginContext(value, now = Date.now()) {
   if (!value || typeof value !== "object" || Array.isArray(value)
-    || Object.keys(value).some(key => !["client", "hand", "cwd", "timezone", "location"].includes(key))) {
+    || Object.keys(value).some(key => !["client", "hand", "cwd", "native_cwd", "timezone", "location"].includes(key))) {
     throw new TypeError("invalid request origin");
   }
   const result = {};
@@ -53,6 +56,15 @@ export function requestOriginContext(value, now = Date.now()) {
   if (result.client && !/^[A-Za-z0-9_.-]+$/.test(result.client)) throw new TypeError("invalid request origin client");
   if (result.cwd && (!result.cwd.startsWith("/") || result.cwd.includes("\\")
     || result.cwd.split("/").some(part => part === "." || part === ".."))) throw new TypeError("invalid request origin cwd");
+  if (value.native_cwd !== undefined) {
+    const path = value.native_cwd;
+    // Native paths describe the caller's directory; they never select a mount.
+    const absolute = typeof path === "string" && (path.startsWith("/")
+      || /^[A-Za-z]:[\\/]/.test(path) || /^\\\\[^\\/]+[\\/][^\\/]+/.test(path));
+    if (!absolute || new TextEncoder().encode(path).length > 512
+      || /[\p{Cc}\p{Cs}]/u.test(path)) throw new TypeError("invalid request origin native_cwd");
+    result.native_cwd = path;
+  }
   if (result.timezone) {
     try { new Intl.DateTimeFormat("en-US", { timeZone: result.timezone }); }
     catch { throw new TypeError("invalid request origin timezone"); }
@@ -83,4 +95,11 @@ function projectWallet(wallet) {
   } : { status: "unavailable" };
   return { status: "ready", address: wallet.address, created_at: wallet.created_at,
     chain: wallet.chain, chain_id: wallet.chain_id, balance };
+}
+
+/** Freshness is evaluated on every read, never reset by discovery caching or reconnect. */
+export function projectHandResources(value, online, now = Date.now()) {
+  const sample = normalizeHandResources(value);
+  if (!sample || !Number.isFinite(now) || sample.observed_at_ms > now + 30_000) return { status: "unknown" };
+  return { ...sample, status: online === false || now - sample.observed_at_ms > 300_000 ? "stale" : "fresh" };
 }

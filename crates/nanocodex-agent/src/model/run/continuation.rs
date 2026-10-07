@@ -6,12 +6,16 @@ use super::*;
 struct CurrentExecution {
     phase: ExecutionPhase,
     #[serde(default)]
+    request_policy: Value,
+    #[serde(default)]
     instruction_revision: Option<u64>,
     workspace: String,
     canonical_context: ResponseItem,
     #[serde(default)]
     client_authored: std::collections::BTreeSet<String>,
     context_baseline: ContextBaseline,
+    #[serde(default)]
+    reasoning: crate::reasoning::ReasoningState,
     #[serde(default)]
     context_usage: Option<Usage>,
     #[serde(default)]
@@ -21,7 +25,8 @@ struct CurrentExecution {
     prompt_cache_key: String,
     model: String,
     effort: Thinking,
-    fast_mode: bool,
+    #[serde(flatten, with = "crate::service_tier_serde")]
+    service_tier: ServiceTier,
     reasoning_mode: String,
     model_id_prefix: Option<String>,
     store_responses: bool,
@@ -34,6 +39,8 @@ struct CurrentExecution {
     warmup_cost: Option<nanocodex_oai_api::pricing::EstimatedUsdCost>,
     context_window_tokens: u64,
     force_compaction: bool,
+    #[serde(default)]
+    background_compaction: Option<background::PendingCompaction>,
     tool_call_indices: HashMap<Box<str>, u32>,
 }
 
@@ -68,14 +75,37 @@ where
                 "invalid execution continuation".into(),
             ));
         }
+        saved.reasoning.validate(&history)?;
         let mut session = self.empty_session(Some(&saved.workspace))?;
         session.validate_workspace(requested_workspace)?;
+        #[cfg(target_family = "wasm")]
+        let (history, prefix) = if session.tools.is_code_only() {
+            let mut history = history;
+            clear_code_only_schemas(&mut history);
+            // Keep admitted instructions, but the embedding's strict capability
+            // boundary applies to an active continuation as well as a new turn.
+            let mut prefix = prefix;
+            prefix.retain(|item| !matches!(item, ResponseItem::AdditionalTools { .. }));
+            clear_code_only_schemas(&mut prefix);
+            prefix.extend(
+                session
+                    .factory
+                    .profile()
+                    .prefix()
+                    .iter()
+                    .filter(|item| matches!(item, ResponseItem::AdditionalTools { .. }))
+                    .cloned(),
+            );
+            (history, prefix)
+        } else {
+            (history, prefix)
+        };
         self.model = saved
             .model
             .parse::<crate::Model>()
             .map_err(NanocodexError::InvalidExecutionPolicy)?;
         self.thinking = saved.effort;
-        self.fast_mode = saved.fast_mode;
+        self.service_tier = saved.service_tier;
         let config = Arc::make_mut(&mut self.config);
         config.reasoning_mode = saved
             .reasoning_mode
@@ -85,6 +115,8 @@ where
         config.store_responses = saved.store_responses;
         config.context_window_tokens = saved.context_window_tokens;
         self.force_compaction = saved.force_compaction;
+        self.background_compaction = saved.background_compaction;
+        self.background_work = None;
         self.instruction_revision = saved.instruction_revision;
         session.factory = session
             .factory
@@ -104,6 +136,7 @@ where
         } else {
             ConversationState::resume(saved.canonical_context, history)?
         };
+        session.conversation.request_policy = saved.request_policy;
         session
             .conversation
             .managed
@@ -113,6 +146,10 @@ where
             saved.server_reasoning_included,
             saved.context_usage_is_estimate,
         );
+        session.conversation.reasoning = saved.reasoning;
+        session
+            .conversation
+            .prepare_request_policy(self.continuation_policy());
         // Provider response IDs are connection-local; only the conversation is durable.
         session.conversation.reset_for_full_request();
         session.context = ContextState::new(
@@ -192,19 +229,21 @@ where
         self.record_transport();
         let steps = self.execution_steps.as_ref().expect("durable execution");
         let saved = CurrentExecution {
+            request_policy: session.conversation.request_policy.clone(),
             phase,
             instruction_revision: self.instruction_revision,
             workspace: session.workspace.clone(),
             canonical_context: (*session.conversation.canonical_context).clone(),
             client_authored: session.conversation.managed.client_authored().clone(),
             context_baseline: session.context.baseline(),
+            reasoning: session.conversation.reasoning.clone(),
             context_usage: session.conversation.managed.context_usage().0.cloned(),
             server_reasoning_included: session.conversation.managed.context_usage().1,
             context_usage_is_estimate: session.conversation.managed.context_usage_is_estimate(),
             prompt_cache_key: session.factory.profile().prompt_cache_key().to_owned(),
             model: self.model.as_str().to_owned(),
             effort: self.thinking,
-            fast_mode: self.fast_mode,
+            service_tier: self.service_tier,
             reasoning_mode: self.config.reasoning_mode.as_str().to_owned(),
             model_id_prefix: self.config.model_id_prefix.as_deref().map(str::to_owned),
             store_responses: self.config.store_responses,
@@ -216,6 +255,7 @@ where
             warmup_cost: self.stats.warmup_usage.estimated_cost.clone(),
             context_window_tokens: self.config.context_window_tokens,
             force_compaction: self.force_compaction,
+            background_compaction: self.background_compaction.clone(),
             tool_call_indices: self.tool_call_indices.clone(),
         };
         steps
@@ -223,6 +263,17 @@ where
                 &saved,
                 session.conversation.flattened_history(),
                 session.factory.profile().prefix().to_vec(),
+                self.background_compaction
+                    .as_ref()
+                    .map_or_else(Vec::new, |pending| {
+                        vec![
+                            format!("background-compaction-{}", pending.after_model_call_index),
+                            format!(
+                                "before-background-compaction-{}",
+                                pending.after_model_call_index
+                            ),
+                        ]
+                    }),
             )
             .await?;
         Ok(())
@@ -236,6 +287,7 @@ mod tests {
     #[test]
     fn execution_accounting_basis_roundtrips_and_defaults_for_legacy_records() {
         let saved = CurrentExecution {
+            request_policy: Value::Null,
             phase: ExecutionPhase::Generate,
             instruction_revision: None,
             workspace: ".".into(),
@@ -245,6 +297,7 @@ mod tests {
             ),
             client_authored: Default::default(),
             context_baseline: ContextBaseline::Missing,
+            reasoning: Default::default(),
             context_usage: Some(Usage {
                 total_tokens: 150007,
                 ..Usage::default()
@@ -254,7 +307,7 @@ mod tests {
             prompt_cache_key: "synthetic".into(),
             model: Model::Astra.as_str().into(),
             effort: Thinking::Low,
-            fast_mode: false,
+            service_tier: ServiceTier::Standard,
             reasoning_mode: "standard".into(),
             model_id_prefix: None,
             store_responses: false,
@@ -266,6 +319,7 @@ mod tests {
             warmup_cost: None,
             context_window_tokens: 272000,
             force_compaction: false,
+            background_compaction: None,
             tool_call_indices: HashMap::new(),
         };
         let mut encoded = serde_json::to_value(saved).unwrap();
